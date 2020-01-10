@@ -1,0 +1,859 @@
+From 1ed0584f2a8b02f4722436a36720e9ab49ae439e Mon Sep 17 00:00:00 2001
+From: Jiffin Tony Thottan <jthottan@redhat.com>
+Date: Mon, 11 May 2015 13:53:22 +0000
+Subject: [PATCH] FSAL_GLUSTER : Conversion of nfs4 acls <-> posix acls using standard libacl api's
+
+This patch introduces two api's fsal_acl_2_posix_acl and
+posixacl_2_fsal_acl which will convert nfs4_acls to posix_acl
+and viceversa with help of standard libacl api's. Rightnow,
+conversion is only applicable for files in FSAL_GLUSTER
+
+BUG: 1215174
+Change-Id: I313b360fe53f1fa4facda1b35c4febb73266e329
+Signed-off-by: Jiffin Tony Thottan <jthottan@redhat.com>
+---
+ src/CMakeLists.txt                       |   24 +-
+ src/FSAL/FSAL_GLUSTER/CMakeLists.txt     |    6 +-
+ src/FSAL/FSAL_GLUSTER/gluster_internal.c |   63 +---
+ src/FSAL/FSAL_GLUSTER/gluster_internal.h |    2 +
+ src/FSAL/FSAL_GLUSTER/handle.c           |   19 +-
+ src/FSAL/FSAL_GLUSTER/posix_acls.c       |  512 ++++++++++++++++++++++++++++++
+ src/FSAL/FSAL_GLUSTER/posix_acls.h       |   21 ++
+ src/nfs-ganesha.spec-in.cmake            |    4 +-
+ 8 files changed, 577 insertions(+), 74 deletions(-)
+ create mode 100644 src/FSAL/FSAL_GLUSTER/posix_acls.c
+ create mode 100644 src/FSAL/FSAL_GLUSTER/posix_acls.h
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 5e14dfe..173f3e2 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -92,6 +92,9 @@ find_package(Toolchain REQUIRED)
+ # Add maintainer mode for (mainly) strict builds
+ include(${CMAKE_SOURCE_DIR}/cmake/maintainer_mode.cmake)
+ 
++# For libraries that provide pkg-config files
++include(FindPkgConfig)
++
+ # If we are in a git tree, then this CMakeLists.txt is in "src/" and go .git is in "src/.."
+ IF( EXISTS ${CMAKE_SOURCE_DIR}/../.git/HEAD  )
+   message( STATUS "Compilation from within a git repository. Using git rev-parse HEAD")
+@@ -480,22 +483,15 @@ endif(KRB5_FOUND AND HAVE_GSSAPI_H)
+ # Validate fsal dependencies
+ 
+ if(USE_FSAL_GLUSTER)
+-  find_library(HAVE_GFAPI gfapi)
+-  check_library_exists(
+-    gfapi
+-    glfs_h_lookupat
+-    ""
+-    HAVE_GFAPI
+-    )
+-  check_include_files("glusterfs/api/glfs.h" HAVE_GLUSTER_H)
+-  if((NOT HAVE_GFAPI) OR (NOT HAVE_GLUSTER_H))
++  pkg_check_modules(GFAPI glusterfs-api>=7.3.7)
++  if(NOT GFAPI_FOUND)
+     if(STRICT_PACKAGE)
+       message(FATAL_ERROR "STRICT PACKAGE: Cannot find GLUSTER GFAPI runtime. Disabling GLUSTER fsal build")
+     else(STRICT_PACKAGE)
+       message(WARNING "Cannot find GLUSTER GFAPI runtime. Disabling GLUSTER fsal build")
+       set(USE_FSAL_GLUSTER OFF)
+     endif(STRICT_PACKAGE)
+-  endif((NOT HAVE_GFAPI) OR (NOT HAVE_GLUSTER_H))
++  endif(NOT GFAPI_FOUND)
+ 
+   if(USE_FSAL_GLUSTER)
+     check_include_files("unistd.h;attr/xattr.h" HAVE_XATTR_H)
+@@ -507,6 +503,14 @@ if(USE_FSAL_GLUSTER)
+         set(USE_FSAL_GLUSTER OFF)
+       endif(STRICT_PACKAGE)
+     endif(NOT HAVE_XATTR_H)
++    check_include_files("acl/libacl.h" HAVE_ACL_H)
++    if(HAVE_ACL_H)
++	set(USE_POSIX_ACLS ON)
++    else()
++	set(USE_POSIX_ACLS OFF)
++	set(USE_FSAL_GLUSTER OFF)
++	message(STATUS "Could not find libacl, disabling GLUSTER fsal build")
++    endif(HAVE_ACL_H)
+   endif(USE_FSAL_GLUSTER)
+ endif(USE_FSAL_GLUSTER)
+ 
+diff --git a/src/FSAL/FSAL_GLUSTER/CMakeLists.txt b/src/FSAL/FSAL_GLUSTER/CMakeLists.txt
+index 2c2d1ad..d7aab43 100644
+--- a/src/FSAL/FSAL_GLUSTER/CMakeLists.txt
++++ b/src/FSAL/FSAL_GLUSTER/CMakeLists.txt
+@@ -1,7 +1,7 @@
+ add_definitions(
+   -D__USE_GNU
+   -D_GNU_SOURCE
+-  -I/usr/include/glusterfs/api/
++  ${GFAPI_CFLAGS}
+ )
+ 
+ set( LIB_PREFIX 64)
+@@ -23,13 +23,15 @@ SET(fsalgluster_LIB_SRCS
+    gluster_internal.c
+    mds.c
+    ds.c
++   posix_acls.h
++   posix_acls.c
+ )
+ 
+ add_library(fsalgluster SHARED ${fsalgluster_LIB_SRCS})
+ 
+ target_link_libraries(fsalgluster
+   ${SYSTEM_LIBRARIES}
+-  gfapi
++  ${GFAPI_LIBRARIES}
+ )
+ 
+ set_target_properties(fsalgluster PROPERTIES VERSION 4.2.0 SOVERSION 4)
+diff --git a/src/FSAL/FSAL_GLUSTER/gluster_internal.c b/src/FSAL/FSAL_GLUSTER/gluster_internal.c
+index b1b8fad..5874625 100644
+--- a/src/FSAL/FSAL_GLUSTER/gluster_internal.c
++++ b/src/FSAL/FSAL_GLUSTER/gluster_internal.c
+@@ -478,40 +478,29 @@ fsal_status_t glusterfs_get_acl(struct glusterfs_export *glfs_export,
+ 				glusterfs_fsal_xstat_t *buffxstat,
+ 				struct attrlist *fsalattr)
+ {
+-	int rc = 0;
+-	const char *acl_key = "user.nfsv4_acls";
+-	glusterfs_acl_t *acl = NULL;
+-
++	fsal_status_t status = { ERR_FSAL_NO_ERROR, 0 };
+ 	fsalattr->acl = NULL;
+ 
+ 	if (NFSv4_ACL_SUPPORT && FSAL_TEST_MASK(fsalattr->mask, ATTR_ACL)) {
+-		rc = glfs_h_getxattrs(glfs_export->gl_fs,
+-				      glhandle,
+-				      acl_key, buffxstat->buffacl,
+-				      GLFS_ACL_BUF_SIZE);
+-		if (rc > 0) {
++
++		buffxstat->acl = glfs_h_acl_get(glfs_export->gl_fs,
++						glhandle,
++						ACL_TYPE_ACCESS);
++		if (buffxstat->acl) {
+ 			/* rc is the size of buffacl */
+-			acl = (glusterfs_acl_t *) buffxstat->buffacl;
+ 			FSAL_SET_MASK(buffxstat->attr_valid, XATTR_ACL);
++			status = posix_acl_2_fsal_acl(buffxstat->acl,
++							&fsalattr->acl);
+ 			LogFullDebug(COMPONENT_FSAL, "acl = %p", fsalattr->acl);
+-		} else if (rc == 0 || (rc == -1 && errno == ENOATTR)) {
+-			/* ACL is empty, or no ACL has been set */
+-			FSAL_SET_MASK(buffxstat->attr_valid, XATTR_ACL);
+-			LogFullDebug(COMPONENT_FSAL, "no ACL-xattr set");
+ 		} else {
+ 			/* some real error occurred */
+ 			LogMajor(COMPONENT_FSAL, "failed to fetch ACL");
+ 			return fsalstat(ERR_FSAL_SERVERFAULT, errno);
+ 		}
+ 
+-		rc = glusterfs_acl_2_fsal_acl(fsalattr, acl);
+-		if (rc != ERR_FSAL_NO_ERROR) {
+-			LogMajor(COMPONENT_FSAL, "failed to convert ACL");
+-			return fsalstat(ERR_FSAL_SERVERFAULT, errno);
+-		}
+ 	}
+ 
+-	return fsalstat(ERR_FSAL_NO_ERROR, 0);
++	return status;
+ }
+ 
+ /*
+@@ -522,18 +511,9 @@ fsal_status_t glusterfs_set_acl(struct glusterfs_export *glfs_export,
+ 				glusterfs_fsal_xstat_t *buffxstat)
+ {
+ 	int rc = 0;
+-	char *acl_key = "user.nfsv4_acls";
+-	glusterfs_acl_t *acl_p;
+-	unsigned int acl_total_size = 0;
+-
+-	if (!NFSv4_ACL_SUPPORT)
+-		return fsalstat(ERR_FSAL_ATTRNOTSUPP, 0);
+ 
+-	acl_p = (glusterfs_acl_t *)(buffxstat->buffacl);
+-	acl_total_size = acl_p->acl_len;
+-	rc = glfs_h_setxattrs(glfs_export->gl_fs, objhandle->glhandle,
+-			      acl_key, buffxstat->buffacl,
+-			      acl_total_size, 0);
++	rc = glfs_h_acl_set(glfs_export->gl_fs, objhandle->glhandle,
++				ACL_TYPE_ACCESS, buffxstat->acl);
+ 
+ 	if (rc < 0) {
+ 		/* TODO: check if error is appropriate.*/
+@@ -924,32 +904,21 @@ fsal_status_t glusterfs_process_acl(struct glfs *fs,
+ 				    struct attrlist *attrs,
+ 				    glusterfs_fsal_xstat_t *buffxstat)
+ {
+-	fsal_status_t status = { ERR_FSAL_NO_ERROR, 0 };
+-	uint32_t fsal_mode;
+-
+-	memset(&buffxstat->buffacl, 0, GLFS_ACL_BUF_SIZE);
+-	fsal_mode = unix2fsal_mode(buffxstat->buffstat.st_mode);
+-
+ 	if (attrs->acl) {
+ 		LogDebug(COMPONENT_FSAL, "setattr acl = %p",
+ 			 attrs->acl);
+ 
+-		/* Clear owner,group,everyone mode-bits */
+-		fsal_mode &= CLEAR_MODE_BITS;
++		/* Convert FSAL ACL to POSIX ACL */
+ 
+-		/* Convert FSAL ACL to GLUSTERFS NFS4 ACL and fill buffer. */
+-		status =
+-		    fsal_acl_2_glusterfs_acl(attrs->acl,
+-					buffxstat->buffacl, &fsal_mode);
+-		buffxstat->buffstat.st_mode = fsal2unix_mode(fsal_mode);
++		buffxstat->acl = fsal_acl_2_posix_acl(attrs->acl);
+ 
+-		if (FSAL_IS_ERROR(status))
+-			return status;
++		if (!buffxstat->acl)
++			return fsalstat(ERR_FSAL_FAULT, 0);
+ 	} else {
+ 		LogCrit(COMPONENT_FSAL, "setattr acl is NULL");
+ 		return fsalstat(ERR_FSAL_FAULT, 0);
+ 	}
+-	return status;
++	return fsalstat(ERR_FSAL_NO_ERROR, 0);
+ }
+ 
+ int initiate_up_thread(struct glusterfs_export *glfsexport)
+diff --git a/src/FSAL/FSAL_GLUSTER/gluster_internal.h b/src/FSAL/FSAL_GLUSTER/gluster_internal.h
+index fe7c7d0..cf151ee 100644
+--- a/src/FSAL/FSAL_GLUSTER/gluster_internal.h
++++ b/src/FSAL/FSAL_GLUSTER/gluster_internal.h
+@@ -27,6 +27,7 @@
+ #include "fsal.h"
+ #include "fsal_types.h"
+ #include "fsal_api.h"
++#include "posix_acls.h"
+ #include <glusterfs/api/glfs.h>
+ #include <glusterfs/api/glfs-handles.h>
+ 
+@@ -431,6 +432,7 @@ typedef struct fsal_xstat__ {
+ 	int attr_valid;
+ 	struct stat buffstat;
+ 	char buffacl[GLFS_ACL_BUF_SIZE];
++	acl_t acl;
+ } glusterfs_fsal_xstat_t;
+ 
+ /* GLUSTERFS ACL */
+diff --git a/src/FSAL/FSAL_GLUSTER/handle.c b/src/FSAL/FSAL_GLUSTER/handle.c
+index e7ff2ae..7a43de8 100644
+--- a/src/FSAL/FSAL_GLUSTER/handle.c
++++ b/src/FSAL/FSAL_GLUSTER/handle.c
+@@ -698,7 +698,6 @@ static fsal_status_t setattrs(struct fsal_obj_handle *obj_hdl,
+ 	glusterfs_fsal_xstat_t buffxstat;
+ 	int mask = 0;
+ 	int attr_valid = 0;
+-	bool is_dir = 0;
+ 	struct glusterfs_export *glfs_export =
+ 	    container_of(op_ctx->fsal_export, struct glusterfs_export, export);
+ 	struct glusterfs_handle *objhandle =
+@@ -787,6 +786,8 @@ static fsal_status_t setattrs(struct fsal_obj_handle *obj_hdl,
+ 			/* mode-bits too if not already passed */
+ 			FSAL_SET_MASK(mask, GLAPI_SET_ATTR_MODE);
+ 		} else if (mask & GLAPI_SET_ATTR_MODE) {
++#if 0
++			bool is_dir = 0;
+ 			switch (obj_hdl->type) {
+ 			case REGULAR_FILE:
+ 				is_dir = 0; break;
+@@ -795,13 +796,8 @@ static fsal_status_t setattrs(struct fsal_obj_handle *obj_hdl,
+ 			default:
+ 				break;
+ 			}
+-			status =
+-			 mode_bits_to_acl(glfs_export->gl_fs, objhandle,
+-					  attrs, &attr_valid,
+-					  &buffxstat, is_dir);
++#endif
+ 
+-			if (FSAL_IS_ERROR(status))
+-				goto out;
+ 		}
+ 	} else if (FSAL_TEST_MASK(attrs->mask, ATTR_ACL)) {
+ 		status = fsalstat(ERR_FSAL_ATTRNOTSUPP, 0);
+@@ -820,12 +816,9 @@ static fsal_status_t setattrs(struct fsal_obj_handle *obj_hdl,
+ 		GLUSTER_VALIDATE_RETURN_STATUS(rc);
+ 	}
+ 
+-	if (FSAL_TEST_MASK(attr_valid, XATTR_ACL)) {
+-		status = glusterfs_set_acl(glfs_export,
+-					   objhandle, &buffxstat);
+-		if (FSAL_IS_ERROR(status))
+-			goto out;
+-	}
++	if (FSAL_TEST_MASK(attr_valid, XATTR_ACL))
++		status = glusterfs_set_acl(glfs_export, objhandle, &buffxstat);
++
+ out:
+ #ifdef GLTIMING
+ 	now(&e_time);
+diff --git a/src/FSAL/FSAL_GLUSTER/posix_acls.c b/src/FSAL/FSAL_GLUSTER/posix_acls.c
+new file mode 100644
+index 0000000..4b44ef9
+--- /dev/null
++++ b/src/FSAL/FSAL_GLUSTER/posix_acls.c
+@@ -0,0 +1,512 @@
++/*
++ * posix_acls.c
++ * vim:noexpandtab:shiftwidth=8:tabstop=8:
++ *
++ * Copyright (C) Red Hat  Inc., 2015
++ * Author: Niels de Vos <ndevos@redhat.com>
++ *	   Jiffin Tony Thottan <jthottan@redhat.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 3 of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * Conversion routines for fsal_acl <-> POSIX ACl
++ *
++ * Routines based on the description from an Internet Draft that has also been
++ * used for the implementation of the conversion in the Linux kernel
++ * NFS-server.
++ *
++ *     Title: Mapping Between NFSv4 and Posix Draft ACLs
++ *   Authors: Marius Aamodt Eriksen & J. Bruce Fields
++ *       URL: http://tools.ietf.org/html/draft-ietf-nfsv4-acl-mapping-05
++ */
++
++
++#include <acl/libacl.h>
++#include "nfs4_acls.h"
++#include "fsal_types.h"
++#include <sys/acl.h>
++#include "posix_acls.h"
++
++/* add permissions in posix acl entry according to allow ace */
++void
++convert_allow_entry_to_posix(fsal_ace_t *ace, acl_permset_t *p_permset) {
++
++	if (IS_FSAL_ACE_READ_DATA(*ace))
++		acl_add_perm(*p_permset, ACL_READ);
++	if (IS_FSAL_ACE_WRITE_DATA(*ace))
++		acl_add_perm(*p_permset, ACL_WRITE);
++	if (IS_FSAL_ACE_EXECUTE(*ace))
++		acl_add_perm(*p_permset, ACL_EXECUTE);
++}
++
++/* delete permissions in posix acl entry according to deny ace */
++void
++convert_deny_entry_to_posix(fsal_ace_t *ace, acl_permset_t *p_permset) {
++
++	if (IS_FSAL_ACE_READ_DATA(*ace))
++		acl_delete_perm(*p_permset, ACL_READ);
++	if (IS_FSAL_ACE_WRITE_DATA(*ace))
++		acl_delete_perm(*p_permset, ACL_WRITE);
++	if (IS_FSAL_ACE_EXECUTE(*ace))
++		acl_delete_perm(*p_permset, ACL_EXECUTE);
++}
++
++/* Finds ACL entry with help of tag and id */
++acl_entry_t
++find_entry(acl_t acl, acl_tag_t tag, int id) {
++	acl_entry_t entry;
++	acl_tag_t entryTag;
++	int ent, ret;
++
++	if (!acl)
++		return NULL;
++
++	for (ent = ACL_FIRST_ENTRY; ; ent = ACL_NEXT_ENTRY) {
++		ret = acl_get_entry(acl, ent, &entry);
++		if (ret == -1) {
++			LogWarn(COMPONENT_FSAL, "acl_get entry failed errno %d",
++					errno);
++		}
++		if (ret == 0 || ret == -1)
++			return NULL;
++
++		if (acl_get_tag_type(entry, &entryTag) == -1) {
++			LogWarn(COMPONENT_FSAL, "No entry tag for ACL Entry");
++			continue;
++		}
++		if (tag == entryTag) {
++			if (tag == ACL_USER || tag == ACL_GROUP)
++				if (id != *(int *)acl_get_qualifier(entry))
++					continue;
++			break;
++		}
++	}
++
++	return entry;
++}
++
++/*
++ *  Given a POSIX ACL convert it into an equivalent FSAL ACL
++ */
++fsal_status_t
++posix_acl_2_fsal_acl(acl_t p_posixacl, fsal_acl_t **p_falacl)
++{
++	int ret = 0, ent, i = 0;
++	fsal_acl_status_t status;
++	fsal_acl_data_t acldata;
++	fsal_ace_t *pace = NULL;
++	fsal_acl_t *pacl = NULL;
++	acl_entry_t entry, mask;
++	acl_tag_t tag;
++	acl_permset_t p_permset;
++	bool readmask = true;
++	bool writemask = true;
++	bool executemask = true;
++
++	if (!p_posixacl)
++		return fsalstat(ERR_FSAL_FAULT, ret);
++
++	acldata.naces = acl_entries(p_posixacl);
++
++	if (!acldata.naces)
++		return fsalstat(ERR_FSAL_FAULT, ret);
++
++	mask = find_entry(p_posixacl, ACL_MASK, 0);
++	if (mask) {
++		ret = acl_get_permset(mask, &p_permset);
++		if (ret)
++			LogWarn(COMPONENT_FSAL,
++			"Cannot retrieve permission set for the Mask Entry");
++		if (acl_get_perm(p_permset, ACL_READ) == 0)
++			readmask = false;
++		if (acl_get_perm(p_permset, ACL_WRITE) == 0)
++			writemask = false;
++		if (acl_get_perm(p_permset, ACL_EXECUTE) == 0)
++			executemask = false;
++		acldata.naces--;
++	}
++	/* *
++	 * Only ALLOW ACL Entries considered right now
++	 * TODO : How to display DENY ACL Entries
++	 * */
++	acldata.aces = (fsal_ace_t *) nfs4_ace_alloc(acldata.naces);
++
++	for (pace = acldata.aces, ent = ACL_FIRST_ENTRY;
++		i < acldata.naces; ent = ACL_NEXT_ENTRY) {
++
++		ret = acl_get_entry(p_posixacl, ent, &entry);
++		if (ret == 0 || ret == -1) {
++			LogWarn(COMPONENT_FSAL,
++					"No more ACL entires remaining");
++			break;
++		}
++		if (acl_get_tag_type(entry, &tag) == -1) {
++			LogWarn(COMPONENT_FSAL, "No entry tag for ACL Entry");
++			continue;
++		}
++		/* Mask is not converted to a fsal_acl entry , skipping */
++		if (tag == ACL_MASK)
++			continue;
++
++		pace->type = FSAL_ACE_TYPE_ALLOW;
++		pace->flag = 0;
++
++		/* Finding uid for the fsal_acl entry */
++		switch (tag) {
++		case  ACL_USER_OBJ:
++			pace->who.uid =  FSAL_ACE_SPECIAL_OWNER;
++			pace->iflag = FSAL_ACE_IFLAG_SPECIAL_ID;
++			break;
++		case  ACL_GROUP_OBJ:
++			pace->who.uid =  FSAL_ACE_SPECIAL_GROUP;
++			pace->iflag = FSAL_ACE_IFLAG_SPECIAL_ID;
++			break;
++		case  ACL_OTHER:
++			pace->who.uid =  FSAL_ACE_SPECIAL_EVERYONE;
++			pace->iflag = FSAL_ACE_IFLAG_SPECIAL_ID;
++			break;
++		case  ACL_USER:
++			pace->who.uid =
++				*(uid_t *)acl_get_qualifier(entry);
++			break;
++		case  ACL_GROUP:
++			pace->who.gid =
++				*(gid_t *)acl_get_qualifier(entry);
++			pace->flag = FSAL_ACE_FLAG_GROUP_ID;
++			break;
++		default:
++			LogWarn(COMPONENT_FSAL, "Invalid tag for the acl");
++		}
++
++		/* *
++		 * Finding permission set for the fsal_acl entry.
++		 * Conversion purely is based on
++		 * http://tools.ietf.org/html/draft-ietf-nfsv4-acl-mapping-05
++		 * */
++
++		/* *
++		 * Unconditionally all ALLOW ACL Entry should
++		 * have these permissions
++		 * */
++
++		pace->perm = FSAL_ACE_PERM_SET_DEFAULT;
++		ret = acl_get_permset(entry, &p_permset);
++		if (ret) {
++			LogWarn(COMPONENT_FSAL,
++			"Cannot retrieve permission set for the ACL Entry");
++			continue;
++		}
++		/* *
++		 * Consider Mask bits only for ACL_USER, ACL_GROUP,
++		 * ACL_GROUP_OBJ entries
++		 * */
++		if (acl_get_perm(p_permset, ACL_READ)) {
++			if (tag == ACL_USER_OBJ || tag == ACL_OTHER ||
++						readmask)
++				pace->perm = pace->perm
++						| FSAL_ACE_PERM_READ_DATA;
++		}
++		if (acl_get_perm(p_permset, ACL_WRITE)) {
++			if (tag == ACL_USER_OBJ || tag == ACL_OTHER ||
++						writemask)
++				pace->perm = pace->perm
++					| FSAL_ACE_PERM_SET_DEFAULT_WRITE;
++			if (tag == ACL_USER_OBJ)
++				pace->perm = pace->perm
++						| FSAL_ACE_PERM_SET_OWNER_WRITE;
++		}
++		if (acl_get_perm(p_permset, ACL_EXECUTE)) {
++			if (tag == ACL_USER_OBJ || tag == ACL_OTHER ||
++						executemask)
++				pace->perm = pace->perm
++						| FSAL_ACE_PERM_EXECUTE;
++		}
++		i++;
++		pace++;
++	}
++	pacl = nfs4_acl_new_entry(&acldata, &status);
++	LogMidDebug(COMPONENT_FSAL, "fsal acl = %p, fsal_acl_status = %u", pacl,
++		    status);
++	if (pacl == NULL) {
++		LogCrit(COMPONENT_FSAL,
++		"posix_acl_2_fsal_acl: failed to create a new acl entry");
++		return fsalstat(ERR_FSAL_FAULT, ret);
++	} else {
++		*p_falacl = pacl;
++		return fsalstat(ERR_FSAL_NO_ERROR, ret);
++	}
++}
++
++/*
++ *  Given a FSAL ACL convert it into an equivalent POSIX ACL
++ */
++acl_t
++fsal_acl_2_posix_acl(fsal_acl_t *p_fsalacl)
++{
++	int ret = 0, i, u_count = 0, g_count = 0;
++	fsal_ace_t *f_ace, *deny_ace = NULL;
++	acl_t p_acl;
++	acl_entry_t p_entry;
++	acl_permset_t p_permset;
++	/* FIXME : The no of users/groups is limited to hundred here */
++	uid_t uid[100], tmp_uid;
++	gid_t gid[100], tmp_gid;
++	bool user = false;
++	bool group = false;
++	bool dup_entry = false;
++
++	if (p_fsalacl == NULL)
++		return NULL;
++	/*
++	 * Populating list of users and group which are not special.
++	 * Mulitple entries for same users and group is possible, so
++	 * avoid duplicate entries in the array.
++	 * TODO: Use a separate api for performing this function
++	 * Annoymous users/groups (id = -1) should handle properly
++	 */
++	for (f_ace = p_fsalacl->aces;
++	f_ace < p_fsalacl->aces + p_fsalacl->naces; f_ace++) {
++		if (!IS_FSAL_ACE_SPECIAL_ID(*f_ace)) {
++			if (IS_FSAL_ACE_GROUP_ID(*f_ace)) {
++				tmp_gid = GET_FSAL_ACE_WHO(*f_ace);
++				for (i = 0; i < g_count ; i++) {
++					if (gid[i] == tmp_gid) {
++						dup_entry = true;
++						break;
++					}
++				}
++				if (dup_entry) {
++					dup_entry = false;
++					continue;
++				}
++				gid[g_count++] = tmp_gid;
++			} else {
++				tmp_uid = GET_FSAL_ACE_WHO(*f_ace);
++				for (i = 0; i < u_count ; i++) {
++					if (uid[i] == tmp_uid) {
++						dup_entry = true;
++						break;
++					}
++				}
++				if (dup_entry) {
++					dup_entry = false;
++					continue;
++				}
++				uid[u_count++] = tmp_uid;
++			}
++		}
++	}
++	if (u_count > 0)
++		user = true;
++	if (g_count > 0)
++		group = true;
++
++	LogDebug(COMPONENT_FSAL, "u_count = %d g_count = %d entries = %d",
++		       u_count, g_count, p_fsalacl->naces);
++	/*
++	 * The fsal_acl list is unordered, but we need to keep posix_acl in
++	 * a specific order such that users, groups, other.So we will fetch
++	 * ACE's from the fsal_acl in that order and convert it into a
++	 * corresponding posix_acl entry
++	 *
++	 * TODO: Currently there are lots of code duplication in this api
++	 *       So its better implement different api's for :
++	 *             1.) fetching a required ACE from fsal_acl
++	 *             2.) Convert a ACE into corresponding posix_acl_entry
++	 *	and use them
++	 */
++	p_acl = acl_init(p_fsalacl->naces);
++
++	ret = acl_create_entry(&p_acl, &p_entry);
++	if (ret) {
++		LogMajor(COMPONENT_FSAL, "Cannot create entry for user");
++		return NULL;
++	}
++
++	ret = acl_set_tag_type(p_entry, ACL_USER_OBJ);
++	if (ret)
++		LogWarn(COMPONENT_FSAL, "Cannot set tag for Entry");
++
++	ret = acl_get_permset(p_entry, &p_permset);
++
++	/* Deny entry is handled at the end */
++	for (f_ace = p_fsalacl->aces;
++		f_ace < p_fsalacl->aces + p_fsalacl->naces; f_ace++) {
++			if (IS_FSAL_ACE_SPECIAL_OWNER(*f_ace)) {
++				if (IS_FSAL_ACE_DENY(*f_ace))
++					deny_ace = f_ace;
++				else if (IS_FSAL_ACE_ALLOW(*f_ace))
++					convert_allow_entry_to_posix(f_ace,
++								&p_permset);
++			}
++	}
++
++	if (deny_ace) {
++		convert_deny_entry_to_posix(deny_ace, &p_permset);
++		deny_ace = NULL;
++	}
++
++	if (user) {
++		for (i = 0; i < u_count; i++) {
++			ret = acl_create_entry(&p_acl, &p_entry);
++			if (ret)
++				LogWarn(COMPONENT_FSAL,
++					"Cannot create entry for user id %d",
++					uid[i]);
++			ret = acl_set_tag_type(p_entry, ACL_USER);
++			if (ret)
++				LogWarn(COMPONENT_FSAL,
++					"Cannot set tag for ACL Entry");
++
++			ret = acl_set_qualifier(p_entry, &uid[i]);
++
++			ret = acl_get_permset(p_entry, &p_permset);
++			for (f_ace = p_fsalacl->aces;
++			f_ace < p_fsalacl->aces + p_fsalacl->naces; f_ace++) {
++				if (IS_FSAL_ACE_USER(*f_ace, uid[i])) {
++					if (IS_FSAL_ACE_DENY(*f_ace))
++						deny_ace = f_ace;
++					else if (IS_FSAL_ACE_ALLOW(*f_ace))
++						convert_allow_entry_to_posix(
++							f_ace, &p_permset);
++				}
++			}
++
++			if (deny_ace) {
++				convert_deny_entry_to_posix(deny_ace,
++								 &p_permset);
++				deny_ace = NULL;
++			}
++			if (!acl_get_perm(p_permset, ACL_READ)
++				&& !acl_get_perm(p_permset, ACL_WRITE)
++				&& !acl_get_perm(p_permset, ACL_EXECUTE))
++				acl_delete_entry(p_acl, p_entry);
++		}
++	}
++	ret = acl_create_entry(&p_acl, &p_entry);
++	if (ret) {
++		LogMajor(COMPONENT_FSAL, "Cannot create entry for group");
++		return NULL;
++	}
++
++	ret = acl_set_tag_type(p_entry, ACL_GROUP_OBJ);
++	if (ret)
++		LogWarn(COMPONENT_FSAL, "Cannot set tag for ACL Entry");
++	ret = acl_get_permset(p_entry, &p_permset);
++
++	for (f_ace = p_fsalacl->aces;
++		f_ace < p_fsalacl->aces + p_fsalacl->naces; f_ace++) {
++			if (IS_FSAL_ACE_SPECIAL_GROUP(*f_ace)) {
++				if (IS_FSAL_ACE_DENY(*f_ace))
++					deny_ace = f_ace;
++				else if (IS_FSAL_ACE_ALLOW(*f_ace))
++					convert_allow_entry_to_posix(f_ace,
++								&p_permset);
++			}
++	}
++
++	if (deny_ace) {
++		convert_deny_entry_to_posix(deny_ace, &p_permset);
++		deny_ace = NULL;
++	}
++
++	if (group) {
++		for (i = 0; i < g_count; i++) {
++			ret = acl_create_entry(&p_acl, &p_entry);
++			if (ret)
++				LogWarn(COMPONENT_FSAL,
++				"Cannot create entry for group id %d",
++				gid[i]);
++
++			ret = acl_set_tag_type(p_entry, ACL_GROUP);
++			if (ret)
++				LogWarn(COMPONENT_FSAL,
++				      "Cannot set tag for ACL Entry");
++
++			ret = acl_set_qualifier(p_entry, &gid[i]);
++
++			ret = acl_get_permset(p_entry, &p_permset);
++			for (f_ace = p_fsalacl->aces;
++			f_ace < p_fsalacl->aces + p_fsalacl->naces; f_ace++) {
++				if (IS_FSAL_ACE_GROUP(*f_ace, gid[i])) {
++					if (IS_FSAL_ACE_DENY(*f_ace))
++						deny_ace = f_ace;
++					else if (IS_FSAL_ACE_ALLOW(*f_ace))
++						convert_allow_entry_to_posix(
++							f_ace, &p_permset);
++				}
++			}
++
++			if (deny_ace) {
++				convert_deny_entry_to_posix(deny_ace,
++								 &p_permset);
++				deny_ace = NULL;
++			}
++			if (!acl_get_perm(p_permset, ACL_READ)
++				&& !acl_get_perm(p_permset, ACL_WRITE)
++				     && !acl_get_perm(p_permset, ACL_EXECUTE))
++					acl_delete_entry(p_acl, p_entry);
++		}
++	}
++	ret = acl_create_entry(&p_acl, &p_entry);
++	if (ret) {
++		LogMajor(COMPONENT_FSAL, "Cannot create entry for other");
++		return NULL;
++	}
++	ret = acl_set_tag_type(p_entry, ACL_OTHER);
++	if (ret)
++		LogWarn(COMPONENT_FSAL, "Cannot set tag for ACL Entry");
++
++	ret = acl_get_permset(p_entry, &p_permset);
++	for (f_ace = p_fsalacl->aces;
++		f_ace < p_fsalacl->aces + p_fsalacl->naces; f_ace++) {
++			if (IS_FSAL_ACE_SPECIAL_EVERYONE(*f_ace)) {
++				if (IS_FSAL_ACE_DENY(*f_ace))
++					deny_ace = f_ace;
++				else if (IS_FSAL_ACE_ALLOW(*f_ace))
++					convert_allow_entry_to_posix(f_ace,
++								&p_permset);
++			}
++	}
++
++	if (deny_ace) {
++		convert_deny_entry_to_posix(deny_ace, &p_permset);
++		deny_ace = NULL;
++	}
++
++	/* calculate appropriate mask if it is needed*/
++	if (user || group) {
++		ret = acl_calc_mask(&p_acl);
++		if (ret)
++			LogWarn(COMPONENT_FSAL,
++			"Cannot calculate mask for posix");
++	}
++
++	/* A valid acl_t should have only one entry for
++	 * ACL_USER_OBJ, ACL_GROUP_OBJ, ACL_OTHER and
++	 * ACL_MASK is required only if ACL_USER or
++	 * ACL_GROUP exists
++	 */
++	ret = acl_check(p_acl, &i);
++	if (ret) {
++		if (ret > 0) {
++			LogWarn(COMPONENT_FSAL,
++			"Error converting ACL: %s at entry no %d",
++			acl_error(ret), i);
++		}
++		return NULL;
++
++	}
++	LogDebug(COMPONENT_FSAL, "posix acl = %s ",
++				acl_to_any_text(p_acl, NULL, ',',
++					TEXT_ABBREVIATE |
++					TEXT_NUMERIC_IDS));
++	return p_acl;
++}
+diff --git a/src/FSAL/FSAL_GLUSTER/posix_acls.h b/src/FSAL/FSAL_GLUSTER/posix_acls.h
+new file mode 100644
+index 0000000..c72f5f6
+--- /dev/null
++++ b/src/FSAL/FSAL_GLUSTER/posix_acls.h
+@@ -0,0 +1,21 @@
++#include <sys/acl.h>
++
++#include "fsal_types.h"
++
++/* permission set for ACE's */
++#define FSAL_ACE_PERM_SET_DEFAULT \
++	(FSAL_ACE_PERM_READ_ACL	| FSAL_ACE_PERM_READ_ATTR \
++	| FSAL_ACE_PERM_SYNCHRONIZE)
++#define FSAL_ACE_PERM_SET_DEFAULT_WRITE \
++	(FSAL_ACE_PERM_WRITE_DATA | FSAL_ACE_PERM_APPEND_DATA)
++#define FSAL_ACE_PERM_SET_OWNER_WRITE \
++	(FSAL_ACE_PERM_WRITE_ACL | FSAL_ACE_PERM_WRITE_ATTR)
++
++fsal_status_t
++posix_acl_2_fsal_acl(acl_t p_posixacl, fsal_acl_t **p_falacl);
++
++acl_t
++fsal_acl_2_posix_acl(fsal_acl_t *p_fsalacl);
++
++acl_entry_t
++find_entry(acl_t acl, acl_tag_t tag, int id);
+diff --git a/src/nfs-ganesha.spec-in.cmake b/src/nfs-ganesha.spec-in.cmake
+index cca6cc2..a81c0dd 100644
+--- a/src/nfs-ganesha.spec-in.cmake
++++ b/src/nfs-ganesha.spec-in.cmake
+@@ -317,8 +317,8 @@ be used with NFS-Ganesha to support PT
+ Summary: The NFS-GANESHA's GLUSTER FSAL
+ Group: Applications/System
+ Requires:	nfs-ganesha = %{version}-%{release}
+-BuildRequires:	glusterfs-api-devel >= 3.5.1
+-BuildRequires:	libattr-devel
++BuildRequires:        glusterfs-api-devel >= 3.7
++BuildRequires:        libattr-devel, libacl-devel
+ 
+ %description gluster
+ This package contains a FSAL shared object to
+-- 
+1.7.1
+

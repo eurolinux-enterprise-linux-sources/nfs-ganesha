@@ -1,0 +1,245 @@
+From c65ad9ec358478aab3a8081bd18c8b25612a87fd Mon Sep 17 00:00:00 2001
+From: Soumya Koduri <skoduri@redhat.com>
+Date: Thu, 9 Jul 2015 12:01:59 +0530
+Subject: [PATCH] FSAL_GLUSTER: Bail out in case of larger lock ranges (>INT64_MAX)
+
+The offset/length of nfs4 lock args is of type uint64_t. In case of
+larger lock ranges(>INT64_MAX), when we map those locks into flock
+structure, flock.l_len could get negative value. Since posix locks
+can accept negative values for 'l_len' we shall end up in unlocking
+an unintended range. Instead bail out and return EBAD_RANGE in such cases.
+
+Change-Id: I7dfd740aadd9d9baf48dbc42cb9d1641c3c3f42d
+Signed-off-by: Soumya Koduri <skoduri@redhat.com>
+---
+ src/FSAL/FSAL_GLUSTER/handle.c      |   15 +++++++++++++++
+ src/FSAL/FSAL_VFS/file.c            |   13 +++++++++++++
+ src/FSAL/commonlib.c                |    2 ++
+ src/Protocols/NFS/nfs_proto_tools.c |    1 +
+ src/Protocols/NLM/nlm_util.c        |    1 +
+ src/SAL/state_misc.c                |   12 ++++++++++++
+ src/cache_inode/cache_inode_misc.c  |    5 +++++
+ src/include/fsal_types.h            |    1 +
+ src/include/gsh_status.h            |    2 ++
+ src/support/nfs_convert.c           |    5 +++++
+ 10 files changed, 57 insertions(+), 0 deletions(-)
+
+diff --git a/src/FSAL/FSAL_GLUSTER/handle.c b/src/FSAL/FSAL_GLUSTER/handle.c
+index 7a7083e..c92eb30 100644
+--- a/src/FSAL/FSAL_GLUSTER/handle.c
++++ b/src/FSAL/FSAL_GLUSTER/handle.c
+@@ -1246,6 +1246,21 @@ static fsal_status_t lock_op(struct fsal_obj_handle *obj_hdl,
+ 	flock.l_start = request_lock->lock_start;
+ 	flock.l_whence = SEEK_SET;
+ 
++	/* flock.l_len being signed long integer, larger lock ranges may
++	 * get mapped to negative values. As per 'man 3 fcntl', posix
++	 * locks can accept negative l_len values which may lead to
++	 * unlocking an unintended range. Better bail out to prevent that.
++	 *
++	 * TODO: How do we support larger ranges (>INT64_MAX) then?
++	 */
++	if (flock.l_len < 0) {
++		LogCrit(COMPONENT_FSAL,
++			"The requested lock length is out of range- flock.l_len(%ld), request_lock_length(%lu)",
++			flock.l_len, request_lock->lock_length);
++		status.major = ERR_FSAL_BAD_RANGE;
++		goto out;
++	}
++
+ 	rc = glfs_posix_lock(objhandle->glfd, cmd, &flock);
+ 	if (rc != 0 && lock_op == FSAL_OP_LOCK
+ 	    && conflicting_lock && (errno == EACCES || errno == EAGAIN)) {
+diff --git a/src/FSAL/FSAL_VFS/file.c b/src/FSAL/FSAL_VFS/file.c
+index f04e771..39f0071 100644
+--- a/src/FSAL/FSAL_VFS/file.c
++++ b/src/FSAL/FSAL_VFS/file.c
+@@ -302,6 +302,19 @@ fsal_status_t vfs_lock_op(struct fsal_obj_handle *obj_hdl,
+ 	lock_args.l_start = request_lock->lock_start;
+ 	lock_args.l_whence = SEEK_SET;
+ 
++	/* flock.l_len being signed long integer, larger lock ranges may
++	 * get mapped to negative values. As per 'man 3 fcntl', posix
++	 * locks can accept negative l_len values which may lead to
++	 * unlocking an unintended range. Better bail out to prevent that.
++	 */
++	if (lock_args.l_len < 0) {
++		LogCrit(COMPONENT_FSAL,
++			"The requested lock length is out of range- lock_args.l_len(%ld), request_lock_length(%lu)",
++			lock_args.l_len, request_lock->lock_length);
++		fsal_error = ERR_FSAL_BAD_RANGE;
++		goto out;
++	}
++
+ 	errno = 0;
+ 	retval = fcntl(myself->u.file.fd, fcntl_comm, &lock_args);
+ 	if (retval && lock_op == FSAL_OP_LOCK) {
+diff --git a/src/FSAL/commonlib.c b/src/FSAL/commonlib.c
+index d2bb0c9..6b1f707 100644
+--- a/src/FSAL/commonlib.c
++++ b/src/FSAL/commonlib.c
+@@ -327,6 +327,8 @@ const char *msg_fsal_err(fsal_errors_t fsal_err)
+ 		return "Union Not Supported";
+ 	case ERR_FSAL_IN_GRACE:
+ 		return "Server in Grace";
++        case ERR_FSAL_BAD_RANGE:
++                return "Lock not in allowable range";
+ 	}
+ 
+ 	return "Unknown FSAL error";
+diff --git a/src/Protocols/NFS/nfs_proto_tools.c b/src/Protocols/NFS/nfs_proto_tools.c
+index 2bbe1f8..2812987 100644
+--- a/src/Protocols/NFS/nfs_proto_tools.c
++++ b/src/Protocols/NFS/nfs_proto_tools.c
+@@ -229,6 +229,7 @@ bool nfs_RetryableError(cache_inode_status_t cache_status)
+ 	case CACHE_INODE_CROSS_JUNCTION:
+ 	case CACHE_INODE_IN_GRACE:
+ 	case CACHE_INODE_BADHANDLE:
++	case CACHE_INODE_BAD_RANGE:
+ 		/* Non retryable error, return error to client */
+ 		return false;
+ 		break;
+diff --git a/src/Protocols/NLM/nlm_util.c b/src/Protocols/NLM/nlm_util.c
+index 2f27d18..e887226 100644
+--- a/src/Protocols/NLM/nlm_util.c
++++ b/src/Protocols/NLM/nlm_util.c
+@@ -537,6 +537,7 @@ nlm4_stats nlm_convert_state_error(state_status_t status)
+ 	case STATE_ESTALE:
+ 		return NLM4_STALE_FH;
+ 	case STATE_FILE_BIG:
++	case STATE_BAD_RANGE:
+ 		return NLM4_FBIG;
+ 	default:
+ 		return NLM4_FAILED;
+diff --git a/src/SAL/state_misc.c b/src/SAL/state_misc.c
+index f65c636..88a135a 100644
+--- a/src/SAL/state_misc.c
++++ b/src/SAL/state_misc.c
+@@ -166,6 +166,8 @@ const char *state_err_str(state_status_t err)
+ 		return "STATE_IN_GRACE";
+ 	case STATE_BADHANDLE:
+ 		return "STATE_BADHANDLE";
++	case STATE_BAD_RANGE:
++		return "STATE_BAD_RANGE";
+ 	}
+ 	return "unknown";
+ }
+@@ -267,6 +269,8 @@ state_status_t cache_inode_status_to_state_status(cache_inode_status_t status)
+ 		return STATE_IN_GRACE;
+ 	case CACHE_INODE_BADHANDLE:
+ 		return STATE_BADHANDLE;
++	case CACHE_INODE_BAD_RANGE:
++		return STATE_BAD_RANGE;
+ 	}
+ 	return STATE_CACHE_INODE_ERR;
+ }
+@@ -362,6 +366,9 @@ state_status_t state_error_convert(fsal_status_t fsal_status)
+ 	case ERR_FSAL_BADHANDLE:
+ 		return STATE_BADHANDLE;
+ 
++	case ERR_FSAL_BAD_RANGE:
++		return STATE_BAD_RANGE;
++
+ 	case ERR_FSAL_DQUOT:
+ 	case ERR_FSAL_NAMETOOLONG:
+ 	case ERR_FSAL_EXIST:
+@@ -557,6 +564,10 @@ nfsstat4 nfs4_Errno_state(state_status_t error)
+ 		nfserror = NFS4ERR_BADHANDLE;
+ 		break;
+ 
++	case STATE_BAD_RANGE:
++		nfserror = NFS4ERR_BAD_RANGE;
++		break;
++
+ 	case STATE_INVALID_ARGUMENT:
+ 	case STATE_CACHE_INODE_ERR:
+ 	case STATE_INCONSISTENT_ENTRY:
+@@ -724,6 +735,7 @@ nfsstat3 nfs3_Errno_state(state_status_t error)
+ 	case STATE_LOCK_DEADLOCK:
+ 	case STATE_GRACE_PERIOD:
+ 	case STATE_SIGNAL_ERROR:
++	case STATE_BAD_RANGE:
+ 		/* Should not occur */
+ 		LogCrit(COMPONENT_NFSPROTO,
+ 			"Unexpected status for conversion = %s",
+diff --git a/src/cache_inode/cache_inode_misc.c b/src/cache_inode/cache_inode_misc.c
+index f79e119..d34a00b 100644
+--- a/src/cache_inode/cache_inode_misc.c
++++ b/src/cache_inode/cache_inode_misc.c
+@@ -149,6 +149,8 @@ cache_inode_err_str(cache_inode_status_t err)
+ 		return "CACHE_INODE_CROSS_JUNCTION";
+ 	case CACHE_INODE_BADHANDLE:
+ 		return "CACHE_INODE_BADHANDLE";
++	case CACHE_INODE_BAD_RANGE:
++		return "CACHE_INODE_BAD_RANGE";
+ 	}
+ 	return "unknown";
+ }
+@@ -686,6 +688,9 @@ cache_inode_error_convert(fsal_status_t fsal_status)
+ 	case ERR_FSAL_BADHANDLE:
+ 		return CACHE_INODE_BADHANDLE;
+ 
++	case ERR_FSAL_BAD_RANGE:
++		return CACHE_INODE_BAD_RANGE;
++
+ 	case ERR_FSAL_BLOCKED:
+ 	case ERR_FSAL_INTERRUPT:
+ 	case ERR_FSAL_NOT_INIT:
+diff --git a/src/include/fsal_types.h b/src/include/fsal_types.h
+index 0b073df..dfc40c2 100644
+--- a/src/include/fsal_types.h
++++ b/src/include/fsal_types.h
+@@ -667,6 +667,7 @@ typedef enum fsal_errors_t {
+ 	ERR_FSAL_SHARE_DENIED = 10015,
+ 	ERR_FSAL_SYMLINK = 10029,
+ 	ERR_FSAL_ATTRNOTSUPP = 10032,
++	ERR_FSAL_BAD_RANGE = 10042,
+ 	ERR_FSAL_NOT_INIT = 20001,
+ 	ERR_FSAL_ALREADY_INIT = 20002,
+ 	ERR_FSAL_BAD_INIT = 20003,
+diff --git a/src/include/gsh_status.h b/src/include/gsh_status.h
+index 2a663f0..3663589 100644
+--- a/src/include/gsh_status.h
++++ b/src/include/gsh_status.h
+@@ -86,6 +86,7 @@ typedef enum state_status {
+ 	STATE_FSAL_SHARE_DENIED,
+ 	STATE_IN_GRACE,
+ 	STATE_BADHANDLE,
++	STATE_BAD_RANGE,
+ } state_status_t;
+ 
+ #define STATE_FSAL_ESTALE STATE_ESTALE
+@@ -139,6 +140,7 @@ typedef enum cache_inode_status {
+ 	CACHE_INODE_CROSS_JUNCTION = 42,
+ 	CACHE_INODE_IN_GRACE = 43,
+ 	CACHE_INODE_BADHANDLE = 44,
++	CACHE_INODE_BAD_RANGE = 45,
+ } cache_inode_status_t;
+ 
+ #endif				/* !GSH_STATUS_H */
+diff --git a/src/support/nfs_convert.c b/src/support/nfs_convert.c
+index 5d72666..5e7390f 100644
+--- a/src/support/nfs_convert.c
++++ b/src/support/nfs_convert.c
+@@ -616,6 +616,10 @@ nfsstat4 nfs4_Errno_verbose(cache_inode_status_t error, const char *where)
+ 		nfserror = NFS4ERR_GRACE;
+ 		break;
+ 
++	case CACHE_INODE_BAD_RANGE:
++		nfserror = NFS4ERR_BAD_RANGE;
++		break;
++
+ 	case CACHE_INODE_INCONSISTENT_ENTRY:
+ 	case CACHE_INODE_HASH_TABLE_ERROR:
+ 	case CACHE_INODE_ASYNC_POST_ERROR:
+@@ -789,6 +793,7 @@ nfsstat3 nfs3_Errno_verbose(cache_inode_status_t error, const char *where)
+ 	case CACHE_INODE_ASYNC_POST_ERROR:
+ 	case CACHE_INODE_STATE_ERROR:
+ 	case CACHE_INODE_CROSS_JUNCTION:
++	case CACHE_INODE_BAD_RANGE:
+ 		/* Should not occur */
+ 		LogDebug(COMPONENT_NFSPROTO,
+ 			 "Line %u should never be reached in nfs3_Errno"
+-- 
+1.7.1
+

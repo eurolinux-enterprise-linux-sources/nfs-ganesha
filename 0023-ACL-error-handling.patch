@@ -1,0 +1,87 @@
+From fb079418a69295a07b6f9670da113e46e9dac679 Mon Sep 17 00:00:00 2001
+From: Jiffin Tony Thottan <jthottan@redhat.com>
+Date: Tue, 21 Jul 2015 17:15:04 +0530
+Subject: [PATCH 1/3] FSAL_GLUSTER : Handling errors properly in acl api's
+
+Previously for all acl failures , glusterfs_get_acl() returns serverfault
+regardless which error it is returning from gluster. So a fop can fail if
+it is failed to fetch acl.
+
+Change-Id: Ia547c33d8af642484f9eaf051a750098c0097f92
+Signed-off-by: Jiffin Tony Thottan <jthottan@redhat.com>
+---
+ src/FSAL/FSAL_GLUSTER/gluster_internal.c |  2 +-
+ src/FSAL/FSAL_GLUSTER/posix_acls.c       | 12 ++++++------
+ 2 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/src/FSAL/FSAL_GLUSTER/gluster_internal.c b/src/FSAL/FSAL_GLUSTER/gluster_internal.c
+index 5f46bc8..cff83c4 100644
+--- a/src/FSAL/FSAL_GLUSTER/gluster_internal.c
++++ b/src/FSAL/FSAL_GLUSTER/gluster_internal.c
+@@ -431,7 +431,7 @@ fsal_status_t glusterfs_get_acl(struct glusterfs_export *glfs_export,
+ 		} else {
+ 			/* some real error occurred */
+ 			LogMajor(COMPONENT_FSAL, "failed to fetch ACL");
+-			return fsalstat(ERR_FSAL_SERVERFAULT, errno);
++			status = gluster2fsal_error(errno);
+ 		}
+ 
+ 	}
+diff --git a/src/FSAL/FSAL_GLUSTER/posix_acls.c b/src/FSAL/FSAL_GLUSTER/posix_acls.c
+index 7d6d867..566b1b1 100644
+--- a/src/FSAL/FSAL_GLUSTER/posix_acls.c
++++ b/src/FSAL/FSAL_GLUSTER/posix_acls.c
+@@ -139,12 +139,12 @@ posix_acl_2_fsal_acl(acl_t p_posixacl, fsal_acl_t **p_falacl)
+ 	bool executemask = true;
+ 
+ 	if (!p_posixacl)
+-		return fsalstat(ERR_FSAL_FAULT, ret);
++		return fsalstat(ERR_FSAL_NOENT, ret);
+ 
+ 	acldata.naces = acl_entries(p_posixacl);
+ 
+ 	if (!acldata.naces)
+-		return fsalstat(ERR_FSAL_FAULT, ret);
++		return fsalstat(ERR_FSAL_NOENT, ret);
+ 
+ 	mask = find_entry(p_posixacl, ACL_MASK, 0);
+ 	if (mask) {
+@@ -265,7 +265,7 @@ posix_acl_2_fsal_acl(acl_t p_posixacl, fsal_acl_t **p_falacl)
+ 	if (pacl == NULL) {
+ 		LogCrit(COMPONENT_FSAL,
+ 		"posix_acl_2_fsal_acl: failed to create a new acl entry");
+-		return fsalstat(ERR_FSAL_FAULT, ret);
++		return fsalstat(ERR_FSAL_FAULT, status);
+ 	} else {
+ 		*p_falacl = pacl;
+ 		return fsalstat(ERR_FSAL_NO_ERROR, ret);
+@@ -682,7 +682,7 @@ posix_acl_2_fsal_acl_for_dir(acl_t e_acl, acl_t i_acl, fsal_acl_t **p_falacl)
+ 	bool i_executemask = true;
+ 
+ 	if (!e_acl)
+-		return fsalstat(ERR_FSAL_FAULT, ret);
++		return fsalstat(ERR_FSAL_NOENT, ret);
+ 	/* *
+ 	 * Here both effective acl and default acl need to be converted,
+ 	 * then store it fsal acl, order for ACE entries doesnot matter
+@@ -721,7 +721,7 @@ posix_acl_2_fsal_acl_for_dir(acl_t e_acl, acl_t i_acl, fsal_acl_t **p_falacl)
+ 
+ 	acldata.naces = ne + ni;
+ 	if (!acldata.naces)
+-		return fsalstat(ERR_FSAL_FAULT, ret);
++		return fsalstat(ERR_FSAL_NOENT, ret);
+ 
+ 	acldata.aces = (fsal_ace_t *) nfs4_ace_alloc(acldata.naces);
+ 
+@@ -922,7 +922,7 @@ posix_acl_2_fsal_acl_for_dir(acl_t e_acl, acl_t i_acl, fsal_acl_t **p_falacl)
+ 	if (pacl == NULL) {
+ 		LogCrit(COMPONENT_FSAL,
+ 		"posix_acl_2_fsal_acl_for_dir: failed to create a new acl entry");
+-		return fsalstat(ERR_FSAL_FAULT, ret);
++		return fsalstat(ERR_FSAL_FAULT, status);
+ 	} else {
+ 		*p_falacl = pacl;
+ 		return fsalstat(ERR_FSAL_NO_ERROR, ret);
+-- 
+2.1.0
+

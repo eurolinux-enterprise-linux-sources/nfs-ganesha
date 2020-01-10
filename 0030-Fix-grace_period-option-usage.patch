@@ -1,0 +1,42 @@
+From cc493643820949c06e93cd7216e78652bde1842a Mon Sep 17 00:00:00 2001
+From: Soumya Koduri <skoduri@redhat.com>
+Date: Fri, 30 Oct 2015 23:11:35 +0530
+Subject: [PATCH] nfs: Use option grace_period to determine grace timeout
+
+Till now, 'lease_lifetime' was used to determine grace period
+value which is not correct. Have corrected it to rightly use the
+grace_period(GracePeriod) option.
+
+If in case grace period configured is less than lease duration, log
+a warning.
+
+Change-Id: Ic45efe86381bae22f7a8d8bc56bafa9cb3516717
+Signed-off-by: Soumya Koduri <skoduri@redhat.com>
+---
+ src/SAL/nfs4_recovery.c |   10 +++++++++-
+ 1 files changed, 9 insertions(+), 1 deletions(-)
+
+diff --git a/src/SAL/nfs4_recovery.c b/src/SAL/nfs4_recovery.c
+index f7fbdf3..61eb965 100644
+--- a/src/SAL/nfs4_recovery.c
++++ b/src/SAL/nfs4_recovery.c
+@@ -85,7 +85,15 @@ void nfs4_start_grace(nfs_grace_start_t *gsp)
+ 	 * setups.
+ 	 */
+ 	grace.g_start = time(NULL);
+-	grace.g_duration = nfs_param.nfsv4_param.lease_lifetime;
++	grace.g_duration = nfs_param.nfsv4_param.grace_period;
++
++	if ((int)nfs_param.nfsv4_param.grace_period <
++		(int)nfs_param.nfsv4_param.lease_lifetime) {
++		LogWarn(COMPONENT_STATE,
++		 "NFS Server GRACE duration should at least match LEASE period. Current configured values are GRACE(%d), LEASE(%d)",
++		 (int)nfs_param.nfsv4_param.grace_period,
++		 (int)nfs_param.nfsv4_param.lease_lifetime);
++	}
+ 
+ 	LogEvent(COMPONENT_STATE, "NFS Server Now IN GRACE, duration %d",
+ 		 (int)grace.g_duration);
+-- 
+1.7.1
+

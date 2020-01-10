@@ -1,0 +1,72 @@
+From e1ac1bb5e74200144ebfa21b48f9a667b9eb65c7 Mon Sep 17 00:00:00 2001
+From: Anand Subramanian <anands@redhat.com>
+Date: Thu, 14 May 2015 22:07:03 +0530
+Subject: [PATCH 17/20] Fixing FSAL_GLUSTER NFSv3 crash in iozone test.
+
+The commit fixes the use of glfs_fstat replacing it
+with glfs_h_stat since we cannot rely on fstat
+as the glfd context can get destroyed under the covers
+due to a close from cache_inode_open contending
+with a getattrs call.
+
+Change-Id: I2f996b8f93fd27708c1a768e326e4c8c3008ac26
+Signed-off-by: Anand Subramanian <anands@redhat.com>
+---
+ src/FSAL/FSAL_GLUSTER/handle.c |   22 +++++++++++++++-------
+ src/FSAL/FSAL_GLUSTER/mds.c    |    7 ++-----
+ 2 files changed, 17 insertions(+), 12 deletions(-)
+
+diff --git a/src/FSAL/FSAL_GLUSTER/handle.c b/src/FSAL/FSAL_GLUSTER/handle.c
+index feecbc9..a2ad641 100644
+--- a/src/FSAL/FSAL_GLUSTER/handle.c
++++ b/src/FSAL/FSAL_GLUSTER/handle.c
+@@ -655,13 +655,21 @@ static fsal_status_t getattrs(struct fsal_obj_handle *obj_hdl)
+ 	now(&s_time);
+ #endif
+ 
+-	/* FIXME: Should we hold the fd so that any async op does
+-	 * not close it */
+-	if (objhandle->openflags != FSAL_O_CLOSED)
+-		rc = glfs_fstat(objhandle->glfd, &buffxstat.buffstat);
+-	else
+-		rc = glfs_h_stat(glfs_export->gl_fs,
+-				objhandle->glhandle, &buffxstat.buffstat);
++	/*
++	 * There is a kind of race here when the glfd part of the
++	 * FSAL GLUSTER object handle is destroyed during a close
++	 * coming in from another NFSv3 WRITE thread which does
++	 * cache_inode_open(). Since the context/fd is destroyed
++	 * we cannot depend on glfs_fstat assuming glfd is valid.
++
++	 * Fixing the issue by removing the glfs_fstat call here.
++
++	 * So default to glfs_h_stat and re-optimize if a better
++	 * way is found - that may involve introducing locks in
++	 * the gfapi's for close and getattrs etc.
++	 */
++	rc = glfs_h_stat(glfs_export->gl_fs,
++			 objhandle->glhandle, &buffxstat.buffstat);
+ 	if (rc != 0) {
+ 		if (errno == ENOENT)
+ 			status = gluster2fsal_error(ESTALE);
+diff --git a/src/FSAL/FSAL_GLUSTER/mds.c b/src/FSAL/FSAL_GLUSTER/mds.c
+index 98fef8d..7c5bcd6 100644
+--- a/src/FSAL/FSAL_GLUSTER/mds.c
++++ b/src/FSAL/FSAL_GLUSTER/mds.c
+@@ -313,11 +313,8 @@ static nfsstat4 pnfs_layout_commit(struct fsal_obj_handle *obj_pub,
+ 	}
+ 
+ 	/* Gets previous status of file in the MDS */
+-	if (objhandle->openflags != FSAL_O_CLOSED)
+-		rc = glfs_fstat(objhandle->glfd, &old_stat);
+-	else
+-		rc = glfs_h_stat(glfs_export->gl_fs,
+-				 objhandle->glhandle, &old_stat);
++	rc = glfs_h_stat(glfs_export->gl_fs,
++			 objhandle->glhandle, &old_stat);
+ 
+ 	if (rc != 0) {
+ 		LogMajor(COMPONENT_PNFS,
+-- 
+1.7.1
+

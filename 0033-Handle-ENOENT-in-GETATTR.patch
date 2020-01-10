@@ -1,0 +1,43 @@
+From 7321b97670866a77008b50782c217dc21441c83d Mon Sep 17 00:00:00 2001
+From: jiffin tony thottan <jthottan@redhat.com>
+Date: Fri, 27 Nov 2015 10:35:22 +0530
+Subject: [PATCH 04/10] FSAL_GLUSTER : Handle ENOENT properly in getattrs
+
+ENOENT is not a supported error for GETATTR. So operations such as
+RENAME(eventhough it succeed) will throws an error in mount point,
+if GETATTR returns ENOENT. This patch will map ENOENT to ESTALE.
+And also cache inode layer will remove the entry from the its list if
+it receives ESTALE error from the getattr().
+
+Bug reference : https://bugzilla.redhat.com/show_bug.cgi?id=1286900
+
+Change-Id: I6ea86cb2ac5a60344d32e773043f98369d7301bf
+Signed-off-by: Jiffin Tony Thottan <jthottan@redhat.com>
+---
+ src/FSAL/FSAL_GLUSTER/handle.c |   10 +++++++---
+ 1 files changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/src/FSAL/FSAL_GLUSTER/handle.c b/src/FSAL/FSAL_GLUSTER/handle.c
+index dc6dce8..ae8b75c 100644
+--- a/src/FSAL/FSAL_GLUSTER/handle.c
++++ b/src/FSAL/FSAL_GLUSTER/handle.c
+@@ -669,9 +669,13 @@ static fsal_status_t getattrs(struct fsal_obj_handle *obj_hdl)
+ 	status = glusterfs_get_acl(glfs_export, objhandle->glhandle,
+ 				   &buffxstat, fsalattr);
+ 
+-	/* for dead links we should not return error */
+-	if (obj_hdl->type == SYMBOLIC_LINK && status.minor == ENOENT)
+-		status = fsalstat(ERR_FSAL_NO_ERROR, 0);
++	/*
++	 * The error ENOENT is not an expected error for GETATTRS.
++	 * Due to this, operations such as RENAME will fail when it
++	 * calls GETATTRS on removed file.
++	 */
++	if (status.minor == ENOENT)
++		status = gluster2fsal_error(ESTALE);
+ 
+  out:
+ #ifdef GLTIMING
+-- 
+1.7.1
+

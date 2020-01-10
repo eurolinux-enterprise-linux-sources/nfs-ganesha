@@ -1,0 +1,45 @@
+From a0cd1d882de246c6e330d52606124e635404841a Mon Sep 17 00:00:00 2001
+From: Jiffin Tony Thottan <jthottan@redhat.com>
+Date: Fri, 26 Jun 2015 20:30:36 +0530
+Subject: [PATCH 3/3] FSAL_GLUSTER : fix possible memory corruption for inherit
+ acl conversion
+
+fsal_acl_t entries which represents inherit acl may not contains
+all the required entries, but fsal_acl_2_posix_acl() api include
+accordingly.For that we may need to allocate acl_t structure with
+more than the required entries.
+
+Change-Id: I205e2d1b516bc9845fbd6284fde99715cdf73e61
+Signed-off-by: Jiffin Tony Thottan <jthottan@redhat.com>
+---
+ src/FSAL/FSAL_GLUSTER/posix_acls.c | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/src/FSAL/FSAL_GLUSTER/posix_acls.c b/src/FSAL/FSAL_GLUSTER/posix_acls.c
+index 6a7e613..7d6d867 100644
+--- a/src/FSAL/FSAL_GLUSTER/posix_acls.c
++++ b/src/FSAL/FSAL_GLUSTER/posix_acls.c
+@@ -316,11 +316,17 @@ fsal_acl_2_posix_acl(fsal_acl_t *p_fsalacl, acl_type_t type)
+ 		LogWarn(COMPONENT_FSAL, "Invalid type for the acl");
+ 	}
+ 
+-	if (entries > 0)
+-		p_acl = acl_init(entries + 1);
+-	else
++	if (entries == 0)
+ 		return NULL;
+ 
++	/*
++	 * The given fsal_acl list may not contains all required entries
++	 * (OWNER@, @GROUP, @EVERYONE) so for a safer approach we may
++	 * allocate three more than required. This problem may occur more
++	 * prominently inherit acl
++	 */
++	p_acl = acl_init(entries + 3);
++
+ 	/* To store values of EVERYONE ACE, a duumy acl entry is used and
+ 	 * it freed at the end */
+ 	dummy_acl = acl_init(1);
+-- 
+2.1.0
+

@@ -1,0 +1,104 @@
+From b4c196e36fc8673cea9b3e6e3498a98ab449b06c Mon Sep 17 00:00:00 2001
+From: Niels de Vos <ndevos@redhat.com>
+Date: Fri, 4 Sep 2015 10:15:33 +0200
+Subject: [PATCH] NLM: retry in nlm_send_async() after getaddrinfo() failure
+
+On occasion it seems possible that getaddrinfo() fails. Subsequest
+access to the result structure can then cause a segmentation fault.
+
+It is unclear why getaddrinfo() only sometimes fails, but it is
+repeatably seen on different environments and network infrastructures. A
+retry after the failure might return a correct getaddrinfo() result.
+
+Verification can be done with the lock tests provided in the
+Connectathon suite (over NFSv3). Running the test in a loop is required,
+reproducing does not always happen immediately.
+
+Change-Id: If98739f32154fc4f150f65af4515c5719c9bb67c
+Reported-by: Saurabh Jain <saujain@redhat.com>
+Url: https://bugzilla.redhat.com/1257957
+Signed-off-by: Niels de Vos <ndevos@redhat.com>
+---
+ src/Protocols/NLM/nlm_async.c | 51 ++++++++++++++++++++++++++++++-------------
+ 1 file changed, 36 insertions(+), 15 deletions(-)
+
+diff --git a/src/Protocols/NLM/nlm_async.c b/src/Protocols/NLM/nlm_async.c
+index 62e4184..546bd3a 100644
+--- a/src/Protocols/NLM/nlm_async.c
++++ b/src/Protocols/NLM/nlm_async.c
+@@ -151,7 +151,7 @@ int nlm_send_async(int proc, state_nlm_client_t *host, void *inarg, void *key)
+ 	struct timeval start, now;
+ 	struct timespec timeout;
+ 
+-	for (retry = 1; retry <= MAX_ASYNC_RETRY; retry++) {
++	for (retry = 0; retry < MAX_ASYNC_RETRY; retry++) {
+ 		if (host->slc_callback_clnt == NULL) {
+ 			LogFullDebug(COMPONENT_NLM,
+ 				     "gsh_clnt_create %s",
+@@ -219,11 +219,32 @@ int nlm_send_async(int proc, state_nlm_client_t *host, void *inarg, void *key)
+ 				gsh_free(buf);
+ 
+ 				/* get the IPv4 mapped IPv6 address */
+-				getaddrinfo(host->slc_nsm_client->
+-					    ssc_nlm_caller_name,
+-					    port_str,
+-					    &hints,
+-					    &result);
++				retval = getaddrinfo(host->slc_nsm_client->
++						     ssc_nlm_caller_name,
++						     port_str,
++						     &hints,
++						     &result);
++
++				/* retry for spurious EAI_NONAME errors */
++				if (retval == EAI_NONAME ||
++				    retval == EAI_AGAIN) {
++					LogEvent(COMPONENT_NLM,
++						 "failed to resolve %s to an address: %s",
++						 host->slc_nsm_client->
++						 ssc_nlm_caller_name,
++						 gai_strerror(retval));
++					/* getaddrinfo() failed, retry */
++					retval = RPC_UNKNOWNADDR;
++					usleep(1000);
++					continue;
++				} else if (retval != 0) {
++					LogMajor(COMPONENT_NLM,
++						 "failed to resolve %s to an address: %s",
++						 host->slc_nsm_client->
++						 ssc_nlm_caller_name,
++						 gai_strerror(retval));
++					return -1;
++				}
+ 
+ 				/* setup the netbuf with in6 address */
+ 				local_buf.buf = result->ai_addr;
+@@ -287,16 +308,16 @@ int nlm_send_async(int proc, state_nlm_client_t *host, void *inarg, void *key)
+ 
+ 		gsh_clnt_destroy(host->slc_callback_clnt);
+ 		host->slc_callback_clnt = NULL;
++	}
+ 
+-		if (retry == MAX_ASYNC_RETRY) {
+-			LogMajor(COMPONENT_NLM,
+-				 "NLM async Client exceeded retry count %d",
+-				 MAX_ASYNC_RETRY);
+-			PTHREAD_MUTEX_lock(&nlm_async_resp_mutex);
+-			resp_key = NULL;
+-			PTHREAD_MUTEX_unlock(&nlm_async_resp_mutex);
+-			return retval;
+-		}
++	if (retry == MAX_ASYNC_RETRY) {
++		LogMajor(COMPONENT_NLM,
++			 "NLM async Client exceeded retry count %d",
++			 MAX_ASYNC_RETRY);
++		PTHREAD_MUTEX_lock(&nlm_async_resp_mutex);
++		resp_key = NULL;
++		PTHREAD_MUTEX_unlock(&nlm_async_resp_mutex);
++		return retval;
+ 	}
+ 
+ 	PTHREAD_MUTEX_lock(&nlm_async_resp_mutex);
+-- 
+2.4.3
+

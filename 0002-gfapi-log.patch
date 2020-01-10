@@ -1,0 +1,41 @@
+From e0a35a5ad6a9f4f3e478adf297a3a291ac7fdd59 Mon Sep 17 00:00:00 2001
+From: Meghana Madhusudhan <mmadhusu@redhat.com>
+Date: Mon, 11 May 2015 11:06:13 +0530
+Subject: [PATCH 14/20] FSAL_GLUSTER: Change the position of gfapi.log
+
+The position of the gfapi.log is changed
+from "/tmp" to "/var/log/".
+
+Change-Id: Ifcad69480eb7f45f490d36e9ecefc0a42f81359b
+Signed-off-by: Meghana Madhusudhan <mmadhusu@redhat.com>
+---
+ src/FSAL/FSAL_GLUSTER/export.c |    6 +++++-
+ 1 files changed, 5 insertions(+), 1 deletions(-)
+
+diff --git a/src/FSAL/FSAL_GLUSTER/export.c b/src/FSAL/FSAL_GLUSTER/export.c
+index d8c3252..a4f625b 100644
+--- a/src/FSAL/FSAL_GLUSTER/export.c
++++ b/src/FSAL/FSAL_GLUSTER/export.c
+@@ -41,6 +41,10 @@
+ #include "nfs_exports.h"
+ #include "export_mgr.h"
+ #include "pnfs_utils.h"
++/* The default location of gfapi log
++ * if glfs_log param is not defined in
++ * the export file */
++#define GFAPI_LOG_LOCATION "/var/log/ganesha-gfapi.log"
+ 
+ /**
+  * @brief Implements GLUSTER FSAL exportoperation release
+@@ -546,7 +550,7 @@ static struct config_item export_params[] = {
+ 		      glexport_params, glhostname),
+ 	CONF_ITEM_PATH("volpath", 1, MAXPATHLEN, "/",
+ 		      glexport_params, glvolpath),
+-	CONF_ITEM_PATH("glfs_log", 1, MAXPATHLEN, "/tmp/gfapi.log",
++	CONF_ITEM_PATH("glfs_log", 1, MAXPATHLEN, GFAPI_LOG_LOCATION,
+ 		       glexport_params, glfs_log),
+ 	CONFIG_EOL
+ };
+-- 
+1.7.1
+

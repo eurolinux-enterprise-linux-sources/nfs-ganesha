@@ -1,0 +1,55 @@
+From d72de1869c27438dfad6885746557a921b890d54 Mon Sep 17 00:00:00 2001
+From: jiffin tony thottan <jthottan@redhat.com>
+Date: Wed, 4 Nov 2015 12:22:13 +0530
+Subject: [PATCH] FSAL_GLUSTER : Populate ALLOW acl entries accordingly if only
+ DENY is present
+
+It is posible to set only DENY entry for a user/group only. In that case an
+ALLOW entry should be created based on `EVERYONE@`. This patch fix the same
+
+Change-Id: I123d590f1f428251c8fdc415eaad774629368670
+Signed-off-by: Jiffin Tony Thottan <jthottan@redhat.com>
+---
+ src/FSAL/FSAL_GLUSTER/posix_acls.c | 26 ++++++++++++--------------
+ 1 file changed, 12 insertions(+), 14 deletions(-)
+
+diff --git a/src/FSAL/FSAL_GLUSTER/posix_acls.c b/src/FSAL/FSAL_GLUSTER/posix_acls.c
+index eb03bc1..2b852f1 100644
+--- a/src/FSAL/FSAL_GLUSTER/posix_acls.c
++++ b/src/FSAL/FSAL_GLUSTER/posix_acls.c
+@@ -641,20 +641,18 @@ fsal_acl_2_posix_acl(fsal_acl_t *p_fsalacl, acl_type_t type)
+ 				if (IS_FSAL_ACE_EXECUTE(*f_ace))
+ 					acl_add_perm(d_permset, ACL_EXECUTE);
+ 			}
+-			if (IS_FSAL_ACE_ALLOW(*f_ace)) {
+-				ret = acl_get_permset(a_entry, &a_permset);
+-				if (isallow(f_ace, e_a_permset, ACL_READ)
+-				&& !isdeny(d_permset, e_d_permset, ACL_READ))
+-					acl_add_perm(a_permset, ACL_READ);
+-
+-				if (isallow(f_ace, e_a_permset, ACL_WRITE)
+-				&& !isdeny(d_permset, e_d_permset, ACL_WRITE))
+-					acl_add_perm(a_permset, ACL_WRITE);
+-
+-				if (isallow(f_ace, e_a_permset, ACL_EXECUTE)
+-				&& !isdeny(d_permset, e_d_permset, ACL_EXECUTE))
+-					acl_add_perm(a_permset, ACL_EXECUTE);
+-			}
++			ret = acl_get_permset(a_entry, &a_permset);
++			if (isallow(f_ace, e_a_permset, ACL_READ)
++			&& !isdeny(d_permset, e_d_permset, ACL_READ))
++				acl_add_perm(a_permset, ACL_READ);
++
++			if (isallow(f_ace, e_a_permset, ACL_WRITE)
++			&& !isdeny(d_permset, e_d_permset, ACL_WRITE))
++				acl_add_perm(a_permset, ACL_WRITE);
++
++			if (isallow(f_ace, e_a_permset, ACL_EXECUTE)
++			&& !isdeny(d_permset, e_d_permset, ACL_EXECUTE))
++				acl_add_perm(a_permset, ACL_EXECUTE);
+ 	}
+ 	if (mask) {
+ 		ret = acl_calc_mask(&allow_acl);
+-- 
+2.1.0
+

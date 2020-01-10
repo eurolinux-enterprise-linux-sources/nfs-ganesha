@@ -1,0 +1,93 @@
+From 366f71ca13c278e4b1f4c9052563f07a0a930ed6 Mon Sep 17 00:00:00 2001
+From: Soumya Koduri <skoduri@redhat.com>
+Date: Wed, 10 Jun 2015 17:50:47 +0530
+Subject: [PATCH 3/5] FSAL_GLUSTER: Fixed an issue with dereferencing a NULL ponter
+
+pthread_join() doesn't always return non NULL retval. Hence included
+a check to verify if the pointer is valid before de-referencing it.
+
+Also changed detroy_mode variable to be atomic.
+
+Change-Id: I3611ee61ba3ba946a07c10e24c16a9aa4b39e096
+Signed-off-by: Soumya Koduri <skoduri@redhat.com>
+---
+ src/FSAL/FSAL_GLUSTER/export.c           |    6 +++---
+ src/FSAL/FSAL_GLUSTER/fsal_up.c          |    6 ++----
+ src/FSAL/FSAL_GLUSTER/gluster_internal.h |    2 +-
+ 3 files changed, 6 insertions(+), 8 deletions(-)
+
+diff --git a/src/FSAL/FSAL_GLUSTER/export.c b/src/FSAL/FSAL_GLUSTER/export.c
+index a4f625b..598b00a 100644
+--- a/src/FSAL/FSAL_GLUSTER/export.c
++++ b/src/FSAL/FSAL_GLUSTER/export.c
+@@ -64,12 +64,12 @@ static void export_release(struct fsal_export *exp_hdl)
+ 			   &glfs_export->export.exports);
+ 	free_export_ops(&glfs_export->export);
+ 
+-	glfs_export->destroy_mode = true;
++	atomic_add_int8_t (&glfs_export->destroy_mode, 1);
+ 
+ 	/* Wait for up_thread to exit */
+ 	err = pthread_join(glfs_export->up_thread, (void **)&retval);
+ 
+-	if (*retval) {
++	if (retval && *retval) {
+ 		LogDebug(COMPONENT_FSAL, "Up_thread join returned value %d",
+ 			 *retval);
+ 	}
+@@ -674,7 +674,7 @@ fsal_status_t glusterfs_create_export(struct fsal_module *fsal_hdl,
+ 	glfsexport->acl_enable =
+ 		((op_ctx->export->export_perms.options &
+ 		  EXPORT_OPTION_DISABLE_ACL) ? 0 : 1);
+-	glfsexport->destroy_mode = false;
++	glfsexport->destroy_mode = 0;
+ 
+ 	op_ctx->fsal_export = &glfsexport->export;
+ 
+diff --git a/src/FSAL/FSAL_GLUSTER/fsal_up.c b/src/FSAL/FSAL_GLUSTER/fsal_up.c
+index 6584bf7..e08372f 100644
+--- a/src/FSAL/FSAL_GLUSTER/fsal_up.c
++++ b/src/FSAL/FSAL_GLUSTER/fsal_up.c
+@@ -143,7 +143,7 @@ void *GLUSTERFSAL_UP_Thread(void *Arg)
+ 	callback.fs = glfsexport->gl_fs;
+ 
+ 	/* Start querying for events and processing. */
+-	while (!glfsexport->destroy_mode) {
++	while (!atomic_fetch_int8_t(&glfsexport->destroy_mode)) {
+ 		LogFullDebug(COMPONENT_FSAL_UP,
+ 			     "Requesting event from FSAL Callback interface for %p.",
+ 			     glfsexport->gl_fs);
+@@ -199,7 +199,6 @@ void *GLUSTERFSAL_UP_Thread(void *Arg)
+ 		 * inode update / invalidate? */
+ 		switch (reason) {
+ 		case GFAPI_INODE_INVALIDATE:
+-		{
+ 			cbk_inode_arg =
+ 				(struct callback_inode_arg *)callback.event_arg;
+ 
+@@ -219,8 +218,7 @@ void *GLUSTERFSAL_UP_Thread(void *Arg)
+ 			if (cbk_inode_arg->oldp_object)
+ 				upcall_inode_invalidate(glfsexport,
+ 						  cbk_inode_arg->oldp_object);
+-		}
+-		break;
++			break;
+ 		default:
+ 			LogWarn(COMPONENT_FSAL_UP, "Unknown event: %d", reason);
+ 			continue;
+diff --git a/src/FSAL/FSAL_GLUSTER/gluster_internal.h b/src/FSAL/FSAL_GLUSTER/gluster_internal.h
+index 5d45214..bc71f69 100644
+--- a/src/FSAL/FSAL_GLUSTER/gluster_internal.h
++++ b/src/FSAL/FSAL_GLUSTER/gluster_internal.h
+@@ -353,7 +353,7 @@ struct glusterfs_export {
+ 	bool acl_enable;
+ 	bool pnfs_ds_enabled;
+ 	bool pnfs_mds_enabled;
+-	bool destroy_mode;
++	int8_t destroy_mode;
+ 	pthread_t up_thread; /* upcall thread */
+ };
+ 
+-- 
+1.7.1
+

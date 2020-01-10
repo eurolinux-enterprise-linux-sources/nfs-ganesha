@@ -1,0 +1,194 @@
+From bc738c21b3618f24dfb03f3c18a887f4af45b5fa Mon Sep 17 00:00:00 2001
+From: Jiffin Tony Thottan <jthottan@redhat.com>
+Date: Wed, 6 May 2015 14:54:09 +0530
+Subject: [PATCH 18/20] FSAL_GLUSTER : Introducing new api's in ds_write and ds_read for performance improvement
+
+This patch introduce  two api's glfs_h_anonymous_write() and
+glfs_h_anonymous_read() which performs IO's in a better way
+for PNFS with help of anonymous fd concept in gluster.
+
+This patch also turn off PNFS by default when user tries to
+mount gluster volumes via nfsv4.1
+
+Change-Id: I47b2829627687f3832b0d4e267285c0aff0eeb32
+Signed-off-by: Jiffin Tony Thottan <jthottan@redhat.com>
+---
+ src/FSAL/FSAL_GLUSTER/ds.c               |   61 +++++++++++++++---------------
+ src/FSAL/FSAL_GLUSTER/gluster_internal.h |    2 -
+ src/FSAL/FSAL_GLUSTER/main.c             |    2 +-
+ src/FSAL/FSAL_GLUSTER/mds.c              |    3 -
+ 4 files changed, 31 insertions(+), 37 deletions(-)
+
+diff --git a/src/FSAL/FSAL_GLUSTER/ds.c b/src/FSAL/FSAL_GLUSTER/ds.c
+index 16e0ab0..df7ed48 100644
+--- a/src/FSAL/FSAL_GLUSTER/ds.c
++++ b/src/FSAL/FSAL_GLUSTER/ds.c
+@@ -56,11 +56,6 @@ static void release(struct fsal_ds_handle *const ds_pub)
+ 				 strerror(errno), errno);
+ 		}
+ 	}
+-	if (ds->glfd) {
+-		rc = glfs_close(ds->glfd);
+-		if (rc != 0)
+-			LogMajor(COMPONENT_PNFS, "status after close %d", -rc);
+-	}
+ 	gsh_free(ds);
+ }
+ 
+@@ -95,15 +90,15 @@ static nfsstat4 ds_read(struct fsal_ds_handle *const ds_pub,
+ 	struct glfs_ds_handle *ds =
+ 		container_of(ds_pub, struct glfs_ds_handle, ds);
+ 	int    rc = 0;
++	struct glusterfs_export *glfs_export =
++	container_of(ds_pub->pds->mds_export->fsal_export,
++		     struct glusterfs_export, export);
+ 
++	if (ds->glhandle == NULL)
++		LogDebug(COMPONENT_PNFS, "ds_read glhandle NULL");
+ 
+-	if (ds->glfd == NULL)
+-		LogDebug(COMPONENT_PNFS, "ds_read glfd NULL");
+-	assert(ds->glfd != NULL);
+-
+-	/* Perform the read operation */
+-	rc = glfs_pread(ds->glfd, buffer, requested_length, offset, 0);
+-
++	rc = glfs_h_anonymous_read(glfs_export->gl_fs, ds->glhandle,
++				   buffer, requested_length, offset);
+ 	if (rc < 0) {
+ 		LogMajor(COMPONENT_PNFS, "Read failed on DS");
+ 		return posix2nfs4_error(-rc);
+@@ -147,6 +142,9 @@ static nfsstat4 ds_write(struct fsal_ds_handle *const ds_pub,
+ {
+ 	struct glfs_ds_handle *ds =
+ 		container_of(ds_pub, struct glfs_ds_handle, ds);
++	struct glusterfs_export *glfs_export =
++	container_of(ds_pub->pds->mds_export->fsal_export,
++		     struct glusterfs_export, export);
+ 	int    rc = 0;
+ 
+ 	memset(writeverf, 0, NFS4_VERIFIER_SIZE);
+@@ -154,13 +152,8 @@ static nfsstat4 ds_write(struct fsal_ds_handle *const ds_pub,
+ 	if (ds->glhandle == NULL)
+ 		LogDebug(COMPONENT_PNFS, "ds_write glhandle NULL");
+ 
+-	if (ds->glfd == NULL)
+-		LogDebug(COMPONENT_PNFS, "ds_write glfd NULL");
+-
+-	assert(ds->glfd != NULL);
+-
+-	rc = glfs_pwrite(ds->glfd, buffer, write_length, offset, 0);
+-
++	rc = glfs_h_anonymous_write(glfs_export->gl_fs, ds->glhandle,
++				    buffer, write_length, offset);
+ 	if (rc < 0) {
+ 		LogMajor(COMPONENT_PNFS, "status after write %d", -rc);
+ 		return posix2nfs4_error(-rc);
+@@ -205,8 +198,24 @@ static nfsstat4 ds_commit(struct fsal_ds_handle *const ds_pub,
+ 		container_of(ds_pub, struct glfs_ds_handle, ds);
+ 	int rc = 0;
+ 
+-	if (ds->stability_got == FILE_SYNC4)
+-		rc = glfs_fsync(ds->glfd);
++	if (ds->stability_got == FILE_SYNC4) {
++		struct glusterfs_export *glfs_export =
++			container_of(ds_pub->pds->mds_export->fsal_export,
++				     struct glusterfs_export, export);
++		struct glfs_fd *glfd = NULL;
++
++		glfd = glfs_h_open(glfs_export->gl_fs, ds->glhandle, O_RDWR);
++		if (glfd == NULL) {
++			LogDebug(COMPONENT_PNFS, "glfd in ds_handle is NULL");
++			return NFS4ERR_SERVERFAULT;
++		}
++		rc = glfs_fsync(glfd);
++		if (rc != 0)
++			LogMajor(COMPONENT_PNFS, "ds_commit() failed  %d", -rc);
++		rc = glfs_close(glfd);
++		if (rc != 0)
++			LogDebug(COMPONENT_PNFS, "status after close %d", -rc);
++	}
+ 	if (rc < 0)
+ 		return NFS4ERR_INVAL;
+ 
+@@ -249,7 +258,6 @@ static nfsstat4 make_ds_handle(struct fsal_pnfs_ds *const pds,
+ 	struct glusterfs_export *glfs_export =
+ 		container_of(pds->mds_export->fsal_export,
+ 			     struct glusterfs_export, export);
+-	int p_flags;
+ 
+ 	*handle = NULL;
+ 
+@@ -275,15 +283,6 @@ static nfsstat4 make_ds_handle(struct fsal_pnfs_ds *const pds,
+ 		return NFS4ERR_SERVERFAULT;
+ 	}
+ 
+-	memcpy(&p_flags,
+-	       (unsigned char *)hdl_desc->addr + GFAPI_HANDLE_LENGTH,
+-	       sizeof(p_flags));
+-
+-	ds->glfd = glfs_h_open(glfs_export->gl_fs, ds->glhandle, p_flags);
+-	if (ds->glfd == NULL) {
+-		LogDebug(COMPONENT_PNFS, "glfd in ds_handle is NULL");
+-		return NFS4ERR_SERVERFAULT;
+-	}
+ 	/* Connect lazily when a FILE_SYNC4 write forces us to, not
+ 	   here. */
+ 
+diff --git a/src/FSAL/FSAL_GLUSTER/gluster_internal.h b/src/FSAL/FSAL_GLUSTER/gluster_internal.h
+index b2c4ac1..5d45214 100644
+--- a/src/FSAL/FSAL_GLUSTER/gluster_internal.h
++++ b/src/FSAL/FSAL_GLUSTER/gluster_internal.h
+@@ -377,7 +377,6 @@ struct glusterfs_handle {
+ struct glfs_ds_handle {
+ 	struct fsal_ds_handle ds;
+ 	struct glfs_object *glhandle;
+-	struct glfs_fd *glfd;
+ 	stable_how4  stability_got;
+ 	bool connected;
+ };
+@@ -390,7 +389,6 @@ struct glfs_file_layout {
+ 
+ struct glfs_ds_wire {
+ 	unsigned char gfid[16];
+-	int flags;
+ 	struct glfs_file_layout layout; /*< Layout information */
+ };
+ 
+diff --git a/src/FSAL/FSAL_GLUSTER/main.c b/src/FSAL/FSAL_GLUSTER/main.c
+index 8d3ff46..7c14f09 100644
+--- a/src/FSAL/FSAL_GLUSTER/main.c
++++ b/src/FSAL/FSAL_GLUSTER/main.c
+@@ -68,7 +68,7 @@ static struct fsal_staticfsinfo_t default_gluster_info = {
+ 	.umask = 0,
+ 	.auth_exportpath_xdev = false,
+ 	.xattr_access_rights = 0400,	/* root=RW, owner=R */
+-	.pnfs_mds = true,
++	.pnfs_mds = false,
+ 	.pnfs_ds = true,
+ 	.link_supports_permission_checks = true,
+ };
+diff --git a/src/FSAL/FSAL_GLUSTER/mds.c b/src/FSAL/FSAL_GLUSTER/mds.c
+index 7c5bcd6..cbb56b1 100644
+--- a/src/FSAL/FSAL_GLUSTER/mds.c
++++ b/src/FSAL/FSAL_GLUSTER/mds.c
+@@ -150,7 +150,6 @@ static nfsstat4 pnfs_layout_get(struct fsal_obj_handle          *obj_pub,
+ 
+ 	struct glusterfs_handle *handle =
+ 		container_of(obj_pub, struct glusterfs_handle, handle);
+-	int    p_flags = 0;
+ 	int    rc = 0;
+ 	/* Structure containing the storage parameters of the file within
+ 	   glusterfs. */
+@@ -219,8 +218,6 @@ static nfsstat4 pnfs_layout_get(struct fsal_obj_handle          *obj_pub,
+ 		return posix2nfs4_error(-rc);
+ 	}
+ 
+-	fsal2posix_openflags(handle->openflags, &p_flags);
+-	ds_wire.flags    = p_flags;
+ 	ds_wire.layout   = file_layout;
+ 	ds_desc.addr     = &ds_wire;
+ 	ds_desc.len      = sizeof(struct glfs_ds_wire);
+-- 
+1.7.1
+

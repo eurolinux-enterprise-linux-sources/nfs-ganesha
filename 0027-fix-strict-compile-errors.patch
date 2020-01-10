@@ -1,0 +1,49 @@
+From 24f8a0428f5143d06e27f860886521bd19c1296a Mon Sep 17 00:00:00 2001
+From: Niels de Vos <ndevos@redhat.com>
+Date: Mon, 2 Nov 2015 17:05:17 +0100
+Subject: [PATCH] build with correct compile flags, fix false rhel6 compiler
+ errors
+
+This creates a useful -debuginfo RPM.
+
+The compile 'fixes' are not structly needed. The RHEL-6 compiler has
+abug where these 'errors' are incorrectly detected. Neither of the
+uninitialized variables can possibly be used incorrectly.
+Newer compilers (including RHEL-7) do not flag these 'errors' anymore.
+
+BUG: 1244792
+Signed-off-by: Niels de Vos <ndevos@redhat.com>
+---
+ src/RPCAL/rpc_tools.c       | 2 +-
+ src/libntirpc/src/svc_ioq.c | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/RPCAL/rpc_tools.c b/src/RPCAL/rpc_tools.c
+index af49f0f..a16738b 100644
+--- a/src/RPCAL/rpc_tools.c
++++ b/src/RPCAL/rpc_tools.c
+@@ -189,7 +189,7 @@ int display_sockaddr(struct display_buffer *dspbuf, sockaddr_t *addr)
+ {
+ 	const char *name = NULL;
+ 	char ipname[SOCK_NAME_MAX];
+-	int port;
++	int port = 0; /* FALSE: 'port' may be used uninitialized in this function */
+ 	int b_left = display_start(dspbuf);
+ 
+ 	if (b_left <= 0)
+diff --git a/src/libntirpc/src/svc_ioq.c b/src/libntirpc/src/svc_ioq.c
+index aecd4f6..091f2e6 100644
+--- a/src/libntirpc/src/svc_ioq.c
++++ b/src/libntirpc/src/svc_ioq.c
+@@ -100,7 +100,7 @@ ioq_flushv(SVCXPRT *xprt, struct x_vc_data *xd,
+ 	struct v_rec *vrec = NULL;
+ 	ssize_t result;
+ 	u_int32_t frag_header;
+-	u_int32_t fbytes;
++	u_int32_t fbytes = 0; /* rhel6 incorrectly thinks this is needed */
+ 	u_int32_t remaining = xioq->ioq.frag_len;
+ 	u_int32_t vsize = (xioq->ioq.size + 1) * sizeof(struct iovec);
+ 	int iw = 0;
+-- 
+2.4.3
+

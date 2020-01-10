@@ -1,0 +1,30 @@
+From 912261d79abe03e7ee02b046b0fb8bfeaf08e1c9 Mon Sep 17 00:00:00 2001
+From: Malahal Naineni <malahal@us.ibm.com>
+Date: Sun, 3 May 2015 09:51:46 -0500
+Subject: [PATCH] Don't let systemd restart ganesha on abort
+
+Restarting ganesha on abort may not be desirable in all environments.
+This should probably a configurable item from /etc/sysconfig/ganesha
+file, but avoid restarting for now by modifying the unit service file.
+
+Change-Id: Ib82a8c27e02e5a658de684da06dc82562c875f48
+Signed-off-by: Malahal Naineni <malahal@us.ibm.com>
+---
+ src/scripts/systemd/nfs-ganesha.service | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/src/scripts/systemd/nfs-ganesha.service b/src/scripts/systemd/nfs-ganesha.service
+index cd0fc77..b241ef5 100644
+--- a/src/scripts/systemd/nfs-ganesha.service
++++ b/src/scripts/systemd/nfs-ganesha.service
+@@ -25,7 +25,6 @@ ExecStart=/usr/bin/ganesha.nfsd $OPTIONS
+ ExecStartPost=-/bin/bash -c "prlimit --pid $MAINPID --nofile=$NOFILE:$NOFILE"
+ ExecReload=/bin/dbus-send --system   --dest=org.ganesha.nfsd --type=method_call /org/ganesha/nfsd/admin  org.ganesha.nfsd.admin.reload
+ ExecStop=/bin/dbus-send --system   --dest=org.ganesha.nfsd --type=method_call /org/ganesha/nfsd/admin org.ganesha.nfsd.admin.shutdown
+-Restart=on-abort
+ 
+ [Install]
+ WantedBy=multi-user.target
+-- 
+2.1.0
+
