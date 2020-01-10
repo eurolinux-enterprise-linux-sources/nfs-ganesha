@@ -39,19 +39,17 @@
 #include <sys/stat.h>
 #include "nfs_core.h"
 #include "log.h"
-#include "cache_inode.h"
 #include "fsal.h"
 #include "9p.h"
 
-int _9p_fsync(struct _9p_request_data *req9p, void *worker_data,
-	      u32 *plenout, char *preply)
+int _9p_fsync(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 {
 	char *cursor = req9p->_9pmsg + _9P_HDR_SIZE + _9P_TYPE_SIZE;
 	u16 *msgtag = NULL;
 	u32 *fid = NULL;
 
 	struct _9p_fid *pfid = NULL;
-	cache_inode_status_t cache_status = CACHE_INODE_SUCCESS;
+	fsal_status_t fsal_status;
 
 	/* Get data */
 	_9p_getptr(cursor, msgtag, u16);
@@ -60,29 +58,26 @@ int _9p_fsync(struct _9p_request_data *req9p, void *worker_data,
 	LogDebug(COMPONENT_9P, "TFSYNC: tag=%u fid=%u", (u32) *msgtag, *fid);
 
 	if (*fid >= _9P_FID_PER_CONN)
-		return _9p_rerror(req9p, worker_data, msgtag, ERANGE, plenout,
-				  preply);
+		return _9p_rerror(req9p, msgtag, ERANGE, plenout, preply);
 
 	pfid = req9p->pconn->fids[*fid];
 
 	/* Check that it is a valid open file */
 	if (pfid == NULL || pfid->pentry == NULL) {
 		LogDebug(COMPONENT_9P, "request on invalid fid=%u", *fid);
-		return _9p_rerror(req9p, worker_data, msgtag, EIO, plenout,
-				  preply);
+		return _9p_rerror(req9p, msgtag, EIO, plenout, preply);
 	}
 
-	op_ctx = &pfid->op_context;
+	_9p_init_opctx(pfid, req9p);
 
-	cache_status =
-	    cache_inode_commit(pfid->pentry,
-			       0LL,	/* start at beginning of file */
-			       0LL);	/* Mimic sync_file_range's behavior: */
+	fsal_status = fsal_commit(pfid->pentry,
+				  0LL,	/* start at beginning of file */
+				  0LL);	/* Mimic sync_file_range's behavior: */
 					/* count=0 means "whole file" */
 
-	if (cache_status != CACHE_INODE_SUCCESS)
-		return _9p_rerror(req9p, worker_data, msgtag,
-				  _9p_tools_errno(cache_status), plenout,
+	if (FSAL_IS_ERROR(fsal_status))
+		return _9p_rerror(req9p, msgtag,
+				  _9p_tools_errno(fsal_status), plenout,
 				  preply);
 
 	/* Build the reply */

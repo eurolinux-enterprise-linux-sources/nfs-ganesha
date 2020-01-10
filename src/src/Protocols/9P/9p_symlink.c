@@ -41,12 +41,10 @@
 #include "nfs_core.h"
 #include "nfs_exports.h"
 #include "log.h"
-#include "cache_inode.h"
 #include "fsal.h"
 #include "9p.h"
 
-int _9p_symlink(struct _9p_request_data *req9p, void *worker_data,
-		u32 *plenout, char *preply)
+int _9p_symlink(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 {
 	char *cursor = req9p->_9pmsg + _9P_HDR_SIZE + _9P_TYPE_SIZE;
 	u16 *msgtag = NULL;
@@ -60,14 +58,12 @@ int _9p_symlink(struct _9p_request_data *req9p, void *worker_data,
 	struct _9p_fid *pfid = NULL;
 	struct _9p_qid qid_symlink;
 
-	cache_entry_t *pentry_symlink = NULL;
+	struct fsal_obj_handle *pentry_symlink = NULL;
 	char symlink_name[MAXNAMLEN];
-	uint64_t fileid;
-	cache_inode_status_t cache_status;
+	char *link_content = NULL;
+	fsal_status_t fsal_status;
 	uint32_t mode = 0777;
-	cache_inode_create_arg_t create_arg;
-
-	memset(&create_arg, 0, sizeof(create_arg));
+	struct attrlist object_attributes;
 
 	/* Get data */
 	_9p_getptr(cursor, msgtag, u16);
@@ -83,68 +79,58 @@ int _9p_symlink(struct _9p_request_data *req9p, void *worker_data,
 		 linkcontent_str, *gid);
 
 	if (*fid >= _9P_FID_PER_CONN)
-		return _9p_rerror(req9p, worker_data, msgtag, ERANGE, plenout,
-				  preply);
+		return _9p_rerror(req9p, msgtag, ERANGE, plenout, preply);
 
 	pfid = req9p->pconn->fids[*fid];
 
 	/* Check that it is a valid fid */
 	if (pfid == NULL || pfid->pentry == NULL) {
 		LogDebug(COMPONENT_9P, "request on invalid fid=%u", *fid);
-		return _9p_rerror(req9p, worker_data, msgtag, EIO, plenout,
-				  preply);
+		return _9p_rerror(req9p, msgtag, EIO, plenout, preply);
 	}
 
-	if ((pfid->op_context.export_perms->options &
-				 EXPORT_OPTION_WRITE_ACCESS) == 0)
-		return _9p_rerror(req9p, worker_data, msgtag, EROFS, plenout,
-				  preply);
+	_9p_init_opctx(pfid, req9p);
 
-	op_ctx = &pfid->op_context;
+	if ((op_ctx->export_perms->options &
+				 EXPORT_OPTION_WRITE_ACCESS) == 0)
+		return _9p_rerror(req9p, msgtag, EROFS, plenout, preply);
+
 	snprintf(symlink_name, MAXNAMLEN, "%.*s", *name_len, name_str);
 
-	create_arg.link_content = gsh_malloc(MAXPATHLEN);
-	if (create_arg.link_content == NULL)
-		return _9p_rerror(req9p, worker_data, msgtag, EFAULT, plenout,
-				  preply);
+	link_content = gsh_malloc(*linkcontent_len + 1);
 
-	snprintf(create_arg.link_content, MAXPATHLEN, "%.*s", *linkcontent_len,
-		 linkcontent_str);
+	memcpy(link_content, linkcontent_str, *linkcontent_len);
+
+	link_content[*linkcontent_len] = '\0';
+
+	fsal_prepare_attrs(&object_attributes, ATTR_MODE);
+
+	object_attributes.mode = mode;
+	object_attributes.valid_mask = ATTR_MODE;
 
 	/* Let's do the job */
 	/* BUGAZOMEU: @todo : the gid parameter is not used yet,
 	 * flags is not yet used */
-	cache_status =
-	    cache_inode_create(pfid->pentry, symlink_name, SYMBOLIC_LINK, mode,
-			       &create_arg, &pentry_symlink);
+	fsal_status = fsal_create(pfid->pentry, symlink_name, SYMBOLIC_LINK,
+				  &object_attributes, link_content,
+				  &pentry_symlink, NULL);
 
-	if (create_arg.link_content != NULL)
-		gsh_free(create_arg.link_content);
+	/* Release the attributes (may release an inherited ACL) */
+	fsal_release_attrs(&object_attributes);
+	gsh_free(link_content);
+
 	if (pentry_symlink == NULL) {
-		return _9p_rerror(req9p, worker_data, msgtag,
-				  _9p_tools_errno(cache_status), plenout,
+		return _9p_rerror(req9p, msgtag,
+				  _9p_tools_errno(fsal_status), plenout,
 				  preply);
 	}
 
-	/* This is not a TATTACH fid */
-	pfid->from_attach = false;
-
-	cache_status = cache_inode_fileid(pentry_symlink, &fileid);
-
-	/* put the entry:
-	 * we don't want to remember it even if cache_inode_fileid fails. */
-	cache_inode_put(pentry_symlink);
-
-	if (cache_status != CACHE_INODE_SUCCESS) {
-		return _9p_rerror(req9p, worker_data, msgtag,
-				  _9p_tools_errno(cache_status), plenout,
-				  preply);
-	}
+	pentry_symlink->obj_ops.put_ref(pentry_symlink);
 
 	/* Build the qid */
 	qid_symlink.type = _9P_QTSYMLINK;
 	qid_symlink.version = 0;
-	qid_symlink.path = fileid;
+	qid_symlink.path = pentry_symlink->fileid;
 
 	/* Build the reply */
 	_9p_setinitptr(cursor, preply, _9P_RSYMLINK);

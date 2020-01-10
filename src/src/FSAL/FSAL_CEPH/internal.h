@@ -53,6 +53,7 @@
 struct ceph_fsal_module {
 	struct fsal_module fsal;
 	fsal_staticfsinfo_t fs_info;
+	char *conf_path;
 };
 extern struct ceph_fsal_module CephFSM;
 
@@ -68,18 +69,25 @@ struct export {
 	struct handle *root;	/*< The root handle */
 };
 
+struct ceph_fd {
+	/** The open and share mode etc. */
+	fsal_openflags_t openflags;
+	/** The cephfs file descriptor. */
+	Fh *fd;
+};
+
 /**
  * The 'private' Ceph FSAL handle
  */
 
 struct handle {
 	struct fsal_obj_handle handle;	/*< The public handle */
-	Fh *fd;
+	struct ceph_fd fd;
 	struct Inode *i;	/*< The Ceph inode */
 	const struct fsal_up_vector *up_ops;	/*< Upcall operations */
 	struct export *export;	/*< The first export this handle belongs to */
 	vinodeno_t vi;		/*< The object identifier */
-	fsal_openflags_t openflags;
+	struct fsal_share share;
 #ifdef CEPH_PNFS
 	uint64_t rd_issued;
 	uint64_t rd_serial;
@@ -121,14 +129,6 @@ extern attrmask_t supported_attributes;
 extern attrmask_t settable_attributes;
 #endif				/* !CEPH_INTERNAL_C */
 
-/**
- * Linux supports a stripe pattern with no more than 4096 stripes, but
- * for now we stick to 1024 to keep them da_addrs from being too
- * gigantic.
- */
-
-static const size_t BIGGEST_PATTERN = 1024;
-
 /* private helper for export object */
 
 static inline fsal_staticfsinfo_t *ceph_staticinfo(struct fsal_module *hdl)
@@ -140,8 +140,8 @@ static inline fsal_staticfsinfo_t *ceph_staticinfo(struct fsal_module *hdl)
 
 /* Prototypes */
 
-int construct_handle(const struct stat *st, struct Inode *i,
-		     struct export *export, struct handle **obj);
+void construct_handle(const struct stat *st, struct Inode *i,
+		      struct export *export, struct handle **obj);
 void deconstruct_handle(struct handle *obj);
 
 /**
@@ -159,8 +159,6 @@ static inline fsal_status_t ceph2fsal_error(const int ceph_errorcode)
 {
 	return fsalstat(posix2fsal_error(-ceph_errorcode), -ceph_errorcode);
 }
-void ceph2fsal_attributes(const struct stat *buffstat,
-			  struct attrlist *fsalattr);
 
 void export_ops_init(struct export_ops *ops);
 void handle_ops_init(struct fsal_obj_ops *ops);
@@ -169,5 +167,9 @@ void pnfs_ds_ops_init(struct fsal_pnfs_ds_ops *ops);
 void export_ops_pnfs(struct export_ops *ops);
 void handle_ops_pnfs(struct fsal_obj_ops *ops);
 #endif				/* CEPH_PNFS */
+
+struct state_t *ceph_alloc_state(struct fsal_export *exp_hdl,
+				 enum state_type state_type,
+				 struct state_t *related_state);
 
 #endif				/* !FSAL_CEPH_INTERNAL_INTERNAL__ */

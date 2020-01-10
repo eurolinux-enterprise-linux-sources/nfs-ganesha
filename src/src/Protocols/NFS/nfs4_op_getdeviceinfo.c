@@ -38,7 +38,6 @@
 #include "log.h"
 #include "fsal.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_exports.h"
 #include "nfs_proto_tools.h"
 #include "nfs_proto_functions.h"
@@ -139,11 +138,6 @@ int nfs4_op_getdeviceinfo(struct nfs_argop4 *op, compound_data_t *data,
 	    da_layout_type = arg_GETDEVICEINFO4->gdia_layout_type;
 
 	da_buffer = gsh_malloc(da_addr_size);
-
-	if (da_buffer == NULL) {
-		nfs_status = NFS4ERR_SERVERFAULT;
-		goto out;
-	}
 
 	xdrmem_create(&da_addr_body, da_buffer, da_addr_size, XDR_ENCODE);
 

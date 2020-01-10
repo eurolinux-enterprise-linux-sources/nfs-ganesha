@@ -50,7 +50,7 @@
 		ATTR_MODE     | ATTR_NUMLINKS | ATTR_OWNER     |	\
 		ATTR_GROUP    | ATTR_ATIME    | ATTR_RAWDEV    |	\
 		ATTR_CTIME    | ATTR_MTIME    | ATTR_SPACEUSED |	\
-		ATTR_CHGTIME)
+		ATTR_CHGTIME  | ATTR_ACL)
 
 struct panfs_fsal_module {
 	struct fsal_module fsal;
@@ -70,13 +70,13 @@ static struct fsal_staticfsinfo_t default_posix_info = {
 	.chown_restricted = true,
 	.case_insensitive = false,
 	.case_preserving = true,
-	.lock_support = true,
+	.lock_support = false,
 	.lock_support_owner = false,
 	.lock_support_async_block = false,
 	.named_attr = true,
 	.unique_handles = true,
 	.lease_time = {10, 0},
-	.acl_support = FSAL_ACLSUPPORT_ALLOW,
+	.acl_support = FSAL_ACLSUPPORT_ALLOW | FSAL_ACLSUPPORT_DENY,
 	.homogenous = true,
 	.supported_attrs = PANFS_SUPPORTED_ATTRIBUTES,
 	.maxread = FSAL_MAXIOSIZE,

@@ -5,7 +5,7 @@
  * Author: Jim Lieb jlieb@panasas.com
  *
  * contributeur : Philippe DENIEL   philippe.deniel@cea.fr
- *                Thomas LEIBOVICI  thomas.leibovici@cea.fr
+ *		Thomas LEIBOVICI  thomas.leibovici@cea.fr
  *
  *
  * This program is free software; you can redistribute it and/or
@@ -46,6 +46,14 @@
 #include "pseudofs_methods.h"
 #include "nfs_exports.h"
 #include "export_mgr.h"
+#include "mdcache.h"
+
+#ifdef __FreeBSD__
+#include <sys/endian.h>
+
+#define bswap_16(x)     bswap16((x))
+#define bswap_64(x)     bswap64((x))
+#endif
 
 /* helpers to/from other PSEUDO objects
  */
@@ -208,6 +216,7 @@ static uint32_t fs_xattr_access_rights(struct fsal_export *exp_hdl)
 
 static fsal_status_t get_quota(struct fsal_export *exp_hdl,
 			       const char *filepath, int quota_type,
+			       int quota_id,
 			       fsal_quota_t *pquota)
 {
 	/* PSEUDOFS doesn't support quotas */
@@ -220,6 +229,7 @@ static fsal_status_t get_quota(struct fsal_export *exp_hdl,
 
 static fsal_status_t set_quota(struct fsal_export *exp_hdl,
 			       const char *filepath, int quota_type,
+			       int quota_id,
 			       fsal_quota_t *pquota, fsal_quota_t *presquota)
 {
 	/* PSEUDOFS doesn't support quotas */
@@ -246,7 +256,7 @@ static fsal_status_t extract_handle(struct fsal_export *exp_hdl,
 
 	if (fh_desc->len < fh_min) {
 		LogMajor(COMPONENT_FSAL,
-			 "Size mismatch for handle.  should be >= %lu, got %lu",
+			 "Size mismatch for handle.  should be >= %zu, got %zu",
 			 fh_min, fh_desc->len);
 		return fsalstat(ERR_FSAL_SERVERFAULT, 0);
 	}
@@ -307,6 +317,7 @@ fsal_status_t pseudofs_create_export(struct fsal_module *fsal_hdl,
 {
 	struct pseudofs_fsal_export *myself;
 	int retval = 0;
+	fsal_status_t status = {0, 0};
 
 	myself = gsh_calloc(1, sizeof(struct pseudofs_fsal_export));
 
@@ -316,17 +327,8 @@ fsal_status_t pseudofs_create_export(struct fsal_module *fsal_hdl,
 		return fsalstat(posix2fsal_error(errno), errno);
 	}
 
-	retval = fsal_export_init(&myself->export);
-
-	if (retval != 0) {
-		LogMajor(COMPONENT_FSAL,
-			 "Could not initialize export");
-		gsh_free(myself);
-		return fsalstat(posix2fsal_error(retval), retval);
-	}
-
+	fsal_export_init(&myself->export);
 	pseudofs_export_ops_init(&myself->export.exp_ops);
-	myself->export.up_ops = up_ops;
 
 	retval = fsal_attach_export(fsal_hdl, &myself->export.exports);
 
@@ -334,40 +336,30 @@ fsal_status_t pseudofs_create_export(struct fsal_module *fsal_hdl,
 		/* seriously bad */
 		LogMajor(COMPONENT_FSAL,
 			 "Could not attach export");
-		goto errout;
+		gsh_free(myself->export_path);
+		gsh_free(myself->root_handle);
+		free_export_ops(&myself->export);
+		gsh_free(myself);	/* elvis has left the building */
+
+		return fsalstat(posix2fsal_error(retval), retval);
 	}
 
 	myself->export.fsal = fsal_hdl;
 
 	/* Save the export path. */
-	myself->export_path = gsh_strdup(op_ctx->export->fullpath);
-
-	if (myself->export_path == NULL) {
-		LogCrit(COMPONENT_FSAL,
-			"Could not allocate export path");
-		retval = ENOMEM;
-		goto errout;
-	}
-
+	myself->export_path = gsh_strdup(op_ctx->ctx_export->fullpath);
 	op_ctx->fsal_export = &myself->export;
+
+	/* Stack MDCACHE on top */
+	status = mdcache_export_init(up_ops, &myself->export.up_ops);
+	if (FSAL_IS_ERROR(status)) {
+		LogDebug(COMPONENT_FSAL, "MDCACHE creation failed for PSEUDO");
+		return status;
+	}
 
 	LogDebug(COMPONENT_FSAL,
 		 "Created exp %p - %s",
 		 myself, myself->export_path);
 
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
-
- errout:
-
-	if (myself->export_path != NULL)
-		gsh_free(myself->export_path);
-
-	if (myself->root_handle != NULL)
-		gsh_free(myself->root_handle);
-
-	free_export_ops(&myself->export);
-
-	gsh_free(myself);	/* elvis has left the building */
-
-	return fsalstat(posix2fsal_error(retval), retval);
 }

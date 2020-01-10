@@ -72,6 +72,8 @@
 #define NFS_V42_NB_OPERATION (NFS4_OP_WRITE_SAME + 1)
 #define _9P_NB_COMMAND 33
 
+#ifdef USE_DBUS
+
 struct op_name {
 	char *name;
 };
@@ -121,7 +123,7 @@ static const struct op_name optabv3[] = {
 	[NFSPROC3_GETATTR] = {.name = "GETATTR", },
 	[NFSPROC3_SETATTR] = {.name = "SETATTR", },
 	[NFSPROC3_LOOKUP] = {.name = "LOOKUP", },
-	[NFSPROC3_ACCESS] = {.name = "ACCESS" , } ,
+	[NFSPROC3_ACCESS] = {.name = "ACCESS", },
 	[NFSPROC3_READLINK] = {.name = "READLINK", },
 	[NFSPROC3_READ] = {.name = "READ", },
 	[NFSPROC3_WRITE] = {.name = "WRITE", },
@@ -213,7 +215,15 @@ static const struct op_name optabv4[] = {
 	[NFS4_OP_READ_PLUS] = {.name = "READ_PLUS",},
 	[NFS4_OP_SEEK] = {.name = "SEEK",},
 	[NFS4_OP_WRITE_SAME] = {.name = "WRITE_SAME",},
+	[NFS4_OP_CLONE] = {.name = "OP_CLONE",},
+	/* NFSv4.3 */
+	[NFS4_OP_GETXATTR] = {.name = "OP_GETXATTR",},
+	[NFS4_OP_SETXATTR] = {.name = "OP_SETXATTR",},
+	[NFS4_OP_LISTXATTR] = {.name = "OP_LISTXATTR",},
+	[NFS4_OP_REMOVEXATTR] = {.name = "OP_REMOVEXATTR",},
 };
+
+#endif
 
 /* Classify protocol ops for stats purposes
  */
@@ -377,19 +387,24 @@ struct nfsv41_stats {
 	struct layout_op recall;
 };
 
+struct transport_stats {
+	uint64_t rx_bytes;
+	uint64_t rx_pkt;
+	uint64_t rx_err;
+	uint64_t tx_bytes;
+	uint64_t tx_pkt;
+	uint64_t tx_err;
+};
+
+#ifdef _USE_9P
 struct _9p_stats {
 	struct proto_op cmds;	/* non-I/O ops */
 	struct xfer_op read;
 	struct xfer_op write;
-	struct transport_stats {
-		uint64_t rx_bytes;
-		uint64_t rx_pkt;
-		uint64_t rx_err;
-		uint64_t tx_bytes;
-		uint64_t tx_pkt;
-		uint64_t tx_err;
-	} trans;
+	struct transport_stats trans;
+	struct proto_op *opcodes[_9P_RWSTAT+1];
 };
+#endif
 
 struct global_stats {
 	struct nfsv3_stats nfsv3;
@@ -416,8 +431,6 @@ struct deleg_stats {
 };
 
 static struct global_stats global_st;
-struct cache_stats cache_st;
-struct cache_stats *cache_stp = &cache_st;
 
 /* include the top level server_stats struct definition
  */
@@ -432,7 +445,7 @@ struct cache_stats *cache_stp = &cache_st;
  * @param stats [IN] the stats structure to dereference in
  * @param lock  [IN] the lock in the stats owning struct
  *
- * @return pointer to proto struct, NULL on OOM
+ * @return pointer to proto struct
  *
  * @TODO make them inlines for release
  */
@@ -444,7 +457,7 @@ static struct nfsv3_stats *get_v3(struct gsh_stats *stats,
 		PTHREAD_RWLOCK_wrlock(lock);
 		if (stats->nfsv3 == NULL)
 			stats->nfsv3 =
-			    gsh_calloc(sizeof(struct nfsv3_stats), 1);
+			    gsh_calloc(1, sizeof(struct nfsv3_stats));
 		PTHREAD_RWLOCK_unlock(lock);
 	}
 	return stats->nfsv3;
@@ -456,7 +469,7 @@ static struct mnt_stats *get_mnt(struct gsh_stats *stats,
 	if (unlikely(stats->mnt == NULL)) {
 		PTHREAD_RWLOCK_wrlock(lock);
 		if (stats->mnt == NULL)
-			stats->mnt = gsh_calloc(sizeof(struct mnt_stats), 1);
+			stats->mnt = gsh_calloc(1, sizeof(struct mnt_stats));
 		PTHREAD_RWLOCK_unlock(lock);
 	}
 	return stats->mnt;
@@ -468,7 +481,7 @@ static struct nlmv4_stats *get_nlm4(struct gsh_stats *stats,
 	if (unlikely(stats->nlm4 == NULL)) {
 		PTHREAD_RWLOCK_wrlock(lock);
 		if (stats->nlm4 == NULL)
-			stats->nlm4 = gsh_calloc(sizeof(struct nlmv4_stats), 1);
+			stats->nlm4 = gsh_calloc(1, sizeof(struct nlmv4_stats));
 		PTHREAD_RWLOCK_unlock(lock);
 	}
 	return stats->nlm4;
@@ -481,7 +494,7 @@ static struct rquota_stats *get_rquota(struct gsh_stats *stats,
 		PTHREAD_RWLOCK_wrlock(lock);
 		if (stats->rquota == NULL)
 			stats->rquota =
-			    gsh_calloc(sizeof(struct rquota_stats), 1);
+			    gsh_calloc(1, sizeof(struct rquota_stats));
 		PTHREAD_RWLOCK_unlock(lock);
 	}
 	return stats->rquota;
@@ -494,7 +507,7 @@ static struct nfsv40_stats *get_v40(struct gsh_stats *stats,
 		PTHREAD_RWLOCK_wrlock(lock);
 		if (stats->nfsv40 == NULL)
 			stats->nfsv40 =
-			    gsh_calloc(sizeof(struct nfsv40_stats), 1);
+			    gsh_calloc(1, sizeof(struct nfsv40_stats));
 		PTHREAD_RWLOCK_unlock(lock);
 	}
 	return stats->nfsv40;
@@ -507,7 +520,7 @@ static struct nfsv41_stats *get_v41(struct gsh_stats *stats,
 		PTHREAD_RWLOCK_wrlock(lock);
 		if (stats->nfsv41 == NULL)
 			stats->nfsv41 =
-			    gsh_calloc(sizeof(struct nfsv41_stats), 1);
+			    gsh_calloc(1, sizeof(struct nfsv41_stats));
 		PTHREAD_RWLOCK_unlock(lock);
 	}
 	return stats->nfsv41;
@@ -520,7 +533,7 @@ static struct nfsv41_stats *get_v42(struct gsh_stats *stats,
 		PTHREAD_RWLOCK_wrlock(lock);
 		if (stats->nfsv42 == NULL)
 			stats->nfsv42 =
-			    gsh_calloc(sizeof(struct nfsv41_stats), 1);
+			    gsh_calloc(1, sizeof(struct nfsv41_stats));
 		PTHREAD_RWLOCK_unlock(lock);
 	}
 	return stats->nfsv42;
@@ -532,7 +545,7 @@ static struct _9p_stats *get_9p(struct gsh_stats *stats, pthread_rwlock_t *lock)
 	if (unlikely(stats->_9p == NULL)) {
 		PTHREAD_RWLOCK_wrlock(lock);
 		if (stats->_9p == NULL)
-			stats->_9p = gsh_calloc(sizeof(struct _9p_stats), 1);
+			stats->_9p = gsh_calloc(1, sizeof(struct _9p_stats));
 		PTHREAD_RWLOCK_unlock(lock);
 	}
 	return stats->_9p;
@@ -622,27 +635,19 @@ static void record_io_stats(struct gsh_stats *gsh_st, pthread_rwlock_t *lock,
 		if (op_ctx->nfs_vers == NFS_V3) {
 			struct nfsv3_stats *sp = get_v3(gsh_st, lock);
 
-			if (sp == NULL)
-				return;
 			iop = is_write ? &sp->write : &sp->read;
 		} else if (op_ctx->nfs_vers == NFS_V4) {
 			if (op_ctx->nfs_minorvers == 0) {
 				struct nfsv40_stats *sp = get_v40(gsh_st, lock);
 
-				if (sp == NULL)
-					return;
 				iop = is_write ? &sp->write : &sp->read;
 			} else if (op_ctx->nfs_minorvers == 1) {
 				struct nfsv41_stats *sp = get_v41(gsh_st, lock);
 
-				if (sp == NULL)
-					return;
 				iop = is_write ? &sp->write : &sp->read;
 			} else if (op_ctx->nfs_minorvers == 2) {
 				struct nfsv41_stats *sp = get_v42(gsh_st, lock);
 
-				if (sp == NULL)
-					return;
 				iop = is_write ? &sp->write : &sp->read;
 			}
 			/* the frightening thought is someday minor == 3 */
@@ -653,8 +658,6 @@ static void record_io_stats(struct gsh_stats *gsh_st, pthread_rwlock_t *lock,
 	} else if (op_ctx->req_type == _9P_REQUEST) {
 		struct _9p_stats *sp = get_9p(gsh_st, lock);
 
-		if (sp == NULL)
-			return;
 		iop = is_write ? &sp->write : &sp->read;
 #endif
 	} else {
@@ -733,8 +736,6 @@ static void record_nfsv4_op(struct gsh_stats *gsh_st, pthread_rwlock_t *lock,
 	if (minorversion == 0) {
 		struct nfsv40_stats *sp = get_v40(gsh_st, lock);
 
-		if (sp == NULL)
-			return;
 		/* record stuff */
 		switch (nfsv40_optype[proto_op]) {
 		case READ_OP:
@@ -752,8 +753,6 @@ static void record_nfsv4_op(struct gsh_stats *gsh_st, pthread_rwlock_t *lock,
 	} else if (minorversion == 1) {
 		struct nfsv41_stats *sp = get_v41(gsh_st, lock);
 
-		if (sp == NULL)
-			return;
 		/* record stuff */
 		switch (nfsv41_optype[proto_op]) {
 		case READ_OP:
@@ -774,8 +773,6 @@ static void record_nfsv4_op(struct gsh_stats *gsh_st, pthread_rwlock_t *lock,
 	} else if (minorversion == 2) {
 		struct nfsv41_stats *sp = get_v42(gsh_st, lock);
 
-		if (sp == NULL)
-			return;
 		/* record stuff */
 		switch (nfsv42_optype[proto_op]) {
 		case READ_OP:
@@ -810,8 +807,6 @@ static void record_compound(struct gsh_stats *gsh_st, pthread_rwlock_t *lock,
 
 		struct nfsv40_stats *sp = get_v40(gsh_st, lock);
 
-		if (sp == NULL)
-			return;
 		/* record stuff */
 		record_op(&sp->compounds, request_time, qwait_time, success,
 			  false);
@@ -819,8 +814,6 @@ static void record_compound(struct gsh_stats *gsh_st, pthread_rwlock_t *lock,
 	} else if (minorversion == 1) {
 		struct nfsv41_stats *sp = get_v41(gsh_st, lock);
 
-		if (sp == NULL)
-			return;
 		/* record stuff */
 		record_op(&sp->compounds, request_time, qwait_time, success,
 			  false);
@@ -828,8 +821,6 @@ static void record_compound(struct gsh_stats *gsh_st, pthread_rwlock_t *lock,
 	} else if (minorversion == 2) {
 		struct nfsv41_stats *sp = get_v42(gsh_st, lock);
 
-		if (sp == NULL)
-			return;
 		/* record stuff */
 		record_op(&sp->compounds, request_time, qwait_time, success,
 			  false);
@@ -858,7 +849,7 @@ static void record_stats(struct gsh_stats *gsh_st, pthread_rwlock_t *lock,
 			 nsecs_elapsed_t qwait_time, bool success, bool dup,
 			 bool global)
 {
-	struct svc_req *req = &reqdata->r_u.nfs->req;
+	struct svc_req *req = &reqdata->r_u.req.svc;
 	uint32_t proto_op = req->rq_proc;
 
 	if (req->rq_prog == nfs_param.core_param.program[P_NFS]) {
@@ -867,8 +858,6 @@ static void record_stats(struct gsh_stats *gsh_st, pthread_rwlock_t *lock,
 		if (req->rq_vers == NFS_V3) {
 			struct nfsv3_stats *sp = get_v3(gsh_st, lock);
 
-			if (sp == NULL)
-				return;
 			/* record stuff */
 			if (global)
 				record_op(&global_st.nfsv3.cmds, request_time,
@@ -900,8 +889,6 @@ static void record_stats(struct gsh_stats *gsh_st, pthread_rwlock_t *lock,
 			record_op(&global_st.mnt.v3_ops, request_time,
 				  qwait_time, success, dup);
 
-		if (sp == NULL)
-			return;
 		/* record stuff */
 		if (req->rq_vers == MOUNT_V1)
 			record_op(&sp->v1_ops, request_time, qwait_time,
@@ -915,8 +902,6 @@ static void record_stats(struct gsh_stats *gsh_st, pthread_rwlock_t *lock,
 		if (global)
 			record_op(&global_st.nlm4.ops, request_time,
 				  qwait_time, success, dup);
-		if (sp == NULL)
-			return;
 		/* record stuff */
 		record_op(&sp->ops, request_time, qwait_time, success, dup);
 	} else if (req->rq_prog == nfs_param.core_param.program[P_RQUOTA]) {
@@ -925,8 +910,6 @@ static void record_stats(struct gsh_stats *gsh_st, pthread_rwlock_t *lock,
 		if (global)
 			record_op(&global_st.rquota.ops, request_time,
 				  qwait_time, success, dup);
-		if (sp == NULL)
-			return;
 		/* record stuff */
 		if (req->rq_vers == RQUOTAVERS)
 			record_op(&sp->ops, request_time, qwait_time, success,
@@ -937,11 +920,11 @@ static void record_stats(struct gsh_stats *gsh_st, pthread_rwlock_t *lock,
 	}
 }
 
+#ifdef _USE_9P
 /**
  * @brief Record transport stats
  *
  */
-#ifdef _USE_9P
 static void record_transport_stats(struct transport_stats *t_st,
 				   uint64_t rx_bytes, uint64_t rx_pkt,
 				   uint64_t rx_err, uint64_t tx_bytes,
@@ -961,12 +944,12 @@ static void record_transport_stats(struct transport_stats *t_st,
 		atomic_add_uint64_t(&t_st->tx_err, tx_err);
 }
 #endif
+#ifdef _USE_9P
 /**
  * @brief record 9P tcp transport stats
  *
  * Called from 9P functions doing send/recv
  */
-#ifdef _USE_9P
 void server_stats_transport_done(struct gsh_client *client,
 				uint64_t rx_bytes, uint64_t rx_pkt,
 				uint64_t rx_err, uint64_t tx_bytes,
@@ -979,6 +962,42 @@ void server_stats_transport_done(struct gsh_client *client,
 	if (sp != NULL)
 		record_transport_stats(&sp->trans, rx_bytes, rx_pkt, rx_err,
 				       tx_bytes, tx_pkt, tx_err);
+}
+
+/**
+ * @bried record 9p operation stats
+ *
+ * Called from 9P interpreter at operation completion
+ */
+void server_stats_9p_done(u8 opc, struct _9p_request_data *req9p)
+{
+	struct gsh_client *client;
+	struct gsh_export *export;
+	struct _9p_stats *sp;
+
+	client = req9p->pconn->client;
+	if (client) {
+		struct server_stats *server_st;
+
+		server_st = container_of(client, struct server_stats, client);
+		sp = get_9p(&server_st->st, &client->lock);
+		if (sp->opcodes[opc] == NULL)
+			sp->opcodes[opc] =
+				gsh_calloc(1, sizeof(struct proto_op));
+		record_op(sp->opcodes[opc], 0, 0, true, false);
+	}
+
+	if (op_ctx->ctx_export) {
+		struct export_stats *exp_st;
+
+		export = op_ctx->ctx_export;
+		exp_st = container_of(export, struct export_stats, export);
+		sp = get_9p(&exp_st->st, &export->lock);
+		if (sp->opcodes[opc] == NULL)
+			sp->opcodes[opc] =
+				gsh_calloc(1, sizeof(struct proto_op));
+		record_op(sp->opcodes[opc], 0, 0, true, false);
+	}
 }
 #endif
 
@@ -993,7 +1012,7 @@ void server_stats_nfs_done(request_data_t *reqdata, int rc, bool dup)
 	struct gsh_client *client = op_ctx->client;
 	struct timespec current_time;
 	nsecs_elapsed_t stop_time;
-	struct svc_req *req = &reqdata->r_u.nfs->req;
+	struct svc_req *req = &reqdata->r_u.req.svc;
 	uint32_t proto_op = req->rq_proc;
 
 	if (req->rq_prog == NFS_PROGRAM && op_ctx->nfs_vers == NFS_V3)
@@ -1012,6 +1031,7 @@ void server_stats_nfs_done(request_data_t *reqdata, int rc, bool dup)
 	stop_time = timespec_diff(&ServerBootTime, &current_time);
 	if (client != NULL) {
 		struct server_stats *server_st;
+
 		server_st = container_of(client, struct server_stats, client);
 		record_stats(&server_st->st, &client->lock, reqdata,
 			     stop_time - op_ctx->start_time,
@@ -1019,18 +1039,18 @@ void server_stats_nfs_done(request_data_t *reqdata, int rc, bool dup)
 			     rc == NFS_REQ_OK, dup, true);
 		(void)atomic_store_uint64_t(&client->last_update, stop_time);
 	}
-	if (!dup && op_ctx->export != NULL) {
+	if (!dup && op_ctx->ctx_export != NULL) {
 		struct export_stats *exp_st;
 
 		exp_st =
-		    container_of(op_ctx->export, struct export_stats, export);
-		record_stats(&exp_st->st, &op_ctx->export->lock, reqdata,
+		    container_of(op_ctx->ctx_export, struct export_stats,
+			    export);
+		record_stats(&exp_st->st, &op_ctx->ctx_export->lock, reqdata,
 			     stop_time - op_ctx->start_time,
 			     op_ctx->queue_wait, rc == NFS_REQ_OK, dup, false);
-		(void)atomic_store_uint64_t(&op_ctx->export->last_update,
+		(void)atomic_store_uint64_t(&op_ctx->ctx_export->last_update,
 					    stop_time);
 	}
-	return;
 }
 
 /**
@@ -1057,6 +1077,7 @@ void server_stats_nfsv4_op_done(int proto_op,
 
 	if (client != NULL) {
 		struct server_stats *server_st;
+
 		server_st = container_of(client, struct server_stats, client);
 		record_nfsv4_op(&server_st->st, &client->lock, proto_op,
 				op_ctx->nfs_minorvers, stop_time - start_time,
@@ -1074,18 +1095,19 @@ void server_stats_nfsv4_op_done(int proto_op,
 		record_op(&global_st.nfsv42.compounds, stop_time - start_time,
 			  op_ctx->queue_wait, status == NFS4_OK, false);
 
-	if (op_ctx->export != NULL) {
+	if (op_ctx->ctx_export != NULL) {
 		struct export_stats *exp_st;
 
 		exp_st =
-		    container_of(op_ctx->export, struct export_stats, export);
-		record_nfsv4_op(&exp_st->st, &op_ctx->export->lock, proto_op,
+		    container_of(op_ctx->ctx_export, struct export_stats,
+			    export);
+		record_nfsv4_op(&exp_st->st, &op_ctx->ctx_export->lock,
+				proto_op,
 				op_ctx->nfs_minorvers, stop_time - start_time,
 				op_ctx->queue_wait, status);
-		(void)atomic_store_uint64_t(&op_ctx->export->last_update,
+		(void)atomic_store_uint64_t(&op_ctx->ctx_export->last_update,
 					    stop_time);
 	}
-	return;
 }
 
 /**
@@ -1104,6 +1126,7 @@ void server_stats_compound_done(int num_ops, int status)
 	stop_time = timespec_diff(&ServerBootTime, &current_time);
 	if (client != NULL) {
 		struct server_stats *server_st;
+
 		server_st = container_of(client, struct server_stats, client);
 		record_compound(&server_st->st, &client->lock,
 				op_ctx->nfs_minorvers,
@@ -1111,19 +1134,19 @@ void server_stats_compound_done(int num_ops, int status)
 				op_ctx->queue_wait, status == NFS4_OK);
 		(void)atomic_store_uint64_t(&client->last_update, stop_time);
 	}
-	if (op_ctx->export != NULL) {
+	if (op_ctx->ctx_export != NULL) {
 		struct export_stats *exp_st;
 
 		exp_st =
-		    container_of(op_ctx->export, struct export_stats, export);
-		record_compound(&exp_st->st, &op_ctx->export->lock,
+		    container_of(op_ctx->ctx_export, struct export_stats,
+			    export);
+		record_compound(&exp_st->st, &op_ctx->ctx_export->lock,
 				op_ctx->nfs_minorvers, num_ops,
 				stop_time - op_ctx->start_time,
 				op_ctx->queue_wait, status == NFS4_OK);
-		(void)atomic_store_uint64_t(&op_ctx->export->last_update,
+		(void)atomic_store_uint64_t(&op_ctx->ctx_export->last_update,
 					    stop_time);
 	}
-	return;
 }
 
 /**
@@ -1145,15 +1168,15 @@ void server_stats_io_done(size_t requested,
 				requested, transferred, success,
 				is_write);
 	}
-	if (op_ctx->export != NULL) {
+	if (op_ctx->ctx_export != NULL) {
 		struct export_stats *exp_st;
 
 		exp_st =
-		    container_of(op_ctx->export, struct export_stats, export);
-		record_io_stats(&exp_st->st, &op_ctx->export->lock,
+		    container_of(op_ctx->ctx_export, struct export_stats,
+			    export);
+		record_io_stats(&exp_st->st, &op_ctx->ctx_export->lock,
 				requested, transferred, success, is_write);
 	}
-	return;
 }
 
 /**
@@ -1166,8 +1189,8 @@ void check_deleg_struct(struct gsh_stats *stats, pthread_rwlock_t *lock)
 	if (unlikely(stats->deleg == NULL)) {
 		PTHREAD_RWLOCK_wrlock(lock);
 		if (stats->deleg == NULL)
-			stats->deleg = gsh_calloc(
-					sizeof(struct deleg_stats), 1);
+			stats->deleg = gsh_calloc(1,
+					sizeof(struct deleg_stats));
 		PTHREAD_RWLOCK_unlock(lock);
 	}
 }
@@ -1175,6 +1198,7 @@ void inc_grants(struct gsh_client *client)
 {
 	if (client != NULL) {
 		struct server_stats *server_st;
+
 		server_st = container_of(client, struct server_stats, client);
 		check_deleg_struct(&server_st->st, &client->lock);
 		server_st->st.deleg->curr_deleg_grants++;
@@ -1184,6 +1208,7 @@ void dec_grants(struct gsh_client *client)
 {
 	if (client != NULL) {
 		struct server_stats *server_st;
+
 		server_st = container_of(client, struct server_stats, client);
 		check_deleg_struct(&server_st->st, &client->lock);
 		server_st->st.deleg->curr_deleg_grants++;
@@ -1193,6 +1218,7 @@ void inc_revokes(struct gsh_client *client)
 {
 	if (client != NULL) {
 		struct server_stats *server_st;
+
 		server_st = container_of(client, struct server_stats, client);
 		check_deleg_struct(&server_st->st, &client->lock);
 		server_st->st.deleg->num_revokes++;
@@ -1202,6 +1228,7 @@ void inc_recalls(struct gsh_client *client)
 {
 	if (client != NULL) {
 		struct server_stats *server_st;
+
 		server_st = container_of(client, struct server_stats, client);
 		check_deleg_struct(&server_st->st, &client->lock);
 		server_st->st.deleg->tot_recalls++;
@@ -1211,6 +1238,7 @@ void inc_failed_recalls(struct gsh_client *client)
 {
 	if (client != NULL) {
 		struct server_stats *server_st;
+
 		server_st = container_of(client, struct server_stats, client);
 		check_deleg_struct(&server_st->st, &client->lock);
 		server_st->st.deleg->failed_recalls++;
@@ -1274,6 +1302,33 @@ void server_stats_summary(DBusMessageIter *iter, struct gsh_stats *st)
 				       &stats_available);
 }
 
+#ifdef _USE_9P
+/** @brief Report protocol operation statistics
+ *
+ * struct proto_op {
+ *         uint64_t total;
+ *         uint64_t errors;
+ *         ...
+ * }
+ *
+ * @param op    [IN] pointer to proto op sub-structure of interest
+ * @param iter  [IN] interator in reply stream to fill
+ */
+static void server_dbus_op_stats(struct proto_op *op, DBusMessageIter *iter)
+{
+	DBusMessageIter struct_iter;
+	uint64_t zero = 0;
+
+	dbus_message_iter_open_container(iter, DBUS_TYPE_STRUCT, NULL,
+					 &struct_iter);
+	dbus_message_iter_append_basic(&struct_iter, DBUS_TYPE_UINT64,
+				       op == NULL ? &zero : &op->total);
+	dbus_message_iter_append_basic(&struct_iter, DBUS_TYPE_UINT64,
+				       op == NULL ? &zero : &op->errors);
+	dbus_message_iter_close_container(iter, &struct_iter);
+}
+#endif
+
 /**
  * @brief Report I/O statistics as a struct
  *
@@ -1311,6 +1366,7 @@ static void server_dbus_iostats(struct xfer_op *iop, DBusMessageIter *iter)
 	dbus_message_iter_close_container(iter, &struct_iter);
 }
 
+#ifdef _USE_9P
 static void server_dbus_transportstats(struct transport_stats *tstats,
 				       DBusMessageIter *iter)
 {
@@ -1332,6 +1388,7 @@ static void server_dbus_transportstats(struct transport_stats *tstats,
 				       &tstats->tx_err);
 	dbus_message_iter_close_container(iter, &struct_iter);
 }
+#endif
 
 void server_dbus_total(struct export_stats *export_st, DBusMessageIter *iter)
 {
@@ -1647,45 +1704,8 @@ void global_dbus_total_ops(DBusMessageIter *iter)
 	global_dbus_total(iter);
 }
 
-void cache_inode_dbus_show(DBusMessageIter *iter)
-{
-	struct timespec timestamp;
-	DBusMessageIter struct_iter;
-	char *type;
 
-	now(&timestamp);
-	dbus_append_timestamp(iter, &timestamp);
-
-	dbus_message_iter_open_container(iter, DBUS_TYPE_STRUCT, NULL,
-					 &struct_iter);
-	type = "cache_req";
-	dbus_message_iter_append_basic(&struct_iter, DBUS_TYPE_STRING, &type);
-	dbus_message_iter_append_basic(&struct_iter, DBUS_TYPE_UINT64,
-					&cache_st.inode_req);
-	type = "cache_hit";
-	dbus_message_iter_append_basic(&struct_iter, DBUS_TYPE_STRING, &type);
-	dbus_message_iter_append_basic(&struct_iter, DBUS_TYPE_UINT64,
-					&cache_st.inode_hit);
-	type = "cache_miss";
-	dbus_message_iter_append_basic(&struct_iter, DBUS_TYPE_STRING, &type);
-	dbus_message_iter_append_basic(&struct_iter, DBUS_TYPE_UINT64,
-					&cache_st.inode_miss);
-	type = "cache_conf";
-	dbus_message_iter_append_basic(&struct_iter, DBUS_TYPE_STRING, &type);
-	dbus_message_iter_append_basic(&struct_iter, DBUS_TYPE_UINT64,
-					&cache_st.inode_conf);
-	type = "cache_added";
-	dbus_message_iter_append_basic(&struct_iter, DBUS_TYPE_STRING, &type);
-	dbus_message_iter_append_basic(&struct_iter, DBUS_TYPE_UINT64,
-					&cache_st.inode_added);
-	type = "cache_mapping";
-	dbus_message_iter_append_basic(&struct_iter, DBUS_TYPE_STRING, &type);
-	dbus_message_iter_append_basic(&struct_iter, DBUS_TYPE_UINT64,
-					&cache_st.inode_mapping);
-
-	dbus_message_iter_close_container(iter, &struct_iter);
-}
-
+#ifdef _USE_9P
 void server_dbus_9p_iostats(struct _9p_stats *_9pp, DBusMessageIter *iter)
 {
 	struct timespec timestamp;
@@ -1704,6 +1724,18 @@ void server_dbus_9p_transstats(struct _9p_stats *_9pp, DBusMessageIter *iter)
 	dbus_append_timestamp(iter, &timestamp);
 	server_dbus_transportstats(&_9pp->trans, iter);
 }
+
+void server_dbus_9p_opstats(struct _9p_stats *_9pp, u8 opcode,
+			    DBusMessageIter *iter)
+{
+	struct timespec timestamp;
+
+	now(&timestamp);
+	dbus_append_timestamp(iter, &timestamp);
+	server_dbus_op_stats(_9pp->opcodes[opcode], iter);
+}
+#endif
+
 
 /**
  * @brief Report layout statistics as a struct
@@ -1826,10 +1858,18 @@ void server_stats_free(struct gsh_stats *statsp)
 		gsh_free(statsp->nfsv42);
 		statsp->nfsv42 = NULL;
 	}
+#ifdef _USE_9P
 	if (statsp->_9p != NULL) {
+		u8 opc;
+
+		for (opc = 0; opc <= _9P_RWSTAT; opc++) {
+			if (statsp->_9p->opcodes[opc] != NULL)
+				gsh_free(statsp->_9p->opcodes[opc]);
+		}
 		gsh_free(statsp->_9p);
 		statsp->_9p = NULL;
 	}
+#endif
 }
 
 /** @} */

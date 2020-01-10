@@ -1,5 +1,5 @@
 /*
- * vim:noexpandtab:shiftwidth=8:tabstop=8:
+ * Vim:noexpandtab:shiftwidth=8:tabstop=8:
  *
  * Copyright CEA/DAM/DIF  (2008)
  * contributeur : Philippe DENIEL   philippe.deniel@cea.fr
@@ -35,8 +35,6 @@
 #include "log.h"
 #include "fsal.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
-#include "cache_inode_lru.h"
 #include "nfs_exports.h"
 #include "nfs_proto_functions.h"
 #include "nfs_proto_tools.h"
@@ -106,29 +104,19 @@ int nfs4_op_restorefh(struct nfs_argop4 *op, compound_data_t *data,
 		get_gsh_export_ref(data->saved_export);
 	}
 
-	/* Copy the data from current FH to saved FH */
+	/* Copy the data from saved FH to current FH */
 	memcpy(data->currentFH.nfs_fh4_val, data->savedFH.nfs_fh4_val,
 	       data->savedFH.nfs_fh4_len);
 
 	data->currentFH.nfs_fh4_len = data->savedFH.nfs_fh4_len;
 
-	if (data->saved_entry != NULL &&
-	    cache_inode_lru_ref(data->saved_entry,
-				LRU_FLAG_NONE) != CACHE_INODE_SUCCESS) {
-		/* SavedFH has gone stale. Return the export reference. */
-		if (data->saved_export != NULL)
-			put_gsh_export(data->saved_export);
-		res_RESTOREFH->status = NFS4ERR_STALE;
-		return res_RESTOREFH->status;
-	}
-
-	if (op_ctx->export != NULL)
-		put_gsh_export(op_ctx->export);
+	if (op_ctx->ctx_export != NULL)
+		put_gsh_export(op_ctx->ctx_export);
 
 	/* Restore the export information */
-	op_ctx->export = data->saved_export;
-	if (op_ctx->export != NULL)
-		op_ctx->fsal_export = op_ctx->export->fsal_export;
+	op_ctx->ctx_export = data->saved_export;
+	if (op_ctx->ctx_export != NULL)
+		op_ctx->fsal_export = op_ctx->ctx_export->fsal_export;
 
 	*op_ctx->export_perms = data->saved_export_perms;
 
@@ -138,7 +126,7 @@ int nfs4_op_restorefh(struct nfs_argop4 *op, compound_data_t *data,
 	 */
 
 	/* Update the current entry */
-	set_current_entry(data, data->saved_entry);
+	set_current_entry(data, data->saved_obj);
 
 	/* Restore the saved stateid */
 	data->current_stateid = data->saved_stateid;
@@ -153,6 +141,7 @@ int nfs4_op_restorefh(struct nfs_argop4 *op, compound_data_t *data,
 
 	if (isFullDebug(COMPONENT_NFS_V4)) {
 		char str[LEN_FH_STR];
+
 		sprint_fhandle4(str, &data->currentFH);
 		LogFullDebug(COMPONENT_NFS_V4,
 			     "RESTORE FH: Current FH %s",
@@ -173,5 +162,4 @@ int nfs4_op_restorefh(struct nfs_argop4 *op, compound_data_t *data,
 void nfs4_op_restorefh_Free(nfs_resop4 *resp)
 {
 	/* Nothing to be done */
-	return;
-}				/* nfs4_op_restorefh_Free */
+}

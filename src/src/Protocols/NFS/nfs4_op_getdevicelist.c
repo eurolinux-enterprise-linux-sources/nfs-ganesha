@@ -42,7 +42,6 @@
 #include "log.h"
 #include "fsal.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_exports.h"
 #include "nfs_proto_tools.h"
 #include "nfs_proto_functions.h"
@@ -125,17 +124,11 @@ int nfs4_op_getdevicelist(struct nfs_argop4 *op, compound_data_t *data,
 
 	cb_opaque.count = 0;
 	cb_opaque.max = 32;
-	cb_opaque.swexport = nfs_htonl64(op_ctx->export->export_id);
+	cb_opaque.swexport = nfs_htonl64(op_ctx->ctx_export->export_id);
 
 	res_GETDEVICELIST4->GETDEVICELIST4res_u.gdlr_resok4.
 	     gdlr_deviceid_list.gdlr_deviceid_list_val =
-	     gsh_malloc(cb_opaque.max * sizeof(deviceid4));
-
-	if (res_GETDEVICELIST4->GETDEVICELIST4res_u.gdlr_resok4.
-	     gdlr_deviceid_list.gdlr_deviceid_list_val == NULL) {
-		nfs_status = NFS4ERR_SERVERFAULT;
-		goto out;
-	}
+				gsh_malloc(cb_opaque.max * sizeof(deviceid4));
 
 	cb_opaque.buffer =
 	    res_GETDEVICELIST4->GETDEVICELIST4res_u.gdlr_resok4.

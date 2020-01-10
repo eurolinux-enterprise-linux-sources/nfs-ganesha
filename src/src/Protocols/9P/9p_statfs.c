@@ -39,12 +39,10 @@
 #include <sys/stat.h>
 #include "nfs_core.h"
 #include "log.h"
-#include "cache_inode.h"
 #include "fsal.h"
 #include "9p.h"
 
-int _9p_statfs(struct _9p_request_data *req9p, void *worker_data,
-	       u32 *plenout, char *preply)
+int _9p_statfs(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 {
 	char *cursor = req9p->_9pmsg + _9P_HDR_SIZE + _9P_TYPE_SIZE;
 	u16 *msgtag = NULL;
@@ -52,9 +50,8 @@ int _9p_statfs(struct _9p_request_data *req9p, void *worker_data,
 
 	struct _9p_fid *pfid = NULL;
 
-	u32 type = 0x6969;	/* NFS_SUPER_MAGIC for wanting of better,
-				 * FSAL do not return this information */
-	u32 bsize = 1;		/* cache_inode_statfs and
+	u32 type = 0x01021997;	/* V9FS_MAGIC */
+	u32 bsize = 1;		/* fsal_statfs and
 				 * FSAL already care for blocksize */
 	u64 *blocks = NULL;
 	u64 *bfree = NULL;
@@ -66,7 +63,8 @@ int _9p_statfs(struct _9p_request_data *req9p, void *worker_data,
 	u32 namelen = MAXNAMLEN;
 
 	fsal_dynamicfsinfo_t dynamicinfo;
-	cache_inode_status_t cache_status;
+	fsal_status_t fsal_status;
+	struct attrlist attrs;
 
 	/* Get data */
 	_9p_getptr(cursor, msgtag, u16);
@@ -75,27 +73,47 @@ int _9p_statfs(struct _9p_request_data *req9p, void *worker_data,
 	LogDebug(COMPONENT_9P, "TSTATFS: tag=%u fid=%u", (u32) *msgtag, *fid);
 
 	if (*fid >= _9P_FID_PER_CONN)
-		return _9p_rerror(req9p, worker_data, msgtag, ERANGE, plenout,
-				  preply);
+		return _9p_rerror(req9p, msgtag, ERANGE, plenout, preply);
 
 	pfid = req9p->pconn->fids[*fid];
 	if (pfid == NULL)
-		return _9p_rerror(req9p, worker_data, msgtag, EINVAL, plenout,
+		return _9p_rerror(req9p, msgtag, EINVAL, plenout, preply);
+	_9p_init_opctx(pfid, req9p);
+
+	/* Get the obj's attributes */
+	fsal_prepare_attrs(&attrs, ATTRS_NFS3);
+
+	fsal_status = pfid->pentry->obj_ops.getattrs(pfid->pentry, &attrs);
+
+	if (FSAL_IS_ERROR(fsal_status)) {
+		/* Done with the attrs */
+		fsal_release_attrs(&attrs);
+
+		return _9p_rerror(req9p, msgtag,
+				  _9p_tools_errno(fsal_status), plenout,
 				  preply);
-	op_ctx = &pfid->op_context;
+	}
+
 	/* Get the FS's stats */
-	cache_status = cache_inode_statfs(pfid->pentry, &dynamicinfo);
-	if (cache_status != CACHE_INODE_SUCCESS)
-		return _9p_rerror(req9p, worker_data, msgtag,
-				  _9p_tools_errno(cache_status), plenout,
+	fsal_status = fsal_statfs(pfid->pentry, &dynamicinfo);
+	if (FSAL_IS_ERROR(fsal_status)) {
+		/* Done with the attrs */
+		fsal_release_attrs(&attrs);
+
+		return _9p_rerror(req9p, msgtag,
+				  _9p_tools_errno(fsal_status), plenout,
 				  preply);
+	}
 
 	blocks = (u64 *) &dynamicinfo.total_bytes;
 	bfree = (u64 *) &dynamicinfo.free_bytes;
 	bavail = (u64 *) &dynamicinfo.avail_bytes;
 	files = (u64 *) &dynamicinfo.total_files;
 	ffree = (u64 *) &dynamicinfo.free_files;
-	fsid = (u64) pfid->pentry->obj_handle->attributes.rawdev.major;
+	fsid = (u64) attrs.rawdev.major;
+
+	/* Done with the attrs */
+	fsal_release_attrs(&attrs);
 
 	/* Build the reply */
 	_9p_setinitptr(cursor, preply, _9P_RSTATFS);

@@ -1,0 +1,40 @@
+From cce011dce9e91e6cb65d3e72a915c260d52b87f4 Mon Sep 17 00:00:00 2001
+From: Daniel Gryniewicz <dang@redhat.com>
+Date: Fri, 20 Jan 2017 09:00:54 -0500
+Subject: [PATCH] MDCACHE - can't rename dirent if not in cache
+
+mdcache_dirent_find() can return success if the dirent is not found and
+the cache is not trusted.  In this case, we can't rename the dirent, so
+just return.
+
+Change-Id: Ia47350395a1d7bc0064b84a565d60d549b793afa
+Signed-off-by: Daniel Gryniewicz <dang@redhat.com>
+---
+ src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_helpers.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_helpers.c b/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_helpers.c
+index 09de106..db55ae8 100644
+--- a/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_helpers.c
++++ b/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_helpers.c
+@@ -1322,6 +1322,8 @@ mdcache_dirent_rename(mdcache_entry_t *parent, const char *oldname,
+ 	status = mdcache_dirent_find(parent, oldname, &dirent);
+ 	if (FSAL_IS_ERROR(status))
+ 		return status;
++	if (!dirent)
++		return status;
+ 
+ 	status = mdcache_dirent_find(parent, newname, &dirent2);
+ 	if (FSAL_IS_ERROR(status) && status.major != ERR_FSAL_NOENT)
+@@ -1329,7 +1331,7 @@ mdcache_dirent_rename(mdcache_entry_t *parent, const char *oldname,
+ 
+ 	if (dirent2) {
+ 		/* rename would cause a collision */
+-		if (dirent && parent->mde_flags & MDCACHE_TRUST_CONTENT) {
++		if (parent->mde_flags & MDCACHE_TRUST_CONTENT) {
+ 			/* overwrite, replace entry and expire the old */
+ 			mdcache_entry_t *oldentry;
+ 
+-- 
+2.9.3
+

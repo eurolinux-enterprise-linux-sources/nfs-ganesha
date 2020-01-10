@@ -39,14 +39,12 @@
 #include <sys/stat.h>
 #include "nfs_core.h"
 #include "log.h"
-#include "cache_inode.h"
 #include "fsal.h"
 #include "9p.h"
 #include "server_stats.h"
 #include "client_mgr.h"
 
-int _9p_read(struct _9p_request_data *req9p, void *worker_data,
-	     u32 *plenout, char *preply)
+int _9p_read(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 {
 	char *cursor = req9p->_9pmsg + _9P_HDR_SIZE + _9P_TYPE_SIZE;
 	char *databuffer;
@@ -61,7 +59,7 @@ int _9p_read(struct _9p_request_data *req9p, void *worker_data,
 
 	size_t read_size = 0;
 	bool eof_met;
-	cache_inode_status_t cache_status = CACHE_INODE_SUCCESS;
+	fsal_status_t fsal_status;
 	/* uint64_t stable_flag = CACHE_INODE_SAFE_WRITE_TO_FS; */
 	bool sync = false;
 
@@ -75,24 +73,21 @@ int _9p_read(struct _9p_request_data *req9p, void *worker_data,
 		 (u32) *msgtag, *fid, (unsigned long long)*offset, *count);
 
 	if (*fid >= _9P_FID_PER_CONN)
-		return _9p_rerror(req9p, worker_data, msgtag, ERANGE, plenout,
-				  preply);
+		return _9p_rerror(req9p, msgtag, ERANGE, plenout, preply);
 
 	pfid = req9p->pconn->fids[*fid];
 
 	/* Make sure the requested amount of data respects negotiated msize */
 	if (*count + _9P_ROOM_RREAD > req9p->pconn->msize)
-		return _9p_rerror(req9p, worker_data, msgtag, ERANGE, plenout,
-				  preply);
+		return _9p_rerror(req9p, msgtag, ERANGE, plenout, preply);
 
 	/* Check that it is a valid fid */
 	if (pfid == NULL || pfid->pentry == NULL) {
 		LogDebug(COMPONENT_9P, "request on invalid fid=%u", *fid);
-		return _9p_rerror(req9p, worker_data, msgtag, EIO, plenout,
-				  preply);
+		return _9p_rerror(req9p, msgtag, EIO, plenout, preply);
 	}
 
-	op_ctx = &pfid->op_context;
+	_9p_init_opctx(pfid, req9p);
 
 	/* Start building the reply already
 	 * So we don't need to use an intermediate data buffer
@@ -110,10 +105,29 @@ int _9p_read(struct _9p_request_data *req9p, void *worker_data,
 
 		outcount = (u32) *count;
 	} else {
-		cache_status =
-		    cache_inode_rdwr(pfid->pentry, CACHE_INODE_READ, *offset,
-				     *count, &read_size, databuffer, &eof_met,
-				     &sync);
+		if (pfid->pentry->fsal->m_ops.support_ex(pfid->pentry)) {
+			/* Call the new fsal_read */
+			fsal_status = fsal_read2(pfid->pentry,
+						false,
+						pfid->state,
+						*offset,
+						*count,
+						&read_size,
+						databuffer,
+						&eof_met,
+						NULL);
+		} else {
+			/* Call legacy fsal_rdwr */
+			fsal_status = fsal_rdwr(pfid->pentry,
+						 FSAL_IO_READ,
+						 *offset,
+						 *count,
+						 &read_size,
+						 databuffer,
+						 &eof_met,
+						 &sync,
+						 NULL);
+		}
 
 		/* Get the handle, for stats */
 		struct gsh_client *client = req9p->pconn->client;
@@ -122,19 +136,15 @@ int _9p_read(struct _9p_request_data *req9p, void *worker_data,
 			LogDebug(COMPONENT_9P,
 				 "Cannot get client block for 9P request");
 		} else {
-			pfid->op_context.client = client;
+			op_ctx->client = client;
 
-			server_stats_io_done(*count,
-					     read_size,
-					     (cache_status ==
-					      CACHE_INODE_SUCCESS) ?
-					      true : false,
-					     false);
+			server_stats_io_done(*count, read_size,
+					     FSAL_IS_ERROR(fsal_status), false);
 		}
 
-		if (cache_status != CACHE_INODE_SUCCESS)
-			return _9p_rerror(req9p, worker_data, msgtag,
-					  _9p_tools_errno(cache_status),
+		if (FSAL_IS_ERROR(fsal_status))
+			return _9p_rerror(req9p, msgtag,
+					  _9p_tools_errno(fsal_status),
 					  plenout, preply);
 
 		outcount = (u32) read_size;

@@ -61,15 +61,13 @@ int vfs_readlink(struct vfs_fsal_obj_handle *myself,
 	if (fd < 0)
 		return fd;
 
-	retval = vfs_stat_by_handle(fd, myself->handle, &st, flags);
+	retval = vfs_stat_by_handle(fd, &st);
 	if (retval < 0)
 		goto error;
 
 	myself->u.symlink.link_size = st.st_size + 1;
 	myself->u.symlink.link_content =
 	    gsh_malloc(myself->u.symlink.link_size);
-	if (myself->u.symlink.link_content == NULL)
-		goto error;
 
 	retlink =
 	    vfs_readlink_by_handle(myself->handle, fd, "",
@@ -110,7 +108,7 @@ int vfs_get_root_handle(struct vfs_filesystem *vfs_fs,
 	}
 
 	/* Check if we have to re-index the fsid based on config */
-	if (exp->fsid_type != -1 &&
+	if (exp->fsid_type != FSID_NO_TYPE &&
 	    exp->fsid_type != vfs_fs->fs->fsid_type) {
 		retval = -change_fsid_type(vfs_fs->fs, exp->fsid_type);
 		if (retval != 0) {
@@ -122,8 +120,8 @@ int vfs_get_root_handle(struct vfs_filesystem *vfs_fs,
 		}
 
 		LogInfo(COMPONENT_FSAL,
-			"Reindexed filesystem %s to "
-			"fsid=0x%016"PRIx64".0x%016"PRIx64,
+			"Reindexed filesystem %s to fsid=0x%016"
+			PRIx64".0x%016"PRIx64,
 			vfs_fs->fs->path,
 			vfs_fs->fs->fsid.major,
 			vfs_fs->fs->fsid.minor);

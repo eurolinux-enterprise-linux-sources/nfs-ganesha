@@ -41,7 +41,6 @@
 #include "nfs4.h"
 #include "mount.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_exports.h"
 #include "nfs_creds.h"
 #include "nfs_proto_functions.h"
@@ -54,7 +53,6 @@
  * This function implements NFSPROC3_ACCESS.
  *
  * @param[in]  arg     NFS arguments union
- * @param[in]  worker  Worker thread data
  * @param[in]  req     SVC request related to this call
  * @param[out] res     Structure to contain the result of the call
  *
@@ -64,16 +62,15 @@
  *
  */
 
-int nfs3_access(nfs_arg_t *arg,
-		nfs_worker_data_t *worker,
-		struct svc_req *req, nfs_res_t *res)
+int nfs3_access(nfs_arg_t *arg, struct svc_req *req, nfs_res_t *res)
 {
-	cache_inode_status_t cache_status;
-	cache_entry_t *entry = NULL;
+	fsal_errors_t fsal_errors;
+	struct fsal_obj_handle *entry = NULL;
 	int rc = NFS_REQ_OK;
 
 	if (isDebug(COMPONENT_NFSPROTO)) {
 		char str[LEN_FH_STR];
+
 		sprint_fhandle3(str, &(arg->arg_access3.object));
 		LogDebug(COMPONENT_NFSPROTO,
 			 "REQUEST PROCESSING: Calling nfs3_access handle: %s",
@@ -95,16 +92,17 @@ int nfs3_access(nfs_arg_t *arg,
 	}
 
 	/* Perform the 'access' call */
-	cache_status =
+	fsal_errors =
 	    nfs_access_op(entry, arg->arg_access3.access,
 			  &res->res_access3.ACCESS3res_u.resok.access, NULL);
 
-	if (cache_status == CACHE_INODE_SUCCESS
-	    || cache_status == CACHE_INODE_FSAL_EACCESS) {
+	if (fsal_errors == ERR_FSAL_NO_ERROR ||
+	    fsal_errors == ERR_FSAL_ACCESS) {
 		/* Build Post Op Attributes */
 		nfs_SetPostOpAttr(entry,
-				  &(res->res_access3.ACCESS3res_u.resok.
-				    obj_attributes));
+				  &res->res_access3.ACCESS3res_u.resok.
+				    obj_attributes,
+				  NULL);
 
 		res->res_access3.status = NFS3_OK;
 		rc = NFS_REQ_OK;
@@ -112,19 +110,20 @@ int nfs3_access(nfs_arg_t *arg,
 	}
 
 	/* If we are here, there was an error */
-	if (nfs_RetryableError(cache_status)) {
+	if (nfs_RetryableError(fsal_errors)) {
 		rc = NFS_REQ_DROP;
 		goto out;
 	}
 
-	res->res_access3.status = nfs3_Errno(cache_status);
+	res->res_access3.status = nfs3_Errno(fsal_errors);
 	nfs_SetPostOpAttr(entry,
-			  &(res->res_access3.ACCESS3res_u.resfail.
-			    obj_attributes));
+			  &res->res_access3.ACCESS3res_u.resfail.
+			    obj_attributes,
+			  NULL);
  out:
 
 	if (entry)
-		cache_inode_put(entry);
+		entry->obj_ops.put_ref(entry);
 
 	return rc;
 }				/* nfs3_access */
@@ -140,5 +139,4 @@ int nfs3_access(nfs_arg_t *arg,
 void nfs3_access_free(nfs_res_t *res)
 {
 	/* Nothing to do */
-	return;
 }

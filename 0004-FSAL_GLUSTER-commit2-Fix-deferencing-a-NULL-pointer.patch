@@ -1,0 +1,30 @@
+From d46e6d13747a6525d659628e185e0a58744698f3 Mon Sep 17 00:00:00 2001
+From: Soumya Koduri <skoduri@redhat.com>
+Date: Mon, 28 Nov 2016 15:52:57 +0530
+Subject: [PATCH] FSAL_GLUSTER/commit2: Fix deferencing a NULL pointer
+
+Allocate a temporary fd to be used to open in case
+if there is another thread using globalfd.
+
+Change-Id: I74d21c6db2e42f13c72b96b1f41a693866e81ded
+Signed-off-by: Soumya Koduri <skoduri@redhat.com>
+---
+ src/FSAL/FSAL_GLUSTER/handle.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/FSAL/FSAL_GLUSTER/handle.c b/src/FSAL/FSAL_GLUSTER/handle.c
+index ef82468..45beb9a 100644
+--- a/src/FSAL/FSAL_GLUSTER/handle.c
++++ b/src/FSAL/FSAL_GLUSTER/handle.c
+@@ -1936,7 +1936,7 @@ static fsal_status_t glusterfs_commit2(struct fsal_obj_handle *obj_hdl,
+ {
+ 	fsal_status_t status;
+ 	int retval;
+-	struct glusterfs_fd *out_fd = NULL;
++	struct glusterfs_fd tmp_fd = {0, NULL}, *out_fd = &tmp_fd;
+ 	struct glusterfs_handle *myself = NULL;
+ 	bool has_lock = false;
+ 	bool closefd = false;
+-- 
+2.5.5
+

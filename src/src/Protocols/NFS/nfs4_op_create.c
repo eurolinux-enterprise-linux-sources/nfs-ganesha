@@ -40,7 +40,6 @@
 #include "log.h"
 #include "fsal.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_exports.h"
 #include "nfs_creds.h"
 #include "nfs_proto_functions.h"
@@ -68,20 +67,17 @@ int nfs4_op_create(struct nfs_argop4 *op, compound_data_t *data,
 	CREATE4args * const arg_CREATE4 = &op->nfs_argop4_u.opcreate;
 	CREATE4res * const res_CREATE4 = &resp->nfs_resop4_u.opcreate;
 
-	cache_entry_t *entry_parent = NULL;
-	cache_entry_t *entry_new = NULL;
+	struct fsal_obj_handle *obj_parent = NULL;
+	struct fsal_obj_handle *obj_new = NULL;
 	struct attrlist sattr;
-	nfs_fh4 newfh4;
-	cache_inode_status_t cache_status = CACHE_INODE_SUCCESS;
 	int convrc = 0;
-	uint32_t mode = 0;
 	char *name = NULL;
 	char *link_content = NULL;
 	struct fsal_export *exp_hdl;
 	fsal_status_t fsal_status;
-	cache_inode_create_arg_t create_arg;
+	object_file_type_t type;
 
-	memset(&create_arg, 0, sizeof(create_arg));
+	memset(&sattr, 0, sizeof(sattr));
 
 	resp->resop = NFS4_OP_CREATE;
 	res_CREATE4->status = NFS4_OK;
@@ -96,7 +92,7 @@ int nfs4_op_create(struct nfs_argop4 *op, compound_data_t *data,
 	exp_hdl = op_ctx->fsal_export;
 
 	fsal_status = exp_hdl->exp_ops.check_quota(exp_hdl,
-						op_ctx->export->fullpath,
+						op_ctx->ctx_export->fullpath,
 						FSAL_QUOTA_INODES);
 
 	if (FSAL_IS_ERROR(fsal_status)) {
@@ -137,9 +133,9 @@ int nfs4_op_create(struct nfs_argop4 *op, compound_data_t *data,
 	if (res_CREATE4->status != NFS4_OK)
 		goto out;
 
-	/* Convert current FH into a cached entry, the current_entry
+	/* Convert current FH into a obj, the current_obj
 	   (assocated with the current FH will be used for this */
-	entry_parent = data->current_entry;
+	obj_parent = data->current_obj;
 
 	/* The currentFH must point to a directory
 	 * (objects are always created within a directory)
@@ -150,7 +146,7 @@ int nfs4_op_create(struct nfs_argop4 *op, compound_data_t *data,
 	}
 
 	res_CREATE4->CREATE4res_u.resok4.cinfo.before =
-	    cache_inode_get_changeid4(entry_parent);
+		fsal_get_changeid4(obj_parent);
 
 	/* Convert the incoming fattr4 to a vattr structure,
 	 * if such arguments are supplied
@@ -165,15 +161,13 @@ int nfs4_op_create(struct nfs_argop4 *op, compound_data_t *data,
 			res_CREATE4->status = convrc;
 			goto out;
 		}
-
-		if (sattr.mask & ATTR_MODE)
-			mode = sattr.mode;
 	}
 
 	/* Create either a symbolic link or a directory */
 	switch (arg_CREATE4->objtype.type) {
 	case NF4LNK:
 		/* Convert the name to link from into a regular string */
+		type = SYMBOLIC_LINK;
 		res_CREATE4->status = nfs4_utf8string2dynamic(
 				&arg_CREATE4->objtype.createtype4_u.linkdata,
 				UTF8_SCAN_SYMLINK,
@@ -181,166 +175,41 @@ int nfs4_op_create(struct nfs_argop4 *op, compound_data_t *data,
 
 		if (res_CREATE4->status != NFS4_OK)
 			goto out;
-
-		create_arg.link_content = link_content;
-
-		/* do the symlink operation */
-		cache_status = cache_inode_create(entry_parent,
-						  name,
-						  SYMBOLIC_LINK,
-						  mode,
-						  &create_arg,
-						  &entry_new);
-
-		if (entry_new == NULL) {
-			res_CREATE4->status = nfs4_Errno(cache_status);
-			goto out;
-		}
-
-		/* If entry exists entry_new is not null but
-		 * cache_status was set
-		 */
-		if (cache_status == CACHE_INODE_ENTRY_EXISTS) {
-			res_CREATE4->status = NFS4ERR_EXIST;
-			cache_inode_put(entry_new);
-			goto out;
-		}
-
 		break;
 
 	case NF4DIR:
-
 		/* Create a new directory */
-		cache_status = cache_inode_create(entry_parent,
-						  name,
-						  DIRECTORY,
-						  mode,
-						  NULL,
-						  &entry_new);
-
-		if (entry_new == NULL) {
-			res_CREATE4->status = nfs4_Errno(cache_status);
-			goto out;
-		}
-
-		/* If entry exists entry_new is not null but
-		 * cache_status was set
-		 */
-		if (cache_status == CACHE_INODE_ENTRY_EXISTS) {
-			res_CREATE4->status = NFS4ERR_EXIST;
-			cache_inode_put(entry_new);
-			goto out;
-		}
+		type = DIRECTORY;
 		break;
 
 	case NF4SOCK:
-
 		/* Create a new socket file */
-		cache_status = cache_inode_create(entry_parent,
-						  name,
-						  SOCKET_FILE,
-						  mode,
-						  NULL,
-						  &entry_new);
-
-		if (entry_new == NULL) {
-			res_CREATE4->status = nfs4_Errno(cache_status);
-			goto out;
-		}
-
-		/* If entry exists entry_new is not null but
-		 * cache_status was set
-		 */
-		if (cache_status == CACHE_INODE_ENTRY_EXISTS) {
-			res_CREATE4->status = NFS4ERR_EXIST;
-			cache_inode_put(entry_new);
-			goto out;
-		}
+		type = SOCKET_FILE;
 		break;
 
 	case NF4FIFO:
-
 		/* Create a new socket file */
-		cache_status = cache_inode_create(entry_parent,
-						  name,
-						  FIFO_FILE,
-						  mode,
-						  NULL,
-						  &entry_new);
-
-		if (entry_new == NULL) {
-			res_CREATE4->status = nfs4_Errno(cache_status);
-			goto out;
-		}
-
-		/* If entry exists entry_new is not null but
-		 * cache_status was set
-		 */
-		if (cache_status == CACHE_INODE_ENTRY_EXISTS) {
-			res_CREATE4->status = NFS4ERR_EXIST;
-			cache_inode_put(entry_new);
-			goto out;
-		}
+		type = FIFO_FILE;
 		break;
 
 	case NF4CHR:
-
-		create_arg.dev_spec.major =
-		    arg_CREATE4->objtype.createtype4_u.devdata.specdata1;
-		create_arg.dev_spec.minor =
-		    arg_CREATE4->objtype.createtype4_u.devdata.specdata2;
-
 		/* Create a new socket file */
-		cache_status = cache_inode_create(entry_parent,
-						  name,
-						  CHARACTER_FILE,
-						  mode,
-						  &create_arg,
-						  &entry_new);
-
-		if (entry_new == NULL) {
-			res_CREATE4->status = nfs4_Errno(cache_status);
-			goto out;
-		}
-
-		/* If entry exists entry_new is not null but
-		 * cache_status was set
-		 */
-		if (cache_status == CACHE_INODE_ENTRY_EXISTS) {
-			res_CREATE4->status = NFS4ERR_EXIST;
-			cache_inode_put(entry_new);
-			goto out;
-		}
+		type = CHARACTER_FILE;
+		sattr.rawdev.major =
+		    arg_CREATE4->objtype.createtype4_u.devdata.specdata1;
+		sattr.rawdev.minor =
+		    arg_CREATE4->objtype.createtype4_u.devdata.specdata2;
+		sattr.valid_mask |= ATTR_RAWDEV;
 		break;
 
 	case NF4BLK:
-
-		create_arg.dev_spec.major =
-		    arg_CREATE4->objtype.createtype4_u.devdata.specdata1;
-		create_arg.dev_spec.minor =
-		    arg_CREATE4->objtype.createtype4_u.devdata.specdata2;
-
 		/* Create a new socket file */
-		cache_status = cache_inode_create(entry_parent,
-						  name,
-						  BLOCK_FILE,
-						  mode,
-						  &create_arg,
-						  &entry_new);
-
-		if (entry_new == NULL) {
-			res_CREATE4->status = nfs4_Errno(cache_status);
-			goto out;
-		}
-
-		/* If entry exists entry_new is not null but
-		 * cache_status was set
-		 */
-		if (cache_status == CACHE_INODE_ENTRY_EXISTS) {
-			res_CREATE4->status = NFS4ERR_EXIST;
-			cache_inode_put(entry_new);
-			goto out;
-		}
+		type = BLOCK_FILE;
+		sattr.rawdev.major =
+		    arg_CREATE4->objtype.createtype4_u.devdata.specdata1;
+		sattr.rawdev.minor =
+		    arg_CREATE4->objtype.createtype4_u.devdata.specdata2;
+		sattr.valid_mask |= ATTR_RAWDEV;
 		break;
 
 	default:
@@ -351,34 +220,35 @@ int nfs4_op_create(struct nfs_argop4 *op, compound_data_t *data,
 		goto out;
 	}			/* switch( arg_CREATE4.objtype.type ) */
 
-	/* Allocation of a new file handle */
-	if (nfs4_AllocateFH(&newfh4) != NFS4_OK) {
-		res_CREATE4->status = NFS4ERR_SERVERFAULT;
-		cache_inode_put(entry_new);
+	if (!(sattr.valid_mask & ATTR_MODE)) {
+		/* Make sure mode is set. */
+		if (type == DIRECTORY)
+			sattr.mode = 0700;
+		else
+			sattr.mode = 0600;
+		sattr.valid_mask |= ATTR_MODE;
+	}
+
+	fsal_status = fsal_create(obj_parent, name, type, &sattr, link_content,
+				  &obj_new, NULL);
+
+	/* Release the attributes (may release an inherited ACL) */
+	fsal_release_attrs(&sattr);
+
+	if (FSAL_IS_ERROR(fsal_status)) {
+		res_CREATE4->status = nfs4_Errno_status(fsal_status);
 		goto out;
 	}
 
-	/* Building the new file handle */
-	if (!nfs4_FSALToFhandle(&newfh4,
-				entry_new->obj_handle,
-				op_ctx->export)) {
+	/* Building the new file handle to replace the current FH */
+	if (!nfs4_FSALToFhandle(false, &data->currentFH, obj_new,
+					op_ctx->ctx_export)) {
 		res_CREATE4->status = NFS4ERR_SERVERFAULT;
-		cache_inode_put(entry_new);
 		goto out;
 	}
-
-	/* This new fh replaces the current FH */
-	data->currentFH.nfs_fh4_len = newfh4.nfs_fh4_len;
-
-	memcpy(data->currentFH.nfs_fh4_val,
-	       newfh4.nfs_fh4_val,
-	       newfh4.nfs_fh4_len);
 
 	/* Mark current_stateid as invalid */
 	data->current_stateid_valid = false;
-
-	/* No do not need newfh any more */
-	gsh_free(newfh4.nfs_fh4_val);
 
 	/* Set the mode if requested */
 	/* Use the same fattr mask for reply, if one attribute was not
@@ -387,31 +257,6 @@ int nfs4_op_create(struct nfs_argop4 *op, compound_data_t *data,
 	    arg_CREATE4->createattrs.attrmask.bitmap4_len;
 
 	if (arg_CREATE4->createattrs.attrmask.bitmap4_len != 0) {
-		/* If owner or owner_group are set, and the credential was
-		 * squashed, then we must squash the set owner and owner_group.
-		 */
-		squash_setattr(&sattr);
-
-		/* Skip setting attributes if all asked attributes
-		 * are handled by create
-		 */
-		if ((sattr.mask &
-		     (ATTR_ACL | ATTR_ATIME | ATTR_MTIME | ATTR_CTIME))
-		    || ((sattr.mask & ATTR_OWNER)
-			&& (op_ctx->creds->caller_uid != sattr.owner))
-		    || ((sattr.mask & ATTR_GROUP)
-			&& (op_ctx->creds->caller_gid != sattr.group))) {
-			cache_status = cache_inode_setattr(entry_new,
-							   &sattr,
-							   false);
-
-			if (cache_status != CACHE_INODE_SUCCESS) {
-				res_CREATE4->status = nfs4_Errno(cache_status);
-				cache_inode_put(entry_new);
-				goto out;
-			}
-		}
-
 		/* copy over bitmap */
 		res_CREATE4->CREATE4res_u.resok4.attrset =
 		    arg_CREATE4->createattrs.attrmask;
@@ -422,7 +267,7 @@ int nfs4_op_create(struct nfs_argop4 *op, compound_data_t *data,
 	       sizeof(changeid4));
 
 	res_CREATE4->CREATE4res_u.resok4.cinfo.after =
-	    cache_inode_get_changeid4(entry_parent);
+		fsal_get_changeid4(obj_parent);
 
 	/* Operation is supposed to be atomic .... */
 	res_CREATE4->CREATE4res_u.resok4.cinfo.atomic = FALSE;
@@ -437,18 +282,20 @@ int nfs4_op_create(struct nfs_argop4 *op, compound_data_t *data,
 	/* @todo : BUGAZOMEU: fair ele free dans cette fonction */
 
 	/* Keep the vnode entry for the file in the compound data */
-	set_current_entry(data, entry_new);
+	set_current_entry(data, obj_new);
 
 	/* If you reach this point, then no error occured */
 	res_CREATE4->status = NFS4_OK;
 
  out:
 
-	if (name != NULL)
-		gsh_free(name);
+	if (obj_new) {
+		/* Put our ref */
+		obj_new->obj_ops.put_ref(obj_new);
+	}
 
-	if (link_content != NULL)
-		gsh_free(link_content);
+	gsh_free(name);
+	gsh_free(link_content);
 
 	return res_CREATE4->status;
 }				/* nfs4_op_create */
@@ -463,5 +310,5 @@ int nfs4_op_create(struct nfs_argop4 *op, compound_data_t *data,
  */
 void nfs4_op_create_Free(nfs_resop4 *resp)
 {
-	return;
-}				/* nfs4_op_create_Free */
+	/* Nothing to be done */
+}

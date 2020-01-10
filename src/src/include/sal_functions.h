@@ -40,6 +40,7 @@
 
 #include <stdint.h>
 #include "sal_data.h"
+#include "fsal.h"
 
 /**
  * @brief Divisions in state and clientid tables.
@@ -55,8 +56,6 @@
 const char *state_err_str(state_status_t err);
 
 state_status_t state_error_convert(fsal_status_t fsal_status);
-
-state_status_t cache_inode_status_to_state_status(cache_inode_status_t status);
 
 nfsstat4 nfs4_Errno_state(state_status_t error);
 nfsstat3 nfs3_Errno_state(state_status_t error);
@@ -82,7 +81,7 @@ void free_state_owner(state_owner_t *owner);
 state_owner_t *get_state_owner(care_t care, state_owner_t *pkey,
 			       state_owner_init_t init_owner, bool_t *isnew);
 
-void state_wipe_file(cache_entry_t *entry);
+void state_wipe_file(struct fsal_obj_handle *obj);
 
 #ifdef DEBUG_SAL
 void dump_all_owners(void);
@@ -91,6 +90,36 @@ void dump_all_owners(void);
 void state_release_export(struct gsh_export *exp);
 
 bool state_unlock_err_ok(state_status_t status);
+
+/**
+ * @brief Initialize a state handle
+ *
+ * @param[in,out] ostate	State handle to initialize
+ * @param[in] type	Type of handle
+ * @param[in] obj	Object owning handle
+ * @return Return description
+ */
+static inline void state_hdl_init(struct state_hdl *ostate,
+				  object_file_type_t type,
+				  struct fsal_obj_handle *obj)
+{
+	memset(ostate, 0, sizeof(*ostate));
+	PTHREAD_RWLOCK_init(&ostate->state_lock, NULL);
+	switch (type) {
+	case REGULAR_FILE:
+		glist_init(&ostate->file.list_of_states);
+		glist_init(&ostate->file.layoutrecall_list);
+		glist_init(&ostate->file.lock_list);
+		glist_init(&ostate->file.nlm_share_list);
+		ostate->file.obj = obj;
+		break;
+	case DIRECTORY:
+		glist_init(&ostate->dir.export_roots);
+		break;
+	default:
+		break;
+	}
+}
 
 /*****************************************************************************
  *
@@ -120,7 +149,7 @@ int Init_9p_hash(void);
 
 /******************************************************************************
  *
- * NLM State functions
+ * NLM Owner functions
  *
  ******************************************************************************/
 
@@ -192,11 +221,40 @@ int Init_nlm_hash(void);
 
 /******************************************************************************
  *
+ * NLM State functions
+ *
+ ******************************************************************************/
+
+int display_nlm_state(struct display_buffer *dspbuf, state_t *key);
+int compare_nlm_state(state_t *state1, state_t *state2);
+int Init_nlm_state_hash(void);
+void dec_nlm_state_ref(state_t *state);
+
+int get_nlm_state(enum state_type state_type,
+		  struct fsal_obj_handle *state_obj,
+		  state_owner_t *state_owner,
+		  bool nsm_state_applies,
+		  uint32_t nsm_state,
+		  state_t **pstate);
+
+/******************************************************************************
+ *
  * NFS4 Client ID functions
  *
  ******************************************************************************/
 
 nfsstat4 clientid_error_to_nfsstat(clientid_status_t err);
+
+static inline
+nfsstat4 clientid_error_to_nfsstat_no_expire(clientid_status_t err)
+{
+	nfsstat4 rc = clientid_error_to_nfsstat(err);
+
+	if (rc == NFS4ERR_EXPIRED)
+		rc = NFS4ERR_STALE_CLIENTID;
+
+	return rc;
+}
 
 const char *clientid_error_to_str(clientid_status_t err);
 
@@ -220,6 +278,8 @@ int remove_unconfirmed_client_id(nfs_client_id_t *clientid);
 
 clientid_status_t nfs_client_id_confirm(nfs_client_id_t *clientid,
 					log_components_t component);
+
+bool clientid_has_state(nfs_client_id_t *clientid);
 
 bool nfs_client_id_expire(nfs_client_id_t *clientid, bool make_stale);
 
@@ -321,7 +381,7 @@ void nfs41_Session_PrintAll(void);
  *
  ******************************************************************************/
 
-#define DISPLAY_STATEID_OTHER_SIZE (DISPLAY_CLIENTID_SIZE + 48)
+#define DISPLAY_STATEID_OTHER_SIZE (DISPLAY_CLIENTID_SIZE + 72)
 
 int display_stateid_other(struct display_buffer *dspbuf, char *other);
 int display_stateid(struct display_buffer *dspbuf, state_t *state);
@@ -352,7 +412,7 @@ void nfs4_BuildStateId_Other(nfs_client_id_t *clientid, char *other);
 #define STATEID_SPECIAL_FOR_CLOSE_41 (STATEID_SPECIAL_CLOSE_41 | \
 				      STATEID_SPECIAL_CURRENT)
 
-nfsstat4 nfs4_Check_Stateid(stateid4 *stateid, cache_entry_t *entry,
+nfsstat4 nfs4_Check_Stateid(stateid4 *stateid, struct fsal_obj_handle *fsal_obj,
 			    state_t **state, compound_data_t *data, int flags,
 			    seqid4 owner_seqid, bool check_seqid,
 			    const char *tag);
@@ -361,12 +421,42 @@ void update_stateid(state_t *state, stateid4 *stateid, compound_data_t *data,
 		    const char *tag);
 
 int nfs4_Init_state_id(void);
-void inc_state_t_ref(struct state_t *state);
-void dec_state_t_ref(struct state_t *state);
+
+/**
+ * @brief Take a reference on state_t
+ *
+ * @param[in] state The state_t to ref
+ */
+static inline void inc_state_t_ref(struct state_t *state)
+{
+	(void) atomic_inc_int32_t(&state->state_refcount);
+}
+
+void dec_nfs4_state_ref(struct state_t *state);
+
+/**
+ * @brief Relinquish a reference on any State
+ *
+ * @param[in] state The NLM State to release
+ */
+static inline void dec_state_t_ref(struct state_t *state)
+{
+#ifdef _USE_NLM
+	if (state->state_type == STATE_TYPE_NLM_LOCK ||
+	    state->state_type == STATE_TYPE_NLM_SHARE)
+		dec_nlm_state_ref(state);
+	else
+#endif /* _USE_NLM */
+		dec_nfs4_state_ref(state);
+}
+
 int nfs4_State_Set(state_t *state_data);
 struct state_t *nfs4_State_Get_Pointer(char *other);
-bool nfs4_State_Del(char *other);
+bool nfs4_State_Del(state_t *state);
 void nfs_State_PrintAll(void);
+
+struct state_t *nfs4_State_Get_Obj(struct fsal_obj_handle *obj,
+				     state_owner_t *owner);
 
 int display_state_id_val(struct gsh_buffdesc *buff, char *str);
 int display_state_id_key(struct gsh_buffdesc *buff, char *str);
@@ -393,6 +483,7 @@ bool valid_lease(nfs_client_id_t *clientid);
  *
  ******************************************************************************/
 
+void uncache_nfs4_owner(struct state_nfs4_owner_t *nfs4_owner);
 void free_nfs4_owner(state_owner_t *owner);
 int display_nfs4_owner(struct display_buffer *dspbuf, state_owner_t *owner);
 int display_nfs4_owner_val(struct gsh_buffdesc *buff, char *str);
@@ -457,12 +548,44 @@ void Release_nfs4_denied(LOCK4denied *denied);
 void Copy_nfs4_denied(LOCK4denied *denied_dst, LOCK4denied *denied_src);
 
 void Copy_nfs4_state_req(state_owner_t *owner, seqid4 seqid, nfs_argop4 *args,
-			 cache_entry_t *entry, nfs_resop4 *resp,
+			 struct fsal_obj_handle *obj, nfs_resop4 *resp,
 			 const char *tag);
 
 bool Check_nfs4_seqid(state_owner_t *owner, seqid4 seqid, nfs_argop4 *args,
-		      cache_entry_t *entry, nfs_resop4 *resp,
+		      struct fsal_obj_handle *obj, nfs_resop4 *resp,
 		      const char *tag);
+
+/**
+ * @brief Determine if an NFS v4 owner has state associated with it
+ *
+ * Note that this function is racy and is only suitable for calling
+ * from places that should not have other activity pending against
+ * the owner. Currently it is only called from setclientid which should
+ * be fine.
+ *
+ * @param[in] owner The owner of interest
+ *
+ * @retval true if the owner has state
+ */
+static inline bool owner_has_state(state_owner_t *owner)
+{
+	bool live_state;
+	struct state_nfs4_owner_t *nfs4_owner = &owner->so_owner.so_nfs4_owner;
+
+	/* If the owner is on the cached owners list, there can't be
+	 * active state.
+	 */
+	if (atomic_fetch_time_t(&nfs4_owner->cache_expire) != 0)
+		return false;
+
+	PTHREAD_MUTEX_lock(&owner->so_mutex);
+
+	live_state = !glist_empty(&nfs4_owner->so_state_list);
+
+	PTHREAD_MUTEX_unlock(&owner->so_mutex);
+
+	return live_state;
+}
 
 /******************************************************************************
  *
@@ -492,20 +615,20 @@ state_status_t state_lock_init(void);
 void log_lock(log_components_t component,
 	      log_levels_t debug,
 	      const char *reason,
-	      cache_entry_t *entry,
+	      struct fsal_obj_handle *obj,
 	      state_owner_t *owner,
 	      fsal_lock_param_t *lock,
 	      char *file,
 	      int line,
 	      char *function);
 
-#define LogLock(component, debug, reason, entry, owner, lock) \
-	log_lock(component, debug, reason, entry, owner, lock, \
+#define LogLock(component, debug, reason, obj, owner, lock) \
+	log_lock(component, debug, reason, obj, owner, lock, \
 		 (char *) __FILE__, __LINE__, (char *) __func__)
 
 void dump_all_locks(const char *label);
 
-state_status_t state_add_grant_cookie(cache_entry_t *entry,
+state_status_t state_add_grant_cookie(struct fsal_obj_handle *obj,
 				      void *cookie, int cookie_size,
 				      state_lock_entry_t *lock_entry,
 				      state_cookie_entry_t **cookie_entry);
@@ -518,7 +641,8 @@ void state_complete_grant(state_cookie_entry_t *cookie_entry);
 state_status_t state_cancel_grant(state_cookie_entry_t *cookie_entry);
 
 state_status_t state_release_grant(state_cookie_entry_t *cookie_entry);
-state_status_t state_test(cache_entry_t *entry,
+state_status_t state_test(struct fsal_obj_handle *obj,
+			  state_t *state,
 			  state_owner_t *owner,
 			  fsal_lock_param_t *lock,
 			  /* owner that holds conflicting lock */
@@ -526,7 +650,7 @@ state_status_t state_test(cache_entry_t *entry,
 			  /* description of conflicting lock */
 			  fsal_lock_param_t *conflict);
 
-state_status_t state_lock(cache_entry_t *entry,
+state_status_t state_lock(struct fsal_obj_handle *obj,
 			  state_owner_t *owner,
 			  state_t *state, state_blocking_t blocking,
 			  state_block_data_t *block_data,
@@ -535,32 +659,36 @@ state_status_t state_lock(cache_entry_t *entry,
 			  state_owner_t **holder,
 			  /* description of conflicting lock */
 			  fsal_lock_param_t *conflict);
-state_status_t do_lock_op(cache_entry_t *entry,
-			  fsal_lock_op_t lock_op,
-			  state_owner_t *owner,
-			  fsal_lock_param_t *lock,
-			  state_owner_t **holder,
-			  fsal_lock_param_t *conflict,
-			  bool_t overlap,
-			  enum fsal_sle_type sle_type);
-state_status_t state_unlock(cache_entry_t *entry,
-			    state_owner_t *owner, state_t *state,
+
+state_status_t state_unlock(struct fsal_obj_handle *obj,
+			    state_t *state,
+			    state_owner_t *owner,
+			    bool state_applies,
+			    int32_t nsm_state,
 			    fsal_lock_param_t *lock);
 
-state_status_t state_cancel(cache_entry_t *entry,
+state_status_t state_cancel(struct fsal_obj_handle *obj,
 			    state_owner_t *owner, fsal_lock_param_t *lock);
 
 state_status_t state_nlm_notify(state_nsm_client_t *nsmclient,
-				bool from_client,
-				state_t *state);
+				bool state_applies,
+				int32_t state);
 
 void state_nfs4_owner_unlock_all(state_owner_t *owner);
 
 void state_export_unlock_all(void);
 
-void state_lock_wipe(cache_entry_t *entry);
+bool state_lock_wipe(struct state_hdl *hstate);
 
-void cancel_all_nlm_blocked();
+void cancel_all_nlm_blocked(void);
+
+static inline void *convert_lock_owner(struct fsal_export *fsal_export,
+				       state_owner_t *owner)
+{
+	return fsal_export->exp_ops.fs_supports(fsal_export,
+						fso_lock_support_owner)
+			? owner : NULL;
+}
 
 /******************************************************************************
  *
@@ -568,12 +696,14 @@ void cancel_all_nlm_blocked();
  *
  ******************************************************************************/
 
-state_status_t state_add_impl(cache_entry_t *entry, enum state_type state_type,
+state_status_t state_add_impl(struct fsal_obj_handle *obj,
+			      enum state_type state_type,
 			      union state_data *state_data,
 			      state_owner_t *owner_input, state_t **state,
 			      struct state_refer *refer);
 
-state_status_t state_add(cache_entry_t *entry, enum state_type state_type,
+state_status_t state_add(struct fsal_obj_handle *obj,
+			 enum state_type state_type,
 			 union state_data *state_data,
 			 state_owner_t *owner_input,
 			 state_t **state, struct state_refer *refer);
@@ -584,20 +714,33 @@ void state_del_locked(state_t *state);
 
 void state_del(state_t *state);
 
-static inline cache_entry_t *get_state_entry_ref(state_t *state)
+static inline struct fsal_obj_handle *get_state_obj_ref(state_t *state)
 {
-	cache_entry_t *entry = NULL;
+	struct fsal_obj_handle *obj = NULL;
+	fsal_status_t fsal_status;
+	struct gsh_buffdesc fh_desc;
+	struct gsh_export *save_exp = op_ctx->ctx_export;
+	struct fsal_export *save_fsal = op_ctx->fsal_export;
 
-	PTHREAD_MUTEX_lock(&state->state_mutex);
+	if (state->state_export == NULL)
+		return NULL;
 
-	if (state->state_entry != NULL &&
-	    cache_inode_lru_ref(state->state_entry,
-				LRU_FLAG_NONE) == CACHE_INODE_SUCCESS)
-		entry = state->state_entry;
+	/* Need to look up in the correct export */
+	op_ctx->ctx_export = state->state_export;
+	op_ctx->fsal_export = state->state_export->fsal_export;
 
-	PTHREAD_MUTEX_unlock(&state->state_mutex);
+	fh_desc.addr = state->state_obj.digest;
+	fh_desc.len = state->state_obj.len;
+	fsal_status =
+	  state->state_export->fsal_export->exp_ops.create_handle(
+		state->state_export->fsal_export, &fh_desc, &obj, NULL);
 
-	return entry;
+	op_ctx->ctx_export = save_exp;
+	op_ctx->fsal_export = save_fsal;
+
+	if (FSAL_IS_ERROR(fsal_status))
+		return NULL;
+	return obj;
 }
 
 static inline struct gsh_export *get_state_export_ref(state_t *state)
@@ -691,12 +834,12 @@ static inline bool state_same_owner(state_t *state, state_owner_t *owner)
 	return same;
 }
 
-bool get_state_entry_export_owner_refs(state_t *state,
-				       cache_entry_t **entry,
+bool get_state_obj_export_owner_refs(state_t *state,
+				     struct fsal_obj_handle **obj,
 				       struct gsh_export **export,
 				       state_owner_t **owner);
 
-void state_nfs4_state_wipe(cache_entry_t *entry);
+void state_nfs4_state_wipe(struct state_hdl *ostate);
 
 enum nfsstat4 release_lock_owner(state_owner_t *owner);
 void release_openstate(state_owner_t *owner);
@@ -713,34 +856,34 @@ void dump_all_states(void);
  *
  ******************************************************************************/
 
-state_status_t acquire_lease_lock(cache_entry_t *entry,
+state_status_t acquire_lease_lock(struct state_hdl *ostate,
 				  state_owner_t *owner,
 				  state_t *state);
-state_status_t release_lease_lock(cache_entry_t *entry, state_t *state);
+state_status_t release_lease_lock(struct fsal_obj_handle *obj, state_t *state);
 
-bool init_deleg_heuristics(cache_entry_t *entry);
-bool deleg_supported(cache_entry_t *entry, struct fsal_export *fsal_export,
+bool init_deleg_heuristics(struct fsal_obj_handle *obj);
+bool deleg_supported(struct fsal_obj_handle *obj,
+		     struct fsal_export *fsal_export,
 		     struct export_perms *export_perms, uint32_t share_access);
-bool can_we_grant_deleg(cache_entry_t *entry, state_t *open_state);
-bool should_we_grant_deleg(cache_entry_t *entry, nfs_client_id_t *client,
+bool can_we_grant_deleg(struct state_hdl *ostate, state_t *open_state);
+bool should_we_grant_deleg(struct state_hdl *ostate, nfs_client_id_t *client,
 			   state_t *open_state, OPEN4args *args,
 			   state_owner_t *owner, bool *prerecall);
 void init_new_deleg_state(union state_data *deleg_state,
 			  open_delegation_type4 sd_type,
 			  nfs_client_id_t *clientid);
 
-void deleg_heuristics_recall(cache_entry_t *entry,
+void deleg_heuristics_recall(struct fsal_obj_handle *obj,
 			     state_owner_t *owner,
 			     struct state_t *deleg);
-void get_deleg_perm(cache_entry_t *entry, nfsace4 *permissions,
-		    open_delegation_type4 type);
-void update_delegation_stats(cache_entry_t *entry,
+void get_deleg_perm(nfsace4 *permissions, open_delegation_type4 type);
+void update_delegation_stats(struct state_hdl *ostate,
 			     state_owner_t *owner,
 			     struct state_t *deleg);
-state_status_t delegrecall_impl(cache_entry_t *entry);
-state_status_t deleg_revoke(cache_entry_t *entry, struct state_t *deleg_state);
-void state_deleg_revoke(cache_entry_t *entry, state_t *state);
-bool state_deleg_conflict(cache_entry_t *entry, bool write);
+state_status_t delegrecall_impl(struct fsal_obj_handle *obj);
+nfsstat4 deleg_revoke(struct fsal_obj_handle *obj, struct state_t *deleg_state);
+void state_deleg_revoke(struct fsal_obj_handle *obj, state_t *state);
+bool state_deleg_conflict(struct fsal_obj_handle *obj, bool write);
 
 /******************************************************************************
  *
@@ -752,7 +895,7 @@ state_status_t state_add_segment(state_t *state, struct pnfs_segment *segment,
 				 void *fsal_data, bool return_on_close);
 
 state_status_t state_delete_segment(state_layout_segment_t *segment);
-state_status_t state_lookup_layout_state(cache_entry_t *entry,
+state_status_t state_lookup_layout_state(struct fsal_obj_handle *obj,
 					 state_owner_t *owner,
 					 layouttype4 type, state_t **state);
 void revoke_owner_layouts(state_owner_t *client_owner);
@@ -766,25 +909,25 @@ void revoke_owner_layouts(state_owner_t *client_owner);
 
 #define OPEN4_SHARE_ACCESS_NONE 0
 
-state_status_t state_share_add(cache_entry_t *entry,
+state_status_t state_share_add(struct fsal_obj_handle *obj,
 			       state_owner_t *owner,
 			       /* state that holds share bits to be added */
 			       state_t *state, bool reclaim);
 
-state_status_t state_share_remove(cache_entry_t *entry,
+state_status_t state_share_remove(struct fsal_obj_handle *obj,
 				  state_owner_t *owner,
 				  /* state that holds share bits to be removed
 				   */
 				  state_t *state);
 
-state_status_t state_share_upgrade(cache_entry_t *entry,
+state_status_t state_share_upgrade(struct fsal_obj_handle *obj,
 				   /* new share bits */
 				   union state_data *state_data,
 				   state_owner_t *owner,
 				   /* state that holds current share bits */
 				   state_t *state, bool reclaim);
 
-state_status_t state_share_downgrade(cache_entry_t *entry,
+state_status_t state_share_downgrade(struct fsal_obj_handle *obj,
 				     /* new share bits */
 				     union state_data *state_data,
 				     state_owner_t *owner,
@@ -794,36 +937,40 @@ state_status_t state_share_downgrade(cache_entry_t *entry,
 state_status_t state_share_set_prev(state_t *state,
 				    union state_data *state_data);
 
-state_status_t state_share_check_prev(state_t *state,
-				      union state_data *state_data);
-
 enum share_bypass_modes {
 	SHARE_BYPASS_NONE,
 	SHARE_BYPASS_READ,
 	SHARE_BYPASS_V3_WRITE
 };
 
-state_status_t state_share_check_conflict(cache_entry_t *entry,
+state_status_t state_share_check_conflict(struct state_hdl *ostate,
 					  int share_acccess,
 					  int share_deny,
 					  enum share_bypass_modes bypass);
-bool state_open_deleg_conflict(cache_entry_t *entry, const state_t *open_state);
+bool state_open_deleg_conflict(struct state_hdl *ostate,
+			       const state_t *open_state);
 
-state_status_t state_share_anonymous_io_start(cache_entry_t *entry,
+state_status_t state_share_anonymous_io_start(struct fsal_obj_handle *obj,
 					      int share_access,
 					      enum share_bypass_modes bypass);
 
-void state_share_anonymous_io_done(cache_entry_t *entry, int share_access);
+void state_share_anonymous_io_done(struct fsal_obj_handle *obj,
+				   int share_access);
 
-state_status_t state_nlm_share(cache_entry_t *,
-			       int, int, state_owner_t *, bool);
+state_status_t state_nlm_share(struct fsal_obj_handle *obj,
+			       int share_access,
+			       int share_deny,
+			       state_owner_t *owner,
+			       state_t *state,
+			       bool reclaim);
 
-state_status_t state_nlm_unshare(cache_entry_t *entry,
+state_status_t state_nlm_unshare(struct fsal_obj_handle *obj,
 				 int share_access,
 				 int share_deny,
-				 state_owner_t *owner);
+				 state_owner_t *owner,
+				 state_t *state);
 
-void state_share_wipe(cache_entry_t *entry);
+void state_share_wipe(struct state_hdl *ostate);
 void state_export_unshare_all(void);
 
 /******************************************************************************
@@ -844,13 +991,15 @@ void signal_async_work(void);
 state_status_t state_async_init(void);
 state_status_t state_async_shutdown(void);
 
-void grant_blocked_lock_upcall(cache_entry_t *entry, void *owner,
+void grant_blocked_lock_upcall(struct fsal_obj_handle *obj, void *owner,
 			       fsal_lock_param_t *lock);
 
-void available_blocked_lock_upcall(cache_entry_t *entry, void *owner,
+void available_blocked_lock_upcall(struct fsal_obj_handle *obj, void *owner,
 				   fsal_lock_param_t *lock);
 
 void process_blocked_lock_upcall(state_block_data_t *block_data);
+
+void blocked_lock_polling(struct fridgethr_context *ctx);
 
 /******************************************************************************
  *

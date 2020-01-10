@@ -40,14 +40,11 @@
 #include "nfs_core.h"
 #include "export_mgr.h"
 #include "log.h"
-#include "cache_inode.h"
-#include "cache_inode_lru.h"
 #include "fsal.h"
 #include "nfs_exports.h"
 #include "9p.h"
 
-int _9p_attach(struct _9p_request_data *req9p, void *worker_data,
-	       u32 *plenout, char *preply)
+int _9p_attach(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 {
 	char *cursor = req9p->_9pmsg + _9P_HDR_SIZE + _9P_TYPE_SIZE;
 	u16 *msgtag = NULL;
@@ -58,18 +55,13 @@ int _9p_attach(struct _9p_request_data *req9p, void *worker_data,
 	u16 *aname_len = NULL;
 	char *aname_str = NULL;
 	u32 *n_uname = NULL;
-
-	uint64_t fileid;
-
 	u32 err = 0;
 
 	struct _9p_fid *pfid = NULL;
 
-	struct gsh_export *export = NULL;
-	cache_inode_status_t cache_status;
 	fsal_status_t fsal_status;
 	char exppath[MAXPATHLEN];
-	cache_inode_fsal_data_t fsal_data;
+	struct gsh_buffdesc fh_desc;
 	struct fsal_obj_handle *pfsal_handle;
 	int port;
 
@@ -93,22 +85,44 @@ int _9p_attach(struct _9p_request_data *req9p, void *worker_data,
 
 	/*
 	 * Find the export for the aname (using as well Path or Tag)
+	 *
+	 * Keep it in the op_ctx.
 	 */
 	snprintf(exppath, MAXPATHLEN, "%.*s", (int)*aname_len, aname_str);
 
 	if (exppath[0] == '/')
-		export = get_gsh_export_by_path(exppath, false);
+		op_ctx->ctx_export = get_gsh_export_by_path(exppath, false);
 	else
-		export = get_gsh_export_by_tag(exppath);
+		op_ctx->ctx_export = get_gsh_export_by_tag(exppath);
 
 	/* Did we find something ? */
-	if (export == NULL) {
+	if (op_ctx->ctx_export == NULL) {
 		err = ENOENT;
 		goto errout;
 	}
 
+	/* Fill in more of the op_ctx */
+	op_ctx->fsal_export = op_ctx->ctx_export->fsal_export;
+	op_ctx->caller_addr = &req9p->pconn->addrpeer;
+
+	/* We store the export_perms in pconn so we only have to evaluate
+	 * them once.
+	 */
+	op_ctx->export_perms = &req9p->pconn->export_perms;
+
+	/* And fill in the op_ctx export_perms and then check them. */
+	export_check_access();
+
+	if ((op_ctx->export_perms->options & EXPORT_OPTION_9P) == 0) {
+		LogInfo(COMPONENT_9P,
+			"9P is not allowed for this export entry, rejecting client");
+		err = EACCES;
+		goto errout;
+	}
+
 	port = get_port(&req9p->pconn->addrpeer);
-	if (export->export_perms.options & EXPORT_OPTION_PRIVILEGED_PORT &&
+
+	if (op_ctx->export_perms->options & EXPORT_OPTION_PRIVILEGED_PORT &&
 	    port >= IPPORT_RESERVED) {
 		LogInfo(COMPONENT_9P,
 			"Port %d is too high for this export entry, rejecting client",
@@ -119,10 +133,10 @@ int _9p_attach(struct _9p_request_data *req9p, void *worker_data,
 
 	/* Set export and fid id in fid */
 	pfid = gsh_calloc(1, sizeof(struct _9p_fid));
-	if (pfid == NULL) {
-		err = ENOMEM;
-		goto errout;
-	}
+
+	/* Copy the export into the pfid with reference. */
+	pfid->export = op_ctx->ctx_export;
+	get_gsh_export_ref(pfid->export);
 
 	pfid->fid = *fid;
 	req9p->pconn->fids[*fid] = pfid;
@@ -149,61 +163,57 @@ int _9p_attach(struct _9p_request_data *req9p, void *worker_data,
 		goto errout;
 	}
 
-	/* Keep track of the export in the req_ctx */
-	pfid->op_context.export = export;
-	pfid->op_context.fsal_export = export->fsal_export;
-	pfid->op_context.caller_addr = &req9p->pconn->addrpeer;
-	pfid->op_context.export_perms = &req9p->pconn->export_perms;
-
-	op_ctx =  &pfid->op_context;
-	export_check_access();
-
 	if (exppath[0] != '/' ||
-	    !strcmp(exppath, export->fullpath)) {
-		/* Check if root cache entry is correctly set, fetch it, and
-		 * take an LRU reference.
+	    !strcmp(exppath, op_ctx->ctx_export->fullpath)) {
+		/* Check if root object is correctly set, fetch it, and take an
+		 * LRU reference.
 		 */
-		cache_status = nfs_export_get_root_entry(export, &pfid->pentry);
-		if (cache_status != CACHE_INODE_SUCCESS) {
-			err = _9p_tools_errno(cache_status);
+		fsal_status =
+		    nfs_export_get_root_entry(op_ctx->ctx_export,
+					    &pfid->pentry);
+
+		if (FSAL_IS_ERROR(fsal_status)) {
+			err = _9p_tools_errno(fsal_status);
 			goto errout;
 		}
 	} else {
 		fsal_status = op_ctx->fsal_export->exp_ops.lookup_path(
 						op_ctx->fsal_export,
 						exppath,
-						&pfsal_handle);
+						&pfsal_handle, NULL);
 		if (FSAL_IS_ERROR(fsal_status)) {
-			err = _9p_tools_errno(
-				cache_inode_error_convert(fsal_status));
+			err = _9p_tools_errno(fsal_status);
 			goto errout;
 		}
 
 		pfsal_handle->obj_ops.handle_to_key(pfsal_handle,
-						 &fsal_data.fh_desc);
-		fsal_data.export = export->fsal_export;
-
-		cache_status = cache_inode_get(&fsal_data, &pfid->pentry);
-		if (cache_status != CACHE_INODE_SUCCESS) {
-			err = _9p_tools_errno(cache_status);
+						 &fh_desc);
+		fsal_status = op_ctx->fsal_export->exp_ops.create_handle(
+				 op_ctx->fsal_export, &fh_desc, &pfid->pentry,
+				 NULL);
+		if (FSAL_IS_ERROR(fsal_status)) {
+			err = _9p_tools_errno(fsal_status);
 			goto errout;
 		}
 	}
 
-	/* This fid is a special one: it comes from TATTACH */
-	pfid->from_attach = true;
+	/* Initialize state_t embeded in fid. The refcount is initialized
+	 * to one to represent the state_t being embeded in the fid. This
+	 * prevents it from ever being reduced to zero by dec_state_t_ref.
+	 */
+	pfid->state =
+		op_ctx->fsal_export->exp_ops.alloc_state(op_ctx->fsal_export,
+							 STATE_TYPE_9P_FID,
+							 NULL);
 
-	cache_status = cache_inode_fileid(pfid->pentry, &fileid);
-	if (cache_status != CACHE_INODE_SUCCESS) {
-		err = _9p_tools_errno(cache_status);
-		goto errout;
-	}
+	glist_init(&pfid->state->state_data.fid.state_locklist);
+	pfid->state->state_refcount = 1;
 
 	/* Compute the qid */
 	pfid->qid.type = _9P_QTDIR;
 	pfid->qid.version = 0;	/* No cache, we want the client
 				 * to stay synchronous with the server */
-	pfid->qid.path = fileid;
+	pfid->qid.path = pfid->pentry->fileid;
 
 	/* Build the reply */
 	_9p_setinitptr(cursor, preply, _9P_RATTACH);
@@ -223,14 +233,10 @@ int _9p_attach(struct _9p_request_data *req9p, void *worker_data,
 
 errout:
 
-	if (export != NULL)
-		put_gsh_export(export);
+	_9p_release_opctx();
 
-	if (pfid != NULL) {
-		if (pfid->pentry != NULL)
-			cache_inode_put(pfid->pentry);
-		gsh_free(pfid);
-	}
+	if (pfid != NULL)
+		free_fid(pfid);
 
-	return _9p_rerror(req9p, worker_data, msgtag, err, plenout, preply);
+	return _9p_rerror(req9p, msgtag, err, plenout, preply);
 }

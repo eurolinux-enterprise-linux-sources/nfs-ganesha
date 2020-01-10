@@ -28,7 +28,6 @@
 #include "log.h"
 #include "gsh_rpc.h"
 #include "nlm4.h"
-#include "cache_inode.h"
 #include "nlm_util.h"
 #include "nlm_async.h"
 
@@ -38,16 +37,12 @@
  * The NLM proc null function, for all versions.
  *
  * @param[in]  parg     Ignored
- * @param[in]  pexport  Ignored
- * @param[in]  pworker  Ignored
  * @param[in]  preq     Ignored
  * @param[out] pres     Ignored
  *
  */
 
-int nlm_Null(nfs_arg_t *arg,
-	     nfs_worker_data_t *worker,
-	     struct svc_req *req, nfs_res_t *res)
+int nlm_Null(nfs_arg_t *arg, struct svc_req *req, nfs_res_t *res)
 {
 	LogDebug(COMPONENT_NLM, "REQUEST PROCESSING: Calling nlm_Null");
 
@@ -65,5 +60,5 @@ int nlm_Null(nfs_arg_t *arg,
  */
 void nlm_Null_Free(nfs_res_t *res)
 {
-	return;
+	/* Nothing to do */
 }

@@ -35,8 +35,6 @@
 #include "log.h"
 #include "fsal.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
-#include "cache_inode_lru.h"
 #include "nfs_exports.h"
 #include "nfs_proto_functions.h"
 #include "nfs_proto_tools.h"
@@ -80,22 +78,19 @@ int nfs4_op_savefh(struct nfs_argop4 *op, compound_data_t *data,
 		return res_SAVEFH->status;
 
 	/* If the savefh is not allocated, do it now */
-	if (data->savedFH.nfs_fh4_val == NULL) {
-		res_SAVEFH->status = nfs4_AllocateFH(&(data->savedFH));
-		if (res_SAVEFH->status != NFS4_OK)
-			return res_SAVEFH->status;
-	}
+	if (data->savedFH.nfs_fh4_val == NULL)
+		nfs4_AllocateFH(&data->savedFH);
 
 	/* Determine if we can get a new export reference. If there is
-	 * no op_ctx->export, don't get a reference.
+	 * no op_ctx->ctx_export, don't get a reference.
 	 */
-	if (op_ctx->export != NULL) {
-		if (!export_ready(op_ctx->export)) {
+	if (op_ctx->ctx_export != NULL) {
+		if (!export_ready(op_ctx->ctx_export)) {
 			/* The CurrentFH export has gone bad. */
 			res_SAVEFH->status = NFS4ERR_STALE;
 			return res_SAVEFH->status;
 		}
-		get_gsh_export_ref(op_ctx->export);
+		get_gsh_export_ref(op_ctx->ctx_export);
 	}
 
 	/* Copy the data from current FH to saved FH */
@@ -104,6 +99,18 @@ int nfs4_op_savefh(struct nfs_argop4 *op, compound_data_t *data,
 	       data->currentFH.nfs_fh4_len);
 
 	data->savedFH.nfs_fh4_len = data->currentFH.nfs_fh4_len;
+
+	/* If saved and current entry are equal, skip the following. */
+	if (data->saved_obj != data->current_obj) {
+
+		set_saved_entry(data, data->current_obj);
+
+		/* Make SAVEFH work right for DS handle */
+		if (data->current_ds != NULL) {
+			data->saved_ds = data->current_ds;
+			ds_handle_get_ref(data->saved_ds);
+		}
+	}
 
 	/* Save the current stateid */
 	data->saved_stateid = data->current_stateid;
@@ -114,46 +121,17 @@ int nfs4_op_savefh(struct nfs_argop4 *op, compound_data_t *data,
 		put_gsh_export(data->saved_export);
 
 	/* Save the export information (reference already taken above). */
-	data->saved_export = op_ctx->export;
+	data->saved_export = op_ctx->ctx_export;
 	data->saved_export_perms = *op_ctx->export_perms;
-
-	/* If saved and current entry are equal, skip the following. */
-	if (data->saved_entry == data->current_entry)
-		goto out;
-
-	if (data->saved_entry) {
-		cache_inode_put(data->saved_entry);
-		data->saved_entry = NULL;
-	}
-
-	if (data->saved_ds) {
-		ds_handle_put(data->saved_ds);
-		data->saved_ds = NULL;
-	}
-
-	data->saved_entry = data->current_entry;
-	data->saved_filetype = data->current_filetype;
-
-	/* Make SAVEFH work right for DS handle */
-	if (data->current_ds != NULL) {
-		data->saved_ds = data->current_ds;
-		ds_handle_get_ref(data->saved_ds);
-	}
-
-	/* Take another reference.  As of now the filehandle is both saved
-	 * and current and both must be counted.  Guard this, in case we
-	 * have a pseudofs handle.
-	 */
-	if (data->saved_entry)
-		(void) cache_inode_lru_ref(data->saved_entry, LRU_REQ_STALE_OK);
-
- out:
 
 	if (isFullDebug(COMPONENT_NFS_V4)) {
 		char str[LEN_FH_STR];
+
 		sprint_fhandle4(str, &data->savedFH);
 		LogFullDebug(COMPONENT_NFS_V4, "SAVE FH: Saved FH %s", str);
 	}
+
+	res_SAVEFH->status = NFS4_OK;
 
 	return NFS4_OK;
 }				/* nfs4_op_savefh */
@@ -169,5 +147,4 @@ int nfs4_op_savefh(struct nfs_argop4 *op, compound_data_t *data,
 void nfs4_op_savefh_Free(nfs_resop4 *resp)
 {
 	/* Nothing to be done */
-	return;
-}				/* nfs4_op_savefh_Free */
+}

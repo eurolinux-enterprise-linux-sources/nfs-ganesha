@@ -11,8 +11,13 @@ SET(fsalvfs_LIB_SRCS
    ../file.c
    ../xattrs.c
    ../vfs_methods.h
+   ../state.c
    subfsal_vfs.c
   )
+
+if(ENABLE_VFS_DEBUG_ACL)
+  set(fsalvfs_LIB_SRCS ${fsalvfs_LIB_SRCS} attrs.c)
+endif(ENABLE_VFS_DEBUG_ACL)
 
 add_library(fsalvfs SHARED ${fsalvfs_LIB_SRCS})
 

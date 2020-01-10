@@ -37,7 +37,6 @@
 #include "nfs4.h"
 #include "nfs_core.h"
 #include "sal_functions.h"
-#include "cache_inode.h"
 #include "nfs_proto_functions.h"
 
 /**
@@ -103,12 +102,12 @@ int nfs4_op_release_lockowner(struct nfs_argop4 *op, compound_data_t *data,
 	convert_nfs4_lock_owner(&arg_RELEASE_LOCKOWNER4->lock_owner,
 				&owner_name);
 
-	/* If this open owner is not known yet, allocated
+	/* If this lock owner is not known yet, allocated
 	 * and set up a new one
 	 */
 	lock_owner = create_nfs4_owner(&owner_name,
 				       nfs_client_id,
-				       STATE_OPEN_OWNER_NFSV4,
+				       STATE_LOCK_OWNER_NFSV4,
 				       NULL,
 				       0,
 				       NULL,
@@ -158,5 +157,4 @@ int nfs4_op_release_lockowner(struct nfs_argop4 *op, compound_data_t *data,
 void nfs4_op_release_lockowner_Free(nfs_resop4 *resp)
 {
 	/* Nothing to be done */
-	return;
-}				/* nfs4_op_release_lockowner_Free */
+}

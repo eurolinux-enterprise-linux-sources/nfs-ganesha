@@ -1,11 +1,32 @@
 multilock test tool
 
+Copyright IBM Corporation, 2012
+ Contributor: Frank Filz  <ffilz@us.ibm.com>
+
+
+This software is a server that implements the NFS protocol.
+
+
+This program is free software; you can redistribute it and/or
+modify it under the terms of the GNU Lesser General Public
+License as published by the Free Software Foundation; either
+version 3 of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+Lesser General Public License for more details.
+
+You should have received a copy of the GNU Lesser General Public
+License along with this library; if not, write to the Free Software
+Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+
 OVERVIEW
 --------
 
 Multilock is a test tool for testing functionality of POSIX locks. It is
 directed at testing NFS server and client implementations. The architecture of
-the tool is a console program (ml_console) and client programs (currently 
+the tool is a console program (ml_console) and client programs (currently
 ml_posix_chold). The console directs any number of clients in a sequence of
 lock operations. The communication between the console and clients is a TCP
 connection, so the clients may be run on multiple hosts (for example, multiple
@@ -137,6 +158,7 @@ The commands and specific parameters are:
 [tag] UNHOP   file_pos start length
 [tag] COMMENT "string"
 [tag] HELLO   "name"
+[tag] FORK    "name"
 [tag] ALARM   seconds
 [tag] QUIT
 
@@ -152,6 +174,8 @@ created on open (other open flags may be supported in the future).
 
 The OFD option indicates that Open File Description locks (or equivalent) will
 be used on this file descriptor.
+
+file-name is allowed to be as long as PATH_MAX - 1.
 
 CLOSE
 -----
@@ -170,6 +194,9 @@ If the second form of the command is given, the length of the string is
 used as the read length (this form is to be used with console scripting command
 OK).
 
+At most 1024 characters may be read. Note that the file data is expected to
+be characters and should not have 0 bytes within.
+
 WRITE
 -----
 
@@ -178,6 +205,9 @@ position).
 
 This is fundamentally a record write, though the record contents are expected
 to be ascii strings.
+
+At most 1024 characters may be written. Note that the file data is expected to
+be characters and should not have 0 bytes within.
 
 SEEK
 ----
@@ -189,7 +219,7 @@ LOCK
 ----
 
 Lock requests a non-blocking lock. If the lock can not be granted, the command
-will return immediately with DENIED status. Locks may be read or write locks 
+will return immediately with DENIED status. Locks may be read or write locks
 (aka shared or exclusive).
 
 LOCKW
@@ -221,14 +251,21 @@ COMMENT
 -------
 
 Comment is a do nothing command. It allows the console to send some commentary to
-the clients.
+the clients. A comment is at most 1024 bytes.
 
 HELLO
 -----
 
-This is another do nothing command. It's real purpose is a response place holder 
+This is another do nothing command. It's real purpose is a response place holder
 for the console to be able to receive initial "HELLO" communications from the
-clients.
+clients. The name is expected to be no more than 1024 characters.
+
+FORK
+-----
+
+Causes the client to fork, open a new socket back to the console and send a
+HELLO response on that socket with the forked name. The name may not be longer
+than 1024 characters.
 
 ALARM
 -----
@@ -300,7 +337,7 @@ OPEN
 ----
 
 Returns OK or ERRNO. A successful OPEN will respond with the file number that
-results from opening the file. This should not be relied on to be any specific 
+results from opening the file. This should not be relied on to be any specific
 value and is merely provided for edification.
 
 CLOSE
@@ -437,6 +474,7 @@ AVAILABLE name command parameters
 DENIED    name command parameters
 DEADLOCK  name command parameters
 CLIENTS   name name...
+FORK      name1 name2
 {
 }
 
@@ -504,7 +542,7 @@ WRITE, COMMENT, ALARM, HELLO, and QUIT. READ must specify the expected string,
 and the length of that string is sent to the client as the expected length. OPEN
 accepts any file_number.
 
-GRANTED is only valid with LOCK, and UNLOCK. 
+GRANTED is only valid with LOCK, and UNLOCK.
 
 AVAILABLE is only valid for TEST and LIST. For LIST, an empty list is expected.
 
@@ -513,10 +551,19 @@ DENIED is only valid with LOCK.
 DEADLOCK is only valus with LOCKW.
 
 CLIENTS
---------
+-------
 
 This command creates a list of EXPECT {name} * HELLO OK {name} for each client
 named on the command.
+
+FORK
+----
+
+This command sents a FORK message to client name1 with name2 as the parameter.
+It then creates a list:
+
+	EXPECT {name1} * FORK OK {name2}
+	EXPECT {name2} * HELLO OK {name2}
 
 { and }
 -------

@@ -1,0 +1,66 @@
+From 12b8eded67e5ac723a8c431a93b72eeff4c8fbb5 Mon Sep 17 00:00:00 2001
+From: Soumya Koduri <skoduri@redhat.com>
+Date: Tue, 17 Jan 2017 11:53:35 +0530
+Subject: [PATCH 1/2] FSAL_GLUSTER: Avoid double free of handle in case of
+ setattr failures
+
+Post any object creation, in case if setting attributes fail, we
+seem to be freeing glusterfs handle twice. Fixed the same.
+
+Change-Id: I917f1295a8f29612ccde8081c447135d6abb475c
+Signed-off-by: Soumya Koduri <skoduri@redhat.com>
+---
+ src/FSAL/FSAL_GLUSTER/handle.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/src/FSAL/FSAL_GLUSTER/handle.c b/src/FSAL/FSAL_GLUSTER/handle.c
+index c37e3de..cb266a8 100644
+--- a/src/FSAL/FSAL_GLUSTER/handle.c
++++ b/src/FSAL/FSAL_GLUSTER/handle.c
+@@ -74,6 +74,7 @@ static void handle_release(struct fsal_obj_handle *obj_hdl)
+ 				"glfs_h_close returned error %s(%d)",
+ 				strerror(errno), errno);
+ 		}
++		objhandle->glhandle = NULL;
+ 	}
+ 
+ 	gsh_free(objhandle);
+@@ -402,6 +403,8 @@ static fsal_status_t makedir(struct fsal_obj_handle *dir_hdl,
+ 				     "setattr2 status=%s",
+ 				     fsal_err_txt(status));
+ 			(*handle)->obj_ops.release(*handle);
++			/* We released handle at this point */
++			glhandle = NULL;
+ 			*handle = NULL;
+ 		}
+ 	} else {
+@@ -535,6 +538,8 @@ static fsal_status_t makenode(struct fsal_obj_handle *dir_hdl,
+ 				     "setattr2 status=%s",
+ 				     fsal_err_txt(status));
+ 			(*handle)->obj_ops.release(*handle);
++			/* We released handle at this point */
++			glhandle = NULL;
+ 			*handle = NULL;
+ 		}
+ 	} else {
+@@ -640,6 +645,8 @@ static fsal_status_t makesymlink(struct fsal_obj_handle *dir_hdl,
+ 				     "setattr2 status=%s",
+ 				     fsal_err_txt(status));
+ 			(*handle)->obj_ops.release(*handle);
++			/* We released handle at this point */
++			glhandle = NULL;
+ 			*handle = NULL;
+ 		}
+ 	} else {
+@@ -1608,6 +1615,8 @@ open:
+ 		if (FSAL_IS_ERROR(status)) {
+ 			/* Release the handle we just allocated. */
+ 			(*new_obj)->obj_ops.release(*new_obj);
++			/* We released handle at this point */
++			glhandle = NULL;
+ 			*new_obj = NULL;
+ 			goto fileerr;
+ 		}
+-- 
+2.5.0
+

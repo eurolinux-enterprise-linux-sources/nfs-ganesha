@@ -47,7 +47,6 @@
 #include "config_parsing.h"
 #include "export_mgr.h"
 #include "fsal_types.h"
-#include "cache_inode.h"
 #include "log.h"
 
 /*
@@ -76,6 +75,9 @@ typedef enum exportlist_client_type__ {
 struct global_export_perms {
 	struct export_perms def;
 	struct export_perms conf;
+	/** Expiration time interval in seconds for attributes.  Settable with
+	    Attr_Expiration_Time. */
+	int32_t  expire_time_attr;
 };
 
 #define GSS_DEFINE_LEN_TEMP 255
@@ -114,43 +116,48 @@ typedef struct exportlist_client_entry__ {
 #define EXPORT_OPTION_TRUST_READIR_NEGATIVE_CACHE 0x00000008
 
 /* Constants for export permissions masks */
-#define EXPORT_OPTION_ROOT 0x00000001	/*< Allow root access as root uid */
-#define EXPORT_OPTION_ROOT_SQUASH 0	/*< Disallow root access as root uid */
-#define EXPORT_OPTION_ALL_ANONYMOUS 0x00000002	/*< all users are squashed to
+#define EXPORT_OPTION_ROOT 0	/*< Allow root access as root uid */
+#define EXPORT_OPTION_ROOT_ID_SQUASH 0x00000001	/*< Disallow root access as
+						    root uid but preserve
+						    alt_groups */
+#define EXPORT_OPTION_ROOT_SQUASH 0x00000002	/*< Disallow root access as root
+						    uid */
+#define EXPORT_OPTION_ALL_ANONYMOUS 0x00000004	/*< all users are squashed to
 						    anonymous */
-#define EXPORT_OPTION_SQUASH_TYPES (EXPORT_OPTION_ROOT | \
+#define EXPORT_OPTION_SQUASH_TYPES (EXPORT_OPTION_ROOT_SQUASH | \
+				    EXPORT_OPTION_ROOT_ID_SQUASH | \
 				    EXPORT_OPTION_ALL_ANONYMOUS) /*< All squash
 								   types */
-#define EXPORT_OPTION_ANON_UID_SET 0x00000004	/*< Indicates Anon_uid was set
+#define EXPORT_OPTION_ANON_UID_SET 0x00000008	/*< Indicates Anon_uid was set
 						 */
-#define EXPORT_OPTION_ANON_GID_SET 0x00000008	/*< Indicates Anon_gid was set
+#define EXPORT_OPTION_ANON_GID_SET 0x00000010	/*< Indicates Anon_gid was set
 						 */
-#define EXPORT_OPTION_READ_ACCESS 0x00000010	/*< R_Access= option specified
+#define EXPORT_OPTION_READ_ACCESS 0x00000020	/*< R_Access= option specified
 						 */
-#define EXPORT_OPTION_WRITE_ACCESS 0x00000020	/*< RW_Access= option specified
+#define EXPORT_OPTION_WRITE_ACCESS 0x00000040	/*< RW_Access= option specified
 						 */
 #define EXPORT_OPTION_RW_ACCESS       (EXPORT_OPTION_READ_ACCESS     | \
 				       EXPORT_OPTION_WRITE_ACCESS)
-#define EXPORT_OPTION_MD_READ_ACCESS 0x00000040	/*< MDONLY_RO_Access= option
+#define EXPORT_OPTION_MD_READ_ACCESS 0x00000080	/*< MDONLY_RO_Access= option
 						    specified */
-#define EXPORT_OPTION_MD_WRITE_ACCESS 0x00000080 /*< MDONLY_Access= option
+#define EXPORT_OPTION_MD_WRITE_ACCESS 0x00000100 /*< MDONLY_Access= option
 						     specified */
 #define EXPORT_OPTION_MD_ACCESS       (EXPORT_OPTION_MD_WRITE_ACCESS | \
 				       EXPORT_OPTION_MD_READ_ACCESS)
 #define EXPORT_OPTION_MODIFY_ACCESS   (EXPORT_OPTION_WRITE_ACCESS | \
 				       EXPORT_OPTION_MD_WRITE_ACCESS)
-#define EXPORT_OPTION_ACCESS_TYPE     (EXPORT_OPTION_READ_ACCESS     | \
+#define EXPORT_OPTION_ACCESS_MASK     (EXPORT_OPTION_READ_ACCESS     | \
 				       EXPORT_OPTION_WRITE_ACCESS    | \
 				       EXPORT_OPTION_MD_WRITE_ACCESS | \
 				       EXPORT_OPTION_MD_READ_ACCESS)
 
 #define EXPORT_OPTION_NO_ACCESS 0	/*< Access_Type = None */
 
-#define EXPORT_OPTION_PRIVILEGED_PORT 0x00000100	/*< Clients use only
+#define EXPORT_OPTION_PRIVILEGED_PORT 0x00000200	/*< Clients use only
 							   privileged port */
 
-#define EXPORT_OPTION_COMMIT 0x00000200		/*< NFS Commit writes */
-#define EXPORT_OPTION_DISABLE_ACL   0x00000400	/*< ACL is disabled */
+#define EXPORT_OPTION_COMMIT 0x00000400		/*< NFS Commit writes */
+#define EXPORT_OPTION_DISABLE_ACL   0x00000800	/*< ACL is disabled */
 
 /* @todo BUGAZOMEU : Mettre au carre les flags des flavors */
 
@@ -171,6 +178,8 @@ typedef struct exportlist_client_entry__ {
 				       EXPORT_OPTION_RPCSEC_GSS_NONE | \
 				       EXPORT_OPTION_RPCSEC_GSS_INTG | \
 				       EXPORT_OPTION_RPCSEC_GSS_PRIV)
+#define EXPORT_OPTION_AUTH_DEFAULTS   (EXPORT_OPTION_AUTH_NONE	     | \
+				       EXPORT_OPTION_AUTH_UNIX)
 
 /* Protocol flags */
 #define EXPORT_OPTION_NFSV3 0x00100000	/*< NFSv3 operations are supported */
@@ -182,9 +191,13 @@ typedef struct exportlist_client_entry__ {
 #define EXPORT_OPTION_PROTOCOLS	      (EXPORT_OPTION_NFSV3	     | \
 				       EXPORT_OPTION_NFSV4	     | \
 				       EXPORT_OPTION_9P)
+#define EXPORT_OPTION_PROTO_DEFAULTS  (EXPORT_OPTION_NFSV3	     | \
+				       EXPORT_OPTION_NFSV4)
 #define EXPORT_OPTION_TRANSPORTS      (EXPORT_OPTION_UDP	     | \
 				       EXPORT_OPTION_TCP	     | \
 				       EXPORT_OPTION_RDMA)
+#define EXPORT_OPTION_XPORT_DEFAULTS  (EXPORT_OPTION_UDP	     | \
+				       EXPORT_OPTION_TCP)
 
 #define EXPORT_OPTION_READ_DELEG 0x10000000	/*< Enable read delegations */
 #define EXPORT_OPTION_WRITE_DELEG 0x20000000	/*< Using write delegations */
@@ -197,24 +210,27 @@ typedef struct exportlist_client_entry__ {
 #define EXPORT_OPTION_NO_READDIR_PLUS 0x80000000 /*< Disallow readdir plus */
 
 /* Export list related functions */
+uid_t get_anonymous_uid(void);
+gid_t get_anonymous_gid(void);
 void export_check_access(void);
 
 bool export_check_security(struct svc_req *req);
 
-void LogClientListEntry(log_components_t component,
-			exportlist_client_entry_t *entry);
-
 int init_export_root(struct gsh_export *exp);
 
-cache_inode_status_t nfs_export_get_root_entry(struct gsh_export *exp,
-					       cache_entry_t **entry);
-void unexport(struct gsh_export *export);
-void kill_export_root_entry(cache_entry_t *entry);
-void kill_export_junction_entry(cache_entry_t *entry);
+fsal_status_t nfs_export_get_root_entry(struct gsh_export *exp,
+					struct fsal_obj_handle **obj);
+void unexport(struct gsh_export *exp);
+/* XXX */
+/*void kill_export_root_entry(cache_entry_t *entry);*/
+/*void kill_export_junction_entry(cache_entry_t *entry);*/
 
 int ReadExports(config_file_t in_config,
 		struct config_error_type *err_type);
-void free_export_resources(struct gsh_export *export);
+int reread_exports(config_file_t in_config,
+		struct config_error_type *err_type);
+void free_export_resources(struct gsh_export *exp);
+
 void exports_pkginit(void);
 
 #endif				/* !NFS_EXPORTS_H */

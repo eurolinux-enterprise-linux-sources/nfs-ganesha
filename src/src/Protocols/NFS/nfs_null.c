@@ -39,7 +39,6 @@
 #include "gsh_rpc.h"
 #include "nfs4.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_exports.h"
 #include "nfs_proto_functions.h"
 
@@ -47,15 +46,11 @@
  * @brief The NFS proc null function, for all versions.
  *
  * @param[in]  arg     ignored
- * @param[in]  export  ignored
- * @param[in]  worker  ignored
  * @param[in]  req     ignored
  * @param[out] res     ignored
  */
 
-int nfs_null(nfs_arg_t *arg,
-	     nfs_worker_data_t *worker,
-	     struct svc_req *req, nfs_res_t *res)
+int nfs_null(nfs_arg_t *arg, struct svc_req *req, nfs_res_t *res)
 {
 	LogDebug(COMPONENT_NFSPROTO, "REQUEST PROCESSING: Calling nfs_null");
 	return NFS3_OK;
@@ -73,5 +68,4 @@ int nfs_null(nfs_arg_t *arg,
 void nfs_null_free(nfs_res_t *res)
 {
 	/* Nothing to do here */
-	return;
 }

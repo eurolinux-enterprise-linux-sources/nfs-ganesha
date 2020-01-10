@@ -95,7 +95,8 @@ static void release(struct fsal_export *export_pub)
 
 static fsal_status_t lookup_path(struct fsal_export *export_pub,
 				 const char *path,
-				 struct fsal_obj_handle **pub_handle)
+				 struct fsal_obj_handle **pub_handle,
+				 struct attrlist *attrs_out)
 {
 	/* The 'private' full export handle */
 	struct export *export =
@@ -139,10 +140,10 @@ static fsal_status_t lookup_path(struct fsal_export *export_pub,
 	if (rc < 0)
 		return ceph2fsal_error(rc);
 
-	rc = construct_handle(&st, i, export, &handle);
-	if (rc < 0) {
-		ceph_ll_put(export->cmount, i);
-		return ceph2fsal_error(rc);
+	construct_handle(&st, i, export, &handle);
+
+	if (attrs_out != NULL) {
+		posix2fsal_attributes(&st, attrs_out);
 	}
 
 	*pub_handle = &handle->handle;
@@ -191,7 +192,8 @@ static fsal_status_t extract_handle(struct fsal_export *exp_hdl,
  */
 static fsal_status_t create_handle(struct fsal_export *export_pub,
 				   struct gsh_buffdesc *desc,
-				   struct fsal_obj_handle **pub_handle)
+				   struct fsal_obj_handle **pub_handle,
+				   struct attrlist *attrs_out)
 {
 	/* Full 'private' export structure */
 	struct export *export =
@@ -227,10 +229,10 @@ static fsal_status_t create_handle(struct fsal_export *export_pub,
 	if (rc < 0)
 		return ceph2fsal_error(rc);
 
-	rc = construct_handle(&st, i, export, &handle);
-	if (rc < 0) {
-		ceph_ll_put(export->cmount, i);
-		return ceph2fsal_error(rc);
+	construct_handle(&st, i, export, &handle);
+
+	if (attrs_out != NULL) {
+		posix2fsal_attributes(&st, attrs_out);
 	}
 
 	*pub_handle = &handle->handle;
@@ -295,6 +297,7 @@ static bool fs_supports(struct fsal_export *export_pub,
 			fsal_fsinfo_options_t option)
 {
 	struct fsal_staticfsinfo_t *info = ceph_staticinfo(export_pub->fsal);
+
 	return fsal_supports(info, option);
 }
 
@@ -502,6 +505,7 @@ void export_ops_init(struct export_ops *ops)
 	ops->fs_supported_attrs = fs_supported_attrs;
 	ops->fs_umask = fs_umask;
 	ops->fs_xattr_access_rights = fs_xattr_access_rights;
+	ops->alloc_state = ceph_alloc_state;
 #ifdef CEPH_PNFS
 	export_ops_pnfs(ops);
 #endif				/* CEPH_PNFS */

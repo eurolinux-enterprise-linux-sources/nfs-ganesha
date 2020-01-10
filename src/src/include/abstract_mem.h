@@ -42,6 +42,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include "log.h"
 
 /**
  * @page GeneralAllocator General Allocator Shim
@@ -59,18 +60,32 @@
  * @brief Allocate memory
  *
  * This function allocates a block of memory no less than the given
- * size.  On failure, it returns NULL.  If a block of memory is
- * returned, it must be released with gsh_free.
+ * size. The block of memory allocated must be released with gsh_free.
+ *
+ * This function aborts if no memory is available.
  *
  * @param[in] n Number of bytes to allocate
+ * @param[in] file Calling source file
+ * @param[in] line Calling source line
+ * @param[in] function Calling source function
  *
- * @return Pointer to a block of memory or NULL.
+ * @return Pointer to a block of memory.
  */
 static inline void *
-gsh_malloc(size_t n)
+gsh_malloc__(size_t n,
+	     const char *file, int line, const char *function)
 {
-	return malloc(n);
+	void *p = malloc(n);
+
+	if (p == NULL) {
+		LogMallocFailure(file, line, function, "gsh_malloc");
+		abort();
+	}
+
+	return p;
 }
+
+#define gsh_malloc(n) gsh_malloc__(n, __FILE__, __LINE__, __func__)
 
 /**
  * @brief Allocate aligned memory
@@ -81,39 +96,63 @@ gsh_malloc(size_t n)
  *
  * @param[in] a Block alignment
  * @param[in] n Number of bytes to allocate
+ * @param[in] file Calling source file
+ * @param[in] line Calling source line
+ * @param[in] function Calling source function
  *
  * @return Pointer to a block of memory or NULL.
  */
 static inline void *
-gsh_malloc_aligned(size_t a, size_t n)
+gsh_malloc_aligned__(size_t a, size_t n,
+		     const char *file, int line, const char *function)
 {
-#ifdef __APPLE__
-	return valloc(n);
-#else
 	void *p;
+
+#ifdef __APPLE__
+	p = valloc(n);
+#else
 	if (posix_memalign(&p, a, n) != 0)
 		p = NULL;
-	return p;
 #endif
+	if (p == NULL) {
+		LogMallocFailure(file, line, function, "gsh_malloc_aligned");
+		abort();
+	}
+
+	return p;
 }
+
+#define gsh_malloc_aligned(a, n) \
+	gsh_malloc_aligned__(a, n, __FILE__, __LINE__, __func__)
 
 /**
  * @brief Allocate zeroed memory
  *
  * This function allocates a block of memory that is guaranteed to be
- * zeroed. On failure, it returns NULL.  If a block of memory is
- * returned, it must be released with gsh_free.
+ * zeroed. The block of memory allocated must be released with gsh_free.
  *
- * @param[in] s Size of object
+ * This function aborts if no memory is available.
+ *
  * @param[in] n Number of objects in block
+ * @param[in] s Size of object
  *
- * @return Pointer to a block of zeroed memory or NULL.
+ * @return Pointer to a block of zeroed memory.
  */
 static inline void *
-gsh_calloc(size_t s, size_t n)
+gsh_calloc__(size_t n, size_t s,
+	     const char *file, int line, const char *function)
 {
-	return calloc(s, n);
+	void *p = calloc(n, s);
+
+	if (p == NULL) {
+		LogMallocFailure(file, line, function, "gsh_calloc");
+		abort();
+	}
+
+	return p;
 }
+
+#define gsh_calloc(n, s) gsh_calloc__(n, s, __FILE__, __LINE__, __func__)
 
 /**
  * @brief Resize a block of memory
@@ -122,17 +161,31 @@ gsh_calloc(size_t s, size_t n)
  * to the given size.  The block may be moved in this process.  On
  * failure, the original block is retained at its original address.
  *
+ * This function aborts if no memory is available to resize.
+ *
  * @param[in] p Block of memory to resize
  * @param[in] n New size
+ * @param[in] file Calling source file
+ * @param[in] line Calling source line
+ * @param[in] function Calling source function
  *
- * @return Pointer to the address of the resized block.  NULL if
- *         resize failed.
+ * @return Pointer to the address of the resized block.
  */
 static inline void *
-gsh_realloc(void *p, size_t n)
+gsh_realloc__(void *p, size_t n,
+	      const char *file, int line, const char *function)
 {
-	return realloc(p, n);
+	void *p2 = realloc(p, n);
+
+	if (n != 0 && p2 == NULL) {
+		LogMallocFailure(file, line, function, "gsh_realloc");
+		abort();
+	}
+
+	return p2;
 }
+
+#define gsh_realloc(p, n) gsh_realloc__(p, n, __FILE__, __LINE__, __func__)
 
 /**
  * @brief Duplicate a string to newly allocated memory
@@ -140,15 +193,69 @@ gsh_realloc(void *p, size_t n)
  * This function allocates a new block of memory sufficient to contain
  * the supplied string, then copies the string into that buffer.
  *
- * @param[in] s  String to duplicate
+ * This function aborts if no memory is available.
  *
- * @return Pointer to new copy of string or NULL on failure.
+ * @param[in] s  String to duplicate
+ * @param[in] file Calling source file
+ * @param[in] line Calling source line
+ * @param[in] function Calling source function
+ *
+ * @return Pointer to new copy of string.
  */
 static inline char *
-gsh_strdup(const char *s)
+gsh_strdup__(const char *s, const char *file, int line, const char *function)
 {
-	return strdup(s);
+	char *p = strdup(s);
+
+	if (p == NULL) {
+		LogMallocFailure(file, line, function, "gsh_strdup");
+		abort();
+	}
+
+	return p;
 }
+
+#define gsh_strdup(s) gsh_strdup__(s, __FILE__, __LINE__, __func__)
+
+/**
+ * @brief Duplicate a string to newly allocated memory (bounded)
+ *
+ * This function allocates a new block of memory sufficient to contain
+ * the supplied string, then copies the string into that buffer.
+ *
+ * This function aborts if no memory is available.
+ *
+ * The returned copied value includes the terminating NUL.
+ *
+ * @param[in] s String to duplicate
+ * @param[in] length Size of the returned string shall be <= length+1
+ * @param[out] copied Number of bytes copied
+ * @param[in] file Calling source file
+ * @param[in] line Calling source line
+ * @param[in] function Calling source function
+ *
+ * @return Pointer to new copy of string.
+ */
+static inline char *
+gsh_strldup__(const char *s, size_t length, size_t *copied,
+	     const char *file, int line, const char *function)
+{
+	char *p = (char *) gsh_malloc__(length+1, file, line, function);
+
+	if (p == NULL) {
+		LogMallocFailure(file, line, function, "gsh_strldup");
+		abort();
+	}
+
+	memcpy(p, s, length);
+	p[length] = '\0';
+	*copied = length + 1;
+
+	return p;
+}
+
+#define gsh_strldup(s, l, n) gsh_strldup__(s, l, n, __FILE__, __LINE__, \
+						__func__)
 
 /**
  * @brief Free a block of memory
@@ -181,118 +288,6 @@ gsh_free_size(void *p, size_t n __attribute__ ((unused)))
 }
 
 /**
- * @page PoolAllocator Pool allocator shim
- *
- * These functions provide an abstract interface to memory pools.
- * Since multiple implementations of pooling may be useful within a
- * single running image, the underlying substrate can be changed using
- * by passing a constant (specifying an allocator) and parameters to
- * pool_init.
- *
- * By design, things are separated out so one can add a new pool
- * substrate without editing this file.  One can create, for example,
- * static_pool.h, define a function vector and a parameter structure,
- * and any functions wishing to use the static_pool could include it.
- */
-
-typedef struct pool pool_t;
-
-/**
- * @brief Abstract type of pool initializer
- *
- * This type represents that of a function to perform the
- * initialization of the underlying pool.  It should allocate the
- * pool_t and other memory it needs in a contiguous block, initialize
- * its own substrate-specific data, and return the pointer to the
- * pool_t (without filling out any of the fields in the pool_t
- * proper.)
- *
- * @param[in] size  Size of the objects to be allocated
- * @param[in] param Substrate specific parameters
- *
- * @return the pointer to the pool_t or NULL on failure
- */
-
-typedef pool_t *(*pool_initializer_t)(size_t size, void *param);
-
-/**
- * @brief Abstract type of pool destroyer
- *
- * This type represents that of a function to perform the destruction
- * of an underlying pool.  It should do any substrate specific cleanup
- * and then deallocate the memory pointed to by the pool argment.
- *
- * @param[in] pool The pool to destroy
- */
-
-typedef void (*pool_destroyer_t)(pool_t *pool);
-
-/**
- * @brief Abstract type of pool allocator
- *
- * This type represents that of a function to perform the allocation
- * of an object in the underlying pool implementation.  It must not
- * call the constructor function, leaving that to the wrapper.
- *
- * @param[in] pool The pool from which to allocate.
- *
- * @return the allocated object or NULL.
- */
-
-typedef void *(*pool_allocator_t)(pool_t *pool);
-
-/**
- * @brief Abstract type of pool freer
- *
- * This type represents that of a function to free an object in the
- * underlying pool implementation.  It must not call the destructor
- * function, leaving that to the wrapper.
- *
- * @param[in] pool   The pool to which to return the object
- * @param[in] object The object to free
- *
- */
-
-typedef void (*pool_freer_t)(pool_t *pool, void *object);
-
-/**
- * @brief A function vector defining a pool substrate
- *
- * This structure provides the set of functions that defines the
- * underlying pool substrate.
- */
-
-struct pool_substrate_vector {
-	pool_initializer_t initializer;	/*< Create an underlying pool */
-	pool_destroyer_t destroyer; /*< Destroy an underlying pool */
-	pool_allocator_t allocator; /*< Allocate an object */
-	pool_freer_t freer; /*< Free an object */
-};
-
-/**
- * @brief Object constructor
- *
- * Functions of this type are used to initialize objects newly
- * allocated from the pool.
- *
- * @param[out] object     The newly allocated object to be initialized
- * @param[in]  parameters Parameters to be used in initialization
- */
-
-typedef void (*pool_constructor_t)(void *object, void *parameters);
-
-/**
- * @brief Object destructor
- *
- * Functions of this type are used to finalize objects before they are
- * returned to the pool.
- *
- * @param[in,out] object The object to be finalized
- */
-
-typedef void (*pool_destructor_t)(void *object);
-
-/**
  * @brief Type representing a pool
  *
  * This type represents a memory pool.  it should be treated, by all
@@ -300,20 +295,17 @@ typedef void (*pool_destructor_t)(void *object);
  * stored or passed to pool functions.  The pointer should never be
  * referenced.  No assumptions about the size of the pointed-to type
  * should be made.
+ *
+ * This allows for flexible growth in the future.
  */
 
-struct pool {
+typedef struct pool {
 	char *name; /*< The name of the pool */
 	size_t object_size; /*< The size of the objects created */
-	pool_constructor_t constructor; /*< The object constructor */
-	pool_destructor_t destructor; /*< The object destructor */
-	struct pool_substrate_vector *substrate_vector;	/*< Pool operations */
-	char substrate_data[]; /*< The beginning of any substrate-specific
-				   data */
-};
+} pool_t;
 
 /**
- * @brief Create an object pool
+ * @brief Create a basic object pool
  *
  * This function creates a new object pool, given a name, object size,
  * constructor and destructor.
@@ -322,46 +314,40 @@ struct pool {
  * implementations that do tracking or keep counts of allocated or
  * de-allocated objects will likely wish to use it in log messages.
  *
+ * This initializer function is expected to abort if it fails.
+ *
  * @param[in] name             The name of this pool
  * @param[in] object_size      The size of objects to allocate
- * @param[in] substrate        The function vector specifying the
- *                             substrate to use for this pool
- * @param[in] substrate_params The substrate-specific parameters for
- *                             this pool
- * @param[in] constructor      Function to be called on each new
- *                             object
- * @param[in] destructor       Function to be called on each object
- *                             before destruction
+ * @param[in] file             Calling source file
+ * @param[in] line             Calling source line
+ * @param[in] function         Calling source function
  *
  * @return A pointer to the pool object.  This pointer must not be
  *         dereferenced.  It may be stored or supplied as an argument
  *         to the other pool functions.  It must not be supplied as an
  *         argument to gsh_free, rather it must be disposed of with
- *         pool_destroy.  NULL is returned on error.
+ *         pool_destroy.
  */
 
 static inline pool_t *
-pool_init(const char *name, size_t object_size,
-	  const struct pool_substrate_vector *substrate,
-	  void *substrate_params,
-	  pool_constructor_t constructor,
-	  pool_destructor_t destructor)
+pool_basic_init__(const char *name, size_t object_size,
+		  const char *file, int line, const char *function)
 {
-	pool_t *pool = substrate->initializer(object_size,
-					      substrate_params);
-	if (pool) {
-		pool->substrate_vector =
-		    (struct pool_substrate_vector *)substrate;
-		pool->object_size = object_size;
-		pool->constructor = constructor;
-		pool->destructor = destructor;
-		if (name)
-			pool->name = gsh_strdup(name);
-		else
-			pool->name = NULL;
-	}
+	pool_t *pool = (pool_t *) gsh_malloc__(sizeof(pool_t), file, line,
+					function);
+
+	pool->object_size = object_size;
+
+	if (name)
+		pool->name = gsh_strdup__(name, file, line, function);
+	else
+		pool->name = NULL;
+
 	return pool;
 }
+
+#define pool_basic_init(name, object_size) \
+	pool_basic_init__(name, object_size, __FILE__, __LINE__, __func__)
 
 /**
  * @brief Destroy a memory pool
@@ -375,7 +361,8 @@ pool_init(const char *name, size_t object_size,
 static inline void
 pool_destroy(pool_t *pool)
 {
-	pool->substrate_vector->destroyer(pool);
+	gsh_free(pool->name);
+	gsh_free(pool);
 }
 
 /**
@@ -387,26 +374,29 @@ pool_destroy(pool_t *pool)
  * the underlying pool abstraction requires a lock, this function must
  * take and release it.
  *
- * @param[in] pool       The pool from which to allocate
- * @param[in] parameters Parameters to be supplied to the
- *                       constructor
+ * This function returns void pointers.  Programmers who wish for more
+ * type safety can easily create static inline wrappers (alloc_client
+ * or similar) to return pointers of a specific type (and omitting the
+ * pool parameter).
  *
- * @return A pointer on success or NULL on failure.  This function
- *         returns void pointers.  Programmers who wish for more type
- *         safety can easily create static inline wrappers
- *         (alloc_client or similar) to return pointers of a specific
- *         type (and omitting the pool parameter).
+ * This function aborts if no memory is available.
+ *
+ * @param[in] pool       The pool from which to allocate
+ * @param[in] file       Calling source file
+ * @param[in] line       Calling source line
+ * @param[in] function   Calling source function
+ *
+ * @return A pointer to the allocated pool item.
  */
 
 static inline void *
-pool_alloc(pool_t *pool, void *parameters)
+pool_alloc__(pool_t *pool, const char *file, int line, const char *function)
 {
-	void *object = pool->substrate_vector->allocator(pool);
-	if (object && (pool->constructor))
-		(pool->constructor) (object, parameters);
-
-	return object;
+	return gsh_calloc__(1, pool->object_size, file, line, function);
 }
+
+#define pool_alloc(pool) \
+	pool_alloc__(pool, __FILE__, __LINE__, __func__)
 
 /**
  * @brief Return an entry to a pool
@@ -427,99 +417,7 @@ pool_alloc(pool_t *pool, void *parameters)
 static inline void
 pool_free(pool_t *pool, void *object)
 {
-	if (pool->destructor)
-		(pool->destructor) (object);
-
-	pool->substrate_vector->freer(pool, object);
-}
-
-/**
- * @page BasicPoolSubstrate The Basic Pool Substrate
- *
- * These functions provide a non-preallocated, general-purpose pool
- * abstraction to Ganesha.  Currently it is only a wrapper around
- * gsh_malloc and gsh_free, but there are plans to, at a later date,
- * rewrite it in terms of an exposed pool interface in the underlying
- * allocator.
- */
-
-/**
- * @brief Initialize a basic pool
- *
- * This function simply allocates space for the pool_t structure and
- * returns it.
- *
- * @param[in] size  Size of the object (unused)
- * @param[in] param Parameters (there are no parameters, must be
- *                  NULL.)
- *
- * @return the allocated pool_t structure.
- */
-
-static inline pool_t *
-pool_basic_initializer(size_t size __attribute__ ((unused)),
-		       void *param __attribute__ ((unused)))
-{
-	assert(param == NULL);	/* We take no parameters */
-	return (pool_t *) gsh_malloc(sizeof(pool_t));
-}
-
-/**
- * @brief Destroy a basic pool
- *
- * This function just frees the space of the pool_t structure.
- *
- * @param[in] pool The pool to destroy
- */
-
-static inline void
-pool_basic_destroy(pool_t *pool)
-{
-	gsh_free(pool);
-}
-
-/**
- * @brief Allocate an object from a basic pool
- *
- * This function just calls gsh_malloc to get an object of the
- * appropriate size.
- *
- * @param[in] pool The pool from which to allocate.
- *
- * @return the allocated object or NULL.
- */
-
-static inline void *
-pool_basic_alloc(pool_t *pool)
-{
-	if (pool->constructor)
-		return gsh_malloc(pool->object_size);
-	else
-		return gsh_calloc(1, pool->object_size);
-}
-
-/**
- * @brief Free an object in a basic pool
- *
- * This function just calls gsh_free on the supplied object.
- *
- * @param[in] pool   The pool to which to return the object (unused)
- * @param[in] object The object to free
- */
-
-static inline void
-pool_basic_free(pool_t *pool __attribute__ ((unused)), void *object)
-{
 	gsh_free(object);
 }
-
-static const struct pool_substrate_vector pool_basic_substrate[] = {
-	{
-		.initializer = pool_basic_initializer,
-		.destroyer = pool_basic_destroy,
-		.allocator = pool_basic_alloc,
-		.freer = pool_basic_free
-	}
-};
 
 #endif /* ABSTRACT_MEM_H */

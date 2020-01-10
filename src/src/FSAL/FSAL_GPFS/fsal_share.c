@@ -1,4 +1,6 @@
-/*
+/**
+ * @file fsal_share.c
+ *
  * Copyright IBM Corporation, 2010
  *  Contributor: Aneesh Kumar K.v  <aneesh.kumar@linux.vnet.ibm.com>
  *
@@ -22,33 +24,35 @@
  *
  *
  */
-#include "config.h"
 
+#include "config.h"
 #include "fsal.h"
 #include "fsal_internal.h"
 #include "fsal_convert.h"
 
 /**
- * GPFSFSAL_share_op:
+ *  @param mntfd Mount file descriptor
+ *  @param owner Owner
+ *  @param req_share Request share
+ *
+ *  @return Status of operation
  */
-fsal_status_t GPFSFSAL_share_op(int mntfd,	/* IN */
-				int fd,	/* IN */
-				void *p_owner,	/* IN */
-				fsal_share_param_t request_share)
-{				/* IN */
+fsal_status_t
+GPFSFSAL_share_op(int mntfd, int fd, void *owner, fsal_share_param_t req_share)
+{
 	int rc = 0;
 	struct share_reserve_arg share_arg;
 	int errsv = 0;
 
 	LogFullDebug(COMPONENT_FSAL,
 		     "Share reservation: access:%u deny:%u owner:%p",
-		     request_share.share_access, request_share.share_deny,
-		     p_owner);
+		     req_share.share_access, req_share.share_deny,
+		     owner);
 
 	share_arg.mountdirfd = mntfd;
 	share_arg.openfd = fd;
-	share_arg.share_access = request_share.share_access;
-	share_arg.share_deny = request_share.share_deny;
+	share_arg.share_access = req_share.share_access;
+	share_arg.share_deny = req_share.share_deny;
 
 	rc = gpfs_ganesha(OPENHANDLE_SHARE_RESERVE, &share_arg);
 	errsv = errno;

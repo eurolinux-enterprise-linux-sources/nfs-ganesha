@@ -27,7 +27,6 @@
 #include "gsh_rpc.h"
 #include "fsal.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_exports.h"
 #include "nfs_creds.h"
 #include "nfs_proto_functions.h"
@@ -63,12 +62,12 @@ struct nfs4_readdir_cb_data {
 static void restore_data(struct nfs4_readdir_cb_data *tracker)
 {
 	/* Restore export stuff */
-	if (op_ctx->export)
-		put_gsh_export(op_ctx->export);
+	if (op_ctx->ctx_export)
+		put_gsh_export(op_ctx->ctx_export);
 
 	*op_ctx->export_perms = tracker->save_export_perms;
-	op_ctx->export = tracker->saved_gsh_export;
-	op_ctx->fsal_export = op_ctx->export->fsal_export;
+	op_ctx->ctx_export = tracker->saved_gsh_export;
+	op_ctx->fsal_export = op_ctx->ctx_export->fsal_export;
 	tracker->saved_gsh_export = NULL;
 
 	/* Restore creds */
@@ -79,28 +78,28 @@ static void restore_data(struct nfs4_readdir_cb_data *tracker)
 }
 
 /**
- * @brief Populate entry4s when called from cache_inode_readdir
+ * @brief Populate entry4s when called from fsal_readdir
  *
- * This function is a callback passed to cache_inode_readdir.  It
+ * This function is a callback passed to fsal_readdir.  It
  * fills in a pre-allocated array of entry4 structures and allocates
  * space for the name and attributes.  This space must be freed.
  *
  * @param[in,out] opaque A struct nfs4_readdir_cb_data that stores the
  *                       location of the array and other bookeeping
  *                       information
- * @param[in]     name   The filename for the current entry
- * @param[in]     handle The current entry's filehandle
- * @param[in]     attrs  The current entry's attributes
+ * @param[in]     obj	 Current file
+ * @param[in]     attrs  The current file's attributes
  * @param[in]     cookie The readdir cookie for the current entry
  */
 
-cache_inode_status_t nfs4_readdir_callback(void *opaque,
-					   cache_entry_t *entry,
-					   const struct attrlist *attr,
-					   uint64_t mounted_on_fileid,
-					   enum cb_state cb_state)
+fsal_errors_t nfs4_readdir_callback(void *opaque,
+				    struct fsal_obj_handle *obj,
+				    const struct attrlist *attr,
+				    uint64_t mounted_on_fileid,
+				    uint64_t cookie,
+				    enum cb_state cb_state)
 {
-	struct cache_inode_readdir_cb_parms *cb_parms = opaque;
+	struct fsal_readdir_cb_parms *cb_parms = opaque;
 	struct nfs4_readdir_cb_data *tracker = cb_parms->opaque;
 	size_t namelen = 0;
 	char val_fh[NFS4_FHSIZE];
@@ -112,14 +111,14 @@ cache_inode_status_t nfs4_readdir_callback(void *opaque,
 	compound_data_t *data = tracker->data;
 	nfsstat4 rdattr_error = NFS4_OK;
 	entry4 *tracker_entry = tracker->entries + tracker->count;
-	cache_inode_status_t attr_status;
+	fsal_status_t fsal_status;
 	fsal_accessflags_t access_mask_attr = 0;
 
 	/* Cleanup after problem with junction processing. */
 	if (cb_state == CB_PROBLEM) {
 		/* Restore the export. */
 		restore_data(tracker);
-		return CACHE_INODE_SUCCESS;
+		return ERR_FSAL_NO_ERROR;
 	}
 
 	if (tracker->total_entries == tracker->count)
@@ -134,9 +133,10 @@ cache_inode_status_t nfs4_readdir_callback(void *opaque,
 	 *       that root inode to proceed rather than getting stuck in a
 	 *       junction crossing infinite loop.
 	 */
+	PTHREAD_RWLOCK_rdlock(&obj->state_hdl->state_lock);
 	if (cb_parms->attr_allowed &&
-	    entry->type == DIRECTORY &&
-	    entry->object.dir.junction_export != NULL &&
+	    obj->type == DIRECTORY &&
+	    obj->state_hdl->dir.junction_export != NULL &&
 	    cb_state == CB_ORIGINAL) {
 		/* This is a junction. Code used to not recognize this
 		 * which resulted in readdir giving different attributes
@@ -148,28 +148,28 @@ cache_inode_status_t nfs4_readdir_callback(void *opaque,
 		LogDebug(COMPONENT_EXPORT,
 			 "Offspring DIR %s is a junction Export_id %d Path %s",
 			 cb_parms->name,
-			 entry->object.dir.junction_export->export_id,
-			 entry->object.dir.junction_export->fullpath);
+			 obj->state_hdl->dir.junction_export->export_id,
+			 obj->state_hdl->dir.junction_export->fullpath);
 
 		/* Get a reference to the export and stash it in
 		 * compound data.
 		 */
-		if (!export_ready(entry->object.dir.junction_export)) {
+		if (!export_ready(obj->state_hdl->dir.junction_export)) {
 			/* Export is in the process of being released.
 			 * Pretend it's not actually a junction.
 			 */
 			goto not_junction;
 		}
 
-		get_gsh_export_ref(entry->object.dir.junction_export);
+		get_gsh_export_ref(obj->state_hdl->dir.junction_export);
 
 		/* Save the compound data context */
 		tracker->save_export_perms = *op_ctx->export_perms;
-		tracker->saved_gsh_export = op_ctx->export;
+		tracker->saved_gsh_export = op_ctx->ctx_export;
 
 		/* Cross the junction */
-		op_ctx->export = entry->object.dir.junction_export;
-		op_ctx->fsal_export = op_ctx->export->fsal_export;
+		op_ctx->ctx_export = obj->state_hdl->dir.junction_export;
+		op_ctx->fsal_export = op_ctx->ctx_export->fsal_export;
 
 		/* Build the credentials */
 		rdattr_error = nfs4_export_check_access(data->req);
@@ -181,15 +181,16 @@ cache_inode_status_t nfs4_readdir_callback(void *opaque,
 			 */
 			LogDebug(COMPONENT_EXPORT,
 				 "NFS4ERR_ACCESS Skipping Export_Id %d Path %s",
-				 op_ctx->export->export_id,
-				 op_ctx->export->fullpath);
+				 op_ctx->ctx_export->export_id,
+				 op_ctx->ctx_export->fullpath);
 
 			/* Restore export and creds */
 			restore_data(tracker);
 
 			/* Indicate success without adding another entry */
 			cb_parms->in_result = true;
-			return CACHE_INODE_SUCCESS;
+			PTHREAD_RWLOCK_unlock(&obj->state_hdl->state_lock);
+			return ERR_FSAL_NO_ERROR;
 		}
 
 		if (rdattr_error == NFS4ERR_WRONGSEC) {
@@ -210,8 +211,8 @@ cache_inode_status_t nfs4_readdir_callback(void *opaque,
 				 */
 				LogDebug(COMPONENT_EXPORT,
 					 "Ignoring NFS4ERR_WRONGSEC (only asked for MOUNTED_IN_FILEID) On ReadDir Export_Id %d Path %s",
-					 op_ctx->export->export_id,
-					 op_ctx->export->fullpath);
+					 op_ctx->ctx_export->export_id,
+					 op_ctx->ctx_export->fullpath);
 
 				/* Because we are not asking for any attributes
 				 * which are a property of the exported file
@@ -236,38 +237,41 @@ cache_inode_status_t nfs4_readdir_callback(void *opaque,
 				 */
 				LogDebug(COMPONENT_EXPORT,
 					 "NFS4ERR_WRONGSEC On ReadDir Export_Id %d Path %s",
-					 op_ctx->export->export_id,
-					 op_ctx->export->fullpath);
+					 op_ctx->ctx_export->export_id,
+					 op_ctx->ctx_export->fullpath);
 			}
 		} else if (rdattr_error == NFS4_OK) {
 			/* Now we must traverse the junction to get the
 			 * attributes. We have already set up the compound data.
 			 *
-			 * Signal to cache_inode_getattr to call back with the
+			 * Signal to populate_dirent to call back with the
 			 * root node of the export across the junction. Also
 			 * signal to ourselves that the call back will be
 			 * across the junction.
 			 */
 			LogDebug(COMPONENT_EXPORT,
 				 "Need to cross junction to Export_Id %d Path %s",
-				 op_ctx->export->export_id,
-				 op_ctx->export->fullpath);
-			return CACHE_INODE_CROSS_JUNCTION;
+				op_ctx->ctx_export->export_id,
+				op_ctx->ctx_export->fullpath);
+			PTHREAD_RWLOCK_unlock(&obj->state_hdl->state_lock);
+			return ERR_FSAL_CROSS_JUNCTION;
 		}
 
-		/* An error occured and we will report it, but we need to get
+		/* An error occurred and we will report it, but we need to get
 		 * the name into the entry to proceed.
 		 *
 		 * Restore export and creds.
 		 */
 		LogDebug(COMPONENT_EXPORT,
 			 "Need to report error for junction to Export_Id %d Path %s",
-			 op_ctx->export->export_id,
-			 op_ctx->export->fullpath);
+			 op_ctx->ctx_export->export_id,
+			 op_ctx->ctx_export->fullpath);
 		restore_data(tracker);
 	}
 
 not_junction:
+	PTHREAD_RWLOCK_unlock(&obj->state_hdl->state_lock);
+
 
 	/* Now process the entry */
 	memset(val_fh, 0, NFS4_FHSIZE);
@@ -281,7 +285,7 @@ not_junction:
 	}
 
 	tracker->mem_left -= sizeof(entry4);
-	tracker_entry->cookie = cb_parms->cookie;
+	tracker_entry->cookie = cookie;
 	tracker_entry->nextentry = NULL;
 
 	/* The filename.  We don't use str2utf8 because that has an
@@ -301,11 +305,6 @@ not_junction:
 	tracker_entry->name.utf8string_len = namelen;
 	tracker_entry->name.utf8string_val = gsh_malloc(namelen + 1);
 
-	if (tracker_entry->name.utf8string_val == NULL) {
-		/* Could not allocate name */
-		goto server_fault;
-	}
-
 	memcpy(tracker_entry->name.utf8string_val,
 	       cb_parms->name,
 	       namelen);
@@ -321,16 +320,13 @@ not_junction:
 		goto skip;
 	}
 
-	if (cb_parms->attr_allowed
-	    && attribute_is_set(tracker->req_attr, FATTR4_FILEHANDLE)) {
-		if (!nfs4_FSALToFhandle(&entryFH,
-					entry->obj_handle,
-					op_ctx->export))
-			goto server_fault;
-	}
+	if (cb_parms->attr_allowed &&
+	    attribute_is_set(tracker->req_attr, FATTR4_FILEHANDLE) &&
+	    !nfs4_FSALToFhandle(false, &entryFH, obj, op_ctx->ctx_export))
+		goto server_fault;
 
 	if (!cb_parms->attr_allowed) {
-		/* cache_inode_readdir is signaling us that client didn't have
+		/* fsal_readdir is signaling us that client didn't have
 		 * search permission in this directory, so we can't return any
 		 * attributes, but must indicate NFS4ERR_ACCESS.
 		 */
@@ -347,18 +343,15 @@ not_junction:
 	if (attribute_is_set(tracker->req_attr, FATTR4_ACL))
 		access_mask_attr |= FSAL_ACE4_MASK_SET(FSAL_ACE_PERM_READ_ACL);
 
-	/* cache_inode_readdir holds attr_lock while making callback,
-	 * so we need to do access check with no mutex.
-	 */
-	attr_status =
-	    cache_inode_access_no_mutex(entry, access_mask_attr);
-
-	if (attr_status != CACHE_INODE_SUCCESS) {
+	/* Attrs were refreshed before call */
+	fsal_status = obj->obj_ops.test_access(obj, access_mask_attr, NULL,
+					       NULL, false);
+	if (FSAL_IS_ERROR(fsal_status)) {
 		LogFullDebug(COMPONENT_NFS_READDIR,
 			     "permission check for attributes status=%s",
-			     cache_inode_err_str(attr_status));
+			     msg_fsal_err(fsal_status.major));
 
-		rdattr_error = nfs4_Errno(attr_status);
+		rdattr_error = nfs4_Errno_status(fsal_status);
 		LogDebug(COMPONENT_NFS_READDIR,
 			 "Skipping because of %s",
 			 nfsstat4_to_str(rdattr_error));
@@ -370,6 +363,8 @@ not_junction:
 	args.data = data;
 	args.hdl4 = &entryFH;
 	args.mounted_on_fileid = mounted_on_fileid;
+	args.fileid = obj->fileid;
+	args.fsid = obj->fsid;
 
 	if (nfs4_FSALattr_To_Fattr(&args,
 				   tracker->req_attr,
@@ -379,7 +374,7 @@ not_junction:
 		goto server_fault;
 	}
 
-	if (entry->type == DIRECTORY && is_sticky_bit_set(attr)) {
+	if (obj->type == DIRECTORY && is_sticky_bit_set(obj, attr)) {
 		rdattr_error = NFS4ERR_MOVED;
 		LogDebug(COMPONENT_NFS_READDIR,
 			 "Skipping because of %s",
@@ -442,7 +437,7 @@ not_junction:
 
  out:
 
-	return CACHE_INODE_SUCCESS;
+	return ERR_FSAL_NO_ERROR;
 }
 
 /**
@@ -465,9 +460,7 @@ static void free_entries(entry4 *entries)
 			gsh_free(entry->name.utf8string_val);
 	}
 	gsh_free(entries);
-
-	return;
-}				/* free_entries */
+}
 
 /**
  * @brief NFS4_OP_READDIR
@@ -487,7 +480,7 @@ int nfs4_op_readdir(struct nfs_argop4 *op, compound_data_t *data,
 {
 	READDIR4args * const arg_READDIR4 = &op->nfs_argop4_u.opreaddir;
 	READDIR4res * const res_READDIR4 = &resp->nfs_resop4_u.opreaddir;
-	cache_entry_t *dir_entry = NULL;
+	struct fsal_obj_handle *dir_obj = NULL;
 	bool eod_met = false;
 	unsigned long dircount = 0;
 	unsigned long maxcount = 0;
@@ -497,8 +490,10 @@ int nfs4_op_readdir(struct nfs_argop4 *op, compound_data_t *data,
 	unsigned int estimated_num_entries = 0;
 	unsigned int num_entries = 0;
 	struct nfs4_readdir_cb_data tracker;
-	cache_inode_status_t cache_status = CACHE_INODE_SUCCESS;
+	fsal_status_t fsal_status = {0, 0};
 	attrmask_t attrmask;
+	bool use_cookie_verifier = op_ctx_export_has_option(
+					EXPORT_OPTION_USE_COOKIE_VERIFIER);
 
 	resp->resop = NFS4_OP_READDIR;
 	res_READDIR4->status = NFS4_OK;
@@ -510,7 +505,7 @@ int nfs4_op_readdir(struct nfs_argop4 *op, compound_data_t *data,
 
 	memset(&tracker, 0, sizeof(tracker));
 
-	dir_entry = data->current_entry;
+	dir_obj = data->current_obj;
 
 	/* get the characteristic value for readdir operation */
 	dircount = arg_READDIR4->dircount;
@@ -527,8 +522,8 @@ int nfs4_op_readdir(struct nfs_argop4 *op, compound_data_t *data,
 	tracker.total_entries = estimated_num_entries;
 
 	LogFullDebug(COMPONENT_NFS_READDIR,
-		     "--- nfs4_op_readdir ---> dircount=%lu maxcount=%lu "
-		     "cookie=%" PRIu64 " estimated_num_entries=%u",
+		     "dircount=%lu maxcount=%lu cookie=%" PRIu64
+		     " estimated_num_entries=%u",
 		     dircount, maxcount, cookie, estimated_num_entries);
 
 	/* Since we never send a cookie of 1 or 2, we shouldn't ever get
@@ -561,11 +556,35 @@ int nfs4_op_readdir(struct nfs_argop4 *op, compound_data_t *data,
 	}
 
 	/* If a cookie verifier is used, then a non-trivial value is
-	 * returned to the client.  This value is the mtime of the
+	 * returned to the client.  This value is the change_time of the
 	 * directory.  If verifier is unused (as in many NFS Servers)
 	 * then only a set of zeros is returned (trivial value)
 	 */
 	memset(cookie_verifier, 0, NFS4_VERIFIER_SIZE);
+	if (use_cookie_verifier) {
+		time_t change_time;
+		struct attrlist attrs;
+
+		fsal_prepare_attrs(&attrs, ATTR_CHGTIME);
+
+		fsal_status =
+			data->current_obj->obj_ops.getattrs(data->current_obj,
+							    &attrs);
+
+		if (FSAL_IS_ERROR(fsal_status)) {
+			res_READDIR4->status = nfs4_Errno_status(fsal_status);
+			LogFullDebug(COMPONENT_NFS_READDIR,
+				     "getattrs returned %s",
+				     msg_fsal_err(fsal_status.major));
+			goto out;
+		}
+
+		change_time = timespec_to_nsecs(&attrs.chgtime);
+		memcpy(cookie_verifier, &change_time, sizeof(change_time));
+
+		/* Done with the attrs */
+		fsal_release_attrs(&attrs);
+	}
 
 	/* Cookie delivered by the server and used by the client SHOULD
 	 * not be 0, 1 or 2 because these values are reserved (see RFC
@@ -578,8 +597,7 @@ int nfs4_op_readdir(struct nfs_argop4 *op, compound_data_t *data,
 	 * '.' and '..' are not returned, so all cookies will be offset by 2
 	 */
 
-	if ((cookie != 0) &&
-	    (op_ctx->export->options & EXPORT_OPTION_USE_COOKIE_VERIFIER)) {
+	if (cookie != 0 && use_cookie_verifier) {
 		if (memcmp(cookie_verifier,
 			   arg_READDIR4->cookieverf,
 			   NFS4_VERIFIER_SIZE) != 0) {
@@ -610,25 +628,25 @@ int nfs4_op_readdir(struct nfs_argop4 *op, compound_data_t *data,
 		attrmask |= ATTR_ACL;
 
 	/* Perform the readdir operation */
-	cache_status = cache_inode_readdir(dir_entry,
-					   cookie,
-					   &num_entries,
-					   &eod_met,
-					   attrmask,
-					   nfs4_readdir_callback,
-					   &tracker);
+	fsal_status = fsal_readdir(dir_obj,
+				   cookie,
+				   &num_entries,
+				   &eod_met,
+				   attrmask,
+				   nfs4_readdir_callback,
+				   &tracker);
 
-	if (cache_status != CACHE_INODE_SUCCESS) {
-		res_READDIR4->status = nfs4_Errno(cache_status);
+	if (FSAL_IS_ERROR(fsal_status)) {
+		res_READDIR4->status = nfs4_Errno_status(fsal_status);
 		LogFullDebug(COMPONENT_NFS_READDIR,
-			     "cache_inode_readdir returned %s",
-			     cache_inode_err_str(cache_status));
+			     "fsal_readdir returned %s",
+			     msg_fsal_err(fsal_status.major));
 		goto out;
 	}
 
 	LogFullDebug(COMPONENT_NFS_READDIR,
-		     "cache_inode_readdir returned %s",
-		     cache_inode_err_str(cache_status));
+		     "fsal_readdir returned %s",
+		     msg_fsal_err(fsal_status.major));
 
 	res_READDIR4->status = tracker.error;
 

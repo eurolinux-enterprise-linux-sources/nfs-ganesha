@@ -20,11 +20,23 @@
 /* Default timeout can be changed using clnt_control() */
 static struct timeval TIMEOUT = { 25, 0 };
 
+/* This function is dragged in by the use of abstract_mem.h, so
+ * we define a simple version that does a printf rather than
+ * pull in the entirety of log_functions.c into this standalone
+ * program.
+ */
+void LogMallocFailure(const char *file, int line, const char *function,
+		      const char *allocator)
+{
+	printf("Aborting %s due to out of memory", allocator);
+}
+
 void *
 nsm_notify_1(notify *argp, CLIENT *clnt)
 {
 	static char clnt_res;
 	AUTH *nsm_auth;
+
 	nsm_auth = authnone_create();
 
 	memset((char *)&clnt_res, 0, sizeof(clnt_res));

@@ -36,7 +36,6 @@
 #include "log.h"
 #include "fsal.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_exports.h"
 #include "nfs_creds.h"
 #include "nfs_proto_tools.h"
@@ -61,10 +60,11 @@ int nfs4_op_lookupp(struct nfs_argop4 *op, compound_data_t *data,
 		    struct nfs_resop4 *resp)
 {
 	LOOKUPP4res * const res_LOOKUPP4 = &resp->nfs_resop4_u.oplookupp;
-	cache_entry_t *dir_entry = NULL;
-	cache_entry_t *file_entry;
-	cache_inode_status_t cache_status;
-	struct gsh_export *original_export = op_ctx->export;
+	struct fsal_obj_handle *dir_obj = NULL;
+	struct fsal_obj_handle *file_obj;
+	struct fsal_obj_handle *root_obj;
+	fsal_status_t status;
+	struct gsh_export *original_export = op_ctx->ctx_export;
 
 	resp->resop = NFS4_OP_LOOKUPP;
 	res_LOOKUPP4->status = NFS4_OK;
@@ -76,18 +76,25 @@ int nfs4_op_lookupp(struct nfs_argop4 *op, compound_data_t *data,
 		return res_LOOKUPP4->status;
 
 	/* Preparing for cache_inode_lookup ".." */
-	file_entry = NULL;
-	dir_entry = data->current_entry;
+	file_obj = NULL;
+	dir_obj = data->current_obj;
 
 	/* If Filehandle points to the root of the current export, then backup
 	 * through junction into the containing export.
 	 */
-	if (data->current_entry->type != DIRECTORY)
+	if (data->current_obj->type != DIRECTORY)
 		goto not_junction;
 
 	PTHREAD_RWLOCK_rdlock(&original_export->lock);
 
-	if (data->current_entry == original_export->exp_root_cache_inode) {
+	status = nfs_export_get_root_entry(original_export, &root_obj);
+	if (FSAL_IS_ERROR(status)) {
+		res_LOOKUPP4->status = nfs4_Errno_status(status);
+		PTHREAD_RWLOCK_unlock(&original_export->lock);
+		return res_LOOKUPP4->status;
+	}
+
+	if (data->current_obj == root_obj) {
 		struct gsh_export *parent_exp = NULL;
 
 		/* Handle reverse junction */
@@ -122,16 +129,16 @@ int nfs4_op_lookupp(struct nfs_argop4 *op, compound_data_t *data,
 		 */
 		PTHREAD_RWLOCK_rdlock(&original_export->lock);
 
-		/* Get the junction inode into dir_entry and parent_exp
+		/* Get the junction inode into dir_obj and parent_exp
 		 * for reference.
 		 */
-		dir_entry = original_export->exp_junction_inode;
+		dir_obj = original_export->exp_junction_obj;
 		parent_exp = original_export->exp_parent_exp;
 
 		/* Check if there is a problem with the export and try and
 		 * get a reference to the parent export.
 		 */
-		if (dir_entry == NULL || parent_exp == NULL ||
+		if (dir_obj == NULL || parent_exp == NULL ||
 		    !export_ready(parent_exp)) {
 			/* Export is in the process of dying */
 			PTHREAD_RWLOCK_unlock(&original_export->lock);
@@ -146,28 +153,20 @@ int nfs4_op_lookupp(struct nfs_argop4 *op, compound_data_t *data,
 
 		get_gsh_export_ref(parent_exp);
 
-		if (cache_inode_lru_ref(dir_entry, LRU_FLAG_NONE) !=
-		    CACHE_INODE_SUCCESS) {
-			/* junction inode has gone stale. */
-			PTHREAD_RWLOCK_unlock(&original_export->lock);
-			LogCrit(COMPONENT_EXPORT,
-				"Reverse junction from Export_Id %d Path %s Parent=%p is stale",
-				original_export->export_id,
-				original_export->fullpath,
-				parent_exp);
-			res_LOOKUPP4->status = NFS4ERR_STALE;
-			return res_LOOKUPP4->status;
-		}
+		dir_obj->obj_ops.get_ref(dir_obj);
 
-		/* Set up dir_entry as current entry with an LRU reference
+		/* Set up dir_obj as current obj with an LRU reference
 		 * while still holding the lock.
 		 */
-		set_current_entry(data, dir_entry);
+		set_current_entry(data, dir_obj);
+
+		/* Put our ref */
+		dir_obj->obj_ops.put_ref(dir_obj);
 
 		/* Stash parent export in opctx while still holding the lock.
 		 */
-		op_ctx->export = parent_exp;
-		op_ctx->fsal_export = op_ctx->export->fsal_export;
+		op_ctx->ctx_export = parent_exp;
+		op_ctx->fsal_export = op_ctx->ctx_export->fsal_export;
 
 		/* Now we are safely transitioned to the parent export and can
 		 * release the lock.
@@ -198,22 +197,28 @@ int nfs4_op_lookupp(struct nfs_argop4 *op, compound_data_t *data,
 		PTHREAD_RWLOCK_unlock(&original_export->lock);
 	}
 
+	/* Return our ref from above */
+	root_obj->obj_ops.put_ref(root_obj);
+
 not_junction:
 
-	cache_status = cache_inode_lookupp(dir_entry, &file_entry);
+	status = fsal_lookupp(dir_obj, &file_obj, NULL);
 
-	if (file_entry != NULL) {
+	if (file_obj != NULL) {
 		/* Convert it to a file handle */
-		if (!nfs4_FSALToFhandle(&data->currentFH,
-					file_entry->obj_handle,
-					op_ctx->export)) {
+		if (!nfs4_FSALToFhandle(false, &data->currentFH,
+						file_obj,
+						op_ctx->ctx_export)) {
 			res_LOOKUPP4->status = NFS4ERR_SERVERFAULT;
-			cache_inode_put(file_entry);
+			file_obj->obj_ops.put_ref(file_obj);
 			return res_LOOKUPP4->status;
 		}
 
 		/* Keep the pointer within the compound data */
-		set_current_entry(data, file_entry);
+		set_current_entry(data, file_obj);
+
+		/* Put our ref */
+		file_obj->obj_ops.put_ref(file_obj);
 
 		/* Return successfully */
 		res_LOOKUPP4->status = NFS4_OK;
@@ -222,7 +227,7 @@ not_junction:
 		 * Return error.
 		 */
 		set_current_entry(data, NULL);
-		res_LOOKUPP4->status = nfs4_Errno(cache_status);
+		res_LOOKUPP4->status = nfs4_Errno_status(status);
 	}
 
 	return res_LOOKUPP4->status;
@@ -239,5 +244,4 @@ not_junction:
 void nfs4_op_lookupp_Free(nfs_resop4 *resp)
 {
 	/* Nothing to be done */
-	return;
-}				/* nfs4_op_lookupp_Free */
+}

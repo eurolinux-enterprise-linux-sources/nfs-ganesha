@@ -57,7 +57,7 @@ struct pseudo_fsal_module {
 	/* pseudofsfs_specific_initinfo_t specific_info;  placeholder */
 };
 
-const char myname[] = "PSEUDOFS";
+const char pseudoname[] = "PSEUDO";
 
 /* filesystem info for PSEUDOFS */
 static struct fsal_staticfsinfo_t default_posix_info = {
@@ -126,6 +126,17 @@ static void init_config(struct fsal_module *fsal_hdl)
 		 pseudofs_me->fs_info.supported_attrs);
 }
 
+/**
+ * @brief Indicate support for extended operations.
+ *
+ * @retval true if extended operations are supported.
+ */
+
+bool pseudofs_support_ex(struct fsal_obj_handle *obj)
+{
+	return true;
+}
+
 /* Module initialization.
  * Called by dlopen() to register the module
  * keep a private pointer to me in myself
@@ -155,7 +166,7 @@ void pseudo_fsal_init(void)
 	int retval;
 	struct fsal_module *myself = &PSEUDOFS.fsal;
 
-	retval = register_fsal(myself, myname, FSAL_MAJOR_VERSION,
+	retval = register_fsal(myself, pseudoname, FSAL_MAJOR_VERSION,
 			       FSAL_MINOR_VERSION, FSAL_ID_NO_PNFS);
 	if (retval != 0) {
 		fprintf(stderr, "PSEUDO module failed to register");
@@ -163,7 +174,7 @@ void pseudo_fsal_init(void)
 	}
 	myself->m_ops.create_export = pseudofs_create_export;
 	myself->m_ops.unload = unload_pseudo_fsal;
-	myself->name = gsh_strdup("PSEUDO");
+	myself->m_ops.support_ex = pseudofs_support_ex;
 
 	/* initialize our config */
 	init_config(myself);

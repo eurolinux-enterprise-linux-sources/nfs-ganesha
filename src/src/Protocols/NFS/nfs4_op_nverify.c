@@ -36,7 +36,6 @@
 #include "log.h"
 #include "nfs4.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_proto_functions.h"
 #include "nfs_proto_tools.h"
 
@@ -61,6 +60,7 @@ int nfs4_op_nverify(struct nfs_argop4 *op, compound_data_t *data,
 	NVERIFY4res * const res_NVERIFY4 = &resp->nfs_resop4_u.opnverify;
 	fattr4 file_attr4;
 	int rc = 0;
+	struct attrlist attrs;
 
 	resp->resop = NFS4_OP_NVERIFY;
 	res_NVERIFY4->status = NFS4_OK;
@@ -84,15 +84,24 @@ int nfs4_op_nverify(struct nfs_argop4 *op, compound_data_t *data,
 		return res_NVERIFY4->status;
 	}
 
+	fsal_prepare_attrs(&attrs, 0);
+
 	res_NVERIFY4->status =
-	    cache_entry_To_Fattr(data->current_entry,
-				 &file_attr4,
-				 data,
-				 &(data->currentFH),
-				 &(arg_NVERIFY4->obj_attributes.attrmask));
+		bitmap4_to_attrmask_t(&arg_NVERIFY4->obj_attributes.attrmask,
+				      &attrs.request_mask);
 
 	if (res_NVERIFY4->status != NFS4_OK)
 		return res_NVERIFY4->status;
+
+	res_NVERIFY4->status =
+		file_To_Fattr(data, attrs.request_mask, &attrs, &file_attr4,
+			      &arg_NVERIFY4->obj_attributes.attrmask);
+
+	if (res_NVERIFY4->status != NFS4_OK)
+		return res_NVERIFY4->status;
+
+	/* Done with the attrs */
+	fsal_release_attrs(&attrs);
 
 	rc = nfs4_Fattr_cmp(&arg_NVERIFY4->obj_attributes, &file_attr4);
 
@@ -119,5 +128,5 @@ int nfs4_op_nverify(struct nfs_argop4 *op, compound_data_t *data,
  */
 void nfs4_op_nverify_Free(nfs_resop4 *resp)
 {
-	return;
-}				/* nfs4_op_nverify_Free */
+	/* Nothing to be done */
+}

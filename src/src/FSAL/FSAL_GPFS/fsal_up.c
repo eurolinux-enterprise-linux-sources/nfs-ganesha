@@ -1,4 +1,7 @@
-/*
+/**
+ * @file    fsal_up.c
+ * @brief   FSAL Upcall Interface
+ *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
  * as published by the Free Software Foundation; either version 3 of
@@ -17,12 +20,7 @@
  * ---------------------------------------
  */
 
-/**
- * @file    fsal_up.c
- * @brief   FSAL Upcall Interface
- */
 #include "config.h"
-
 #include "fsal.h"
 #include "fsal_up.h"
 #include "fsal_internal.h"
@@ -33,6 +31,12 @@
 #include <utime.h>
 #include <sys/time.h>
 
+/**
+ * @brief Up Thread
+ *
+ * @param Arg reference to void
+ *
+ */
 void *GPFSFSAL_UP_Thread(void *Arg)
 {
 	struct gpfs_filesystem *gpfs_fs = Arg;
@@ -52,9 +56,10 @@ void *GPFSFSAL_UP_Thread(void *Arg)
 	uint32_t expire_time_attr = 0;
 	uint32_t upflags = 0;
 	int errsv = 0;
+	fsal_status_t fsal_status = {0,};
 
 #ifdef _VALGRIND_MEMCHECK
-		memset(handle.f_handle, 0, sizeof(handle.f_handle));
+		memset(&handle, 0, sizeof(handle));
 		memset(&buf, 0, sizeof(buf));
 		memset(&fl, 0, sizeof(fl));
 		memset(&devid, 0, sizeof(devid));
@@ -85,7 +90,7 @@ void *GPFSFSAL_UP_Thread(void *Arg)
 			     "Requesting event from FSAL Callback interface for %d.",
 			     gpfs_fs->root_fd);
 
-		handle.handle_size = OPENHANDLE_HANDLE_LEN;
+		handle.handle_size = GPFS_MAX_FH_SIZE;
 		handle.handle_key_size = OPENHANDLE_KEY_LEN;
 		handle.handle_version = OPENHANDLE_VERSION;
 
@@ -105,14 +110,8 @@ void *GPFSFSAL_UP_Thread(void *Arg)
 		errsv = errno;
 
 		if (rc != 0) {
-			if (rc == ENOSYS) {
-				LogFatal(COMPONENT_FSAL_UP,
-					 "GPFS was not found, rc ENOSYS");
-				return NULL;
-			}
 			LogCrit(COMPONENT_FSAL_UP,
-				"OPENHANDLE_INODE_UPDATE failed for %d."
-				" rc %d, errno %d (%s) reason %d",
+				"OPENHANDLE_INODE_UPDATE failed for %d. rc %d, errno %d (%s) reason %d",
 				gpfs_fs->root_fd, rc, errsv,
 				strerror(errsv), reason);
 
@@ -138,14 +137,20 @@ void *GPFSFSAL_UP_Thread(void *Arg)
 
 		retry = 0;
 
+		/* flags is int, but only the least significant 2 bytes
+		 * are valid.  We are getting random bits into the upper
+		 * 2 bytes! Workaround this until the kernel module
+		 * gets fixed.
+		 */
+		flags = flags & 0xffff;
+
 		LogDebug(COMPONENT_FSAL_UP,
-			 "inode update: rc %d reason %d update ino %ld flags:%x",
+			 "inode update: rc %d reason %d update ino %"
+			 PRId64 " flags:%x",
 			 rc, reason, callback.buf->st_ino, flags);
 
 		LogFullDebug(COMPONENT_FSAL_UP,
-			     "inode update: flags:%x callback.handle:%p"
-			     " handle size = %u handle_type:%d handle_version:%d"
-			     " key_size = %u handle_fsid=%d.%d f_handle:%p expire: %d",
+			     "inode update: flags:%x callback.handle:%p handle size = %u handle_type:%d handle_version:%d key_size = %u handle_fsid=%X.%X f_handle:%p expire: %d",
 			     *callback.flags, callback.handle,
 			     callback.handle->handle_size,
 			     callback.handle->handle_type,
@@ -192,16 +197,16 @@ void *GPFSFSAL_UP_Thread(void *Arg)
 					.lock_length = fl.flock.l_len
 				};
 				if (reason == INODE_LOCK_AGAIN)
-					rc = up_async_lock_avail(general_fridge,
-							 event_func,
-							 gpfs_fs->fs->fsal,
+					fsal_status = up_async_lock_avail(
+							 general_fridge,
+							 event_func->up_export,
 							 &key,
 							 fl.lock_owner,
 							 &lockdesc, NULL, NULL);
 				else
-					rc = up_async_lock_grant(general_fridge,
-							 event_func,
-							 gpfs_fs->fs->fsal,
+					fsal_status = up_async_lock_grant(
+							 general_fridge,
+							 event_func->up_export,
 							 &key,
 							 fl.lock_owner,
 							 &lockdesc, NULL, NULL);
@@ -210,10 +215,10 @@ void *GPFSFSAL_UP_Thread(void *Arg)
 
 		case BREAK_DELEGATION:	/* Delegation Event */
 			LogDebug(COMPONENT_FSAL_UP,
-				 "delegation recall: flags:%x ino %ld", flags,
-				 callback.buf->st_ino);
-			rc = up_async_delegrecall(general_fridge, event_func,
-						  gpfs_fs->fs->fsal,
+				 "delegation recall: flags:%x ino %" PRId64,
+				 flags, callback.buf->st_ino);
+			fsal_status = up_async_delegrecall(general_fridge,
+						  event_func->up_export,
 						  &key, NULL, NULL);
 			break;
 
@@ -225,12 +230,12 @@ void *GPFSFSAL_UP_Thread(void *Arg)
 					.io_mode = LAYOUTIOMODE4_ANY
 				};
 				LogDebug(COMPONENT_FSAL_UP,
-					 "layout file recall: flags:%x ino %ld",
-					 flags, callback.buf->st_ino);
+					 "layout file recall: flags:%x ino %"
+					 PRId64, flags, callback.buf->st_ino);
 
-				rc = up_async_layoutrecall(general_fridge,
-							event_func,
-							gpfs_fs->fs->fsal,
+				fsal_status = up_async_layoutrecall(
+							general_fridge,
+							event_func->up_export,
 							&key,
 							LAYOUT4_NFSV4_1_FILES,
 							false, &segment,
@@ -241,8 +246,8 @@ void *GPFSFSAL_UP_Thread(void *Arg)
 
 		case LAYOUT_RECALL_ANY:	/* Recall all layouts Event */
 			LogDebug(COMPONENT_FSAL_UP,
-				 "layout recall any: flags:%x ino %ld", flags,
-				 callback.buf->st_ino);
+				 "layout recall any: flags:%x ino %" PRId64,
+				 flags, callback.buf->st_ino);
 
 	    /**
 	     * @todo This functionality needs to be implemented as a
@@ -256,15 +261,19 @@ void *GPFSFSAL_UP_Thread(void *Arg)
 
 		case LAYOUT_NOTIFY_DEVICEID:	/* Device update Event */
 			LogDebug(COMPONENT_FSAL_UP,
-				"layout dev update: flags:%x ino %ld seq %d fd %d fsid 0x%lx",
-				flags, callback.buf->st_ino, devid.device_id2,
-				devid.device_id4, devid.devid);
+				 "layout dev update: flags:%x ino %"
+				 PRId64 " seq %d fd %d fsid 0x%" PRIx64,
+				 flags,
+				callback.buf->st_ino,
+				devid.device_id2,
+				devid.device_id4,
+				devid.devid);
 
 			memset(&devid, 0, sizeof(devid));
 			devid.fsal_id = FSAL_ID_GPFS;
 
-			rc = up_async_notify_device(general_fridge,
-						event_func,
+			fsal_status = up_async_notify_device(general_fridge,
+						event_func->up_export,
 						NOTIFY_DEVICEID4_DELETE_MASK,
 						LAYOUT4_NFSV4_1_FILES,
 						&devid,
@@ -277,7 +286,8 @@ void *GPFSFSAL_UP_Thread(void *Arg)
 				struct attrlist attr;
 
 				LogMidDebug(COMPONENT_FSAL_UP,
-					    "inode update: flags:%x update ino %ld n_link:%d",
+					    "inode update: flags:%x update ino %"
+					    PRId64 " n_link:%d",
 					    flags, callback.buf->st_ino,
 					    (int)callback.buf->st_nlink);
 
@@ -302,10 +312,9 @@ void *GPFSFSAL_UP_Thread(void *Arg)
 				 * until this gets fixed!
 				 */
 				if (flags & (UP_SIZE | UP_SIZE_BIG)) {
-					rc = event_func->invalidate(
-						gpfs_fs->fs->fsal, &key,
-						CACHE_INODE_INVALIDATE_ATTRS |
-						CACHE_INODE_INVALIDATE_CONTENT);
+					fsal_status = event_func->invalidate(
+						event_func->up_export, &key,
+						FSAL_UP_INVALIDATE_CACHE);
 					break;
 				}
 
@@ -314,18 +323,28 @@ void *GPFSFSAL_UP_Thread(void *Arg)
 				if (flags &
 				    ~(UP_SIZE | UP_NLINK | UP_MODE | UP_OWN |
 				     UP_TIMES | UP_ATIME | UP_SIZE_BIG)) {
-					rc = event_func->invalidate(
-						gpfs_fs->fs->fsal, &key,
-						CACHE_INODE_INVALIDATE_ATTRS |
-						CACHE_INODE_INVALIDATE_CONTENT);
+					fsal_status = event_func->invalidate(
+						event_func->up_export, &key,
+						FSAL_UP_INVALIDATE_CACHE);
 				} else {
-					attr.mask = 0;
+					/* buf may not have all attributes set.
+					 * Since posix2fsal_attributes() copies
+					 * all attributes and also sets
+					 * attr.mask, correct attr.mask with
+					 * valid upcall flags only before
+					 * passing the attr to update() which
+					 * actually updates the cache_inode
+					 * object attributes.
+					 */
+					posix2fsal_attributes(&buf, &attr);
+					/* Set the mask to what is changed */
+					attr.valid_mask = 0;
 					if (flags & UP_SIZE)
-						attr.mask |=
+						attr.valid_mask |=
 						   ATTR_CHGTIME | ATTR_CHANGE |
 						   ATTR_SIZE | ATTR_SPACEUSED;
 					if (flags & UP_SIZE_BIG) {
-						attr.mask |=
+						attr.valid_mask |=
 						   ATTR_CHGTIME | ATTR_CHANGE |
 						   ATTR_SIZE | ATTR_SPACEUSED;
 						upflags |=
@@ -333,39 +352,38 @@ void *GPFSFSAL_UP_Thread(void *Arg)
 						   fsal_up_update_spaceused_inc;
 					}
 					if (flags & UP_MODE)
-						attr.mask |=
+						attr.valid_mask |=
 						   ATTR_CHGTIME | ATTR_CHANGE |
 						   ATTR_MODE;
 					if (flags & UP_OWN)
-						attr.mask |=
+						attr.valid_mask |=
 						   ATTR_CHGTIME | ATTR_CHANGE |
 						   ATTR_OWNER;
 					if (flags & UP_TIMES)
-						attr.mask |=
+						attr.valid_mask |=
 						   ATTR_CHGTIME | ATTR_CHANGE |
 						   ATTR_ATIME | ATTR_CTIME |
 						    ATTR_MTIME;
 					if (flags & UP_ATIME)
-						attr.mask |=
+						attr.valid_mask |=
 						   ATTR_CHGTIME | ATTR_CHANGE |
 						   ATTR_ATIME;
 
-					posix2fsal_attributes(&buf, &attr);
 					attr.expire_time_attr =
 					    expire_time_attr;
 
-					rc = event_func->
-					    update(gpfs_fs->fs->fsal,
+					fsal_status = event_func->
+					    update(event_func->up_export,
 						   &key, &attr, upflags);
 
 					if ((flags & UP_NLINK)
 					    && (attr.numlinks == 0)) {
-						upflags = fsal_up_nlink;
-						attr.mask = 0;
-						rc = up_async_update
+						upflags = fsal_up_nlink |
+							  fsal_up_close;
+						attr.valid_mask = 0;
+						fsal_status = up_async_update
 						    (general_fridge,
-						     event_func,
-						     gpfs_fs->fs->fsal,
+						     event_func->up_export,
 						     &key, &attr,
 						     upflags, NULL, NULL);
 					}
@@ -381,27 +399,35 @@ void *GPFSFSAL_UP_Thread(void *Arg)
 
 		case INODE_INVALIDATE:
 			LogMidDebug(COMPONENT_FSAL_UP,
-				    "inode invalidate: flags:%x update ino %ld",
-				    flags, callback.buf->st_ino);
+				    "inode invalidate: flags:%x update ino %"
+				    PRId64, flags, callback.buf->st_ino);
 
-			upflags = CACHE_INODE_INVALIDATE_ATTRS |
-				  CACHE_INODE_INVALIDATE_CONTENT;
-			rc = event_func->invalidate_close(
-						gpfs_fs->fs->fsal,
-						event_func,
+			upflags = FSAL_UP_INVALIDATE_CACHE;
+			fsal_status = event_func->invalidate_close(
+						event_func->up_export,
 						&key,
 						upflags);
 			break;
+
+		case THREAD_PAUSE:
+			/* File system image is probably going away, but
+			 * we don't need to do anything here as we
+			 * eventually get other errors that stop this
+			 * thread.
+			 */
+			continue; /* get next event */
 
 		default:
 			LogWarn(COMPONENT_FSAL_UP, "Unknown event: %d", reason);
 			continue;
 		}
 
-		if (rc && rc != CACHE_INODE_NOT_FOUND) {
+		if (FSAL_IS_ERROR(fsal_status) &&
+		    fsal_status.major != ERR_FSAL_NOENT) {
 			LogWarn(COMPONENT_FSAL_UP,
-				"Event %d could not be processed for fd %d rc %d",
-				reason, gpfs_fs->root_fd, rc);
+				"Event %d could not be processed for fd %d rc %s",
+				reason, gpfs_fs->root_fd,
+				fsal_err_txt(fsal_status));
 		}
 	}
 

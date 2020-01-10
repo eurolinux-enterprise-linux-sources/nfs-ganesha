@@ -33,7 +33,6 @@
 #include "config.h"
 #include "fsal.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_exports.h"
 #include "nfs_creds.h"
 #include "nfs_proto_functions.h"
@@ -60,8 +59,8 @@ int nfs4_op_secinfo(struct nfs_argop4 *op, compound_data_t *data,
 	SECINFO4args * const arg_SECINFO4 = &op->nfs_argop4_u.opsecinfo;
 	SECINFO4res * const res_SECINFO4 = &resp->nfs_resop4_u.opsecinfo;
 	char *secinfo_fh_name = NULL;
-	cache_inode_status_t cache_status = CACHE_INODE_SUCCESS;
-	cache_entry_t *entry_src = NULL;
+	fsal_status_t fsal_status = {0, 0};
+	struct fsal_obj_handle *obj_src = NULL;
 	sec_oid4 v5oid = { krb5oid.length, (char *)krb5oid.elements };
 	int num_entry = 0;
 	struct export_perms save_export_perms = { 0, };
@@ -88,49 +87,46 @@ int nfs4_op_secinfo(struct nfs_argop4 *op, compound_data_t *data,
 		goto out;
 
 
-	cache_status = cache_inode_lookup(data->current_entry,
-					  secinfo_fh_name,
-					  &entry_src);
+	fsal_status = fsal_lookup(data->current_obj, secinfo_fh_name,
+				  &obj_src, NULL);
 
-	if (entry_src == NULL) {
-		res_SECINFO4->status = nfs4_Errno(cache_status);
+	if (obj_src == NULL) {
+		res_SECINFO4->status = nfs4_Errno_status(fsal_status);
 		goto out;
 	}
 
-	/* Get attr_lock for looking at junction_export */
-	PTHREAD_RWLOCK_rdlock(&entry_src->attr_lock);
+	/* Get state lock for junction_export */
+	PTHREAD_RWLOCK_rdlock(&obj_src->state_hdl->state_lock);
 
-	if (entry_src->type == DIRECTORY &&
-	    entry_src->object.dir.junction_export != NULL) {
+	if (obj_src->type == DIRECTORY &&
+	    obj_src->state_hdl->dir.junction_export != NULL) {
 		/* Handle junction */
-		cache_entry_t *entry = NULL;
+		struct gsh_export *junction_export =
+			obj_src->state_hdl->dir.junction_export;
+		struct fsal_obj_handle *obj = NULL;
 
 		/* Try to get a reference to the export. */
-		if (!export_ready(entry_src->object.dir.junction_export)) {
+		if (!export_ready(junction_export)) {
 			/* Export has gone bad. */
-			/* Release attr_lock */
-			PTHREAD_RWLOCK_unlock(&entry_src->attr_lock);
-			LogDebug(NFS4ERR_STALE,
+			LogDebug(COMPONENT_EXPORT,
 				 "NFS4ERR_STALE On Export_Id %d Path %s",
-				 entry_src->object.dir
-					.junction_export->export_id,
-				 entry_src->object.dir
-					.junction_export->fullpath);
+				 junction_export->export_id,
+				 junction_export->fullpath);
 			res_SECINFO4->status = NFS4ERR_STALE;
+			PTHREAD_RWLOCK_unlock(&obj_src->state_hdl->state_lock);
 			goto out;
 		}
 
-		get_gsh_export_ref(entry_src->object.dir.junction_export);
+		get_gsh_export_ref(junction_export);
+
+		PTHREAD_RWLOCK_unlock(&obj_src->state_hdl->state_lock);
 
 		/* Save the compound data context */
 		save_export_perms = *op_ctx->export_perms;
-		saved_gsh_export = op_ctx->export;
+		saved_gsh_export = op_ctx->ctx_export;
 
-		op_ctx->export = entry_src->object.dir.junction_export;
-		op_ctx->fsal_export = op_ctx->export->fsal_export;
-
-		/* Release attr_lock */
-		PTHREAD_RWLOCK_unlock(&entry_src->attr_lock);
+		op_ctx->ctx_export = junction_export;
+		op_ctx->fsal_export = op_ctx->ctx_export->fsal_export;
 
 		/* Build credentials */
 		res_SECINFO4->status = nfs4_export_check_access(data->req);
@@ -143,8 +139,8 @@ int nfs4_op_secinfo(struct nfs_argop4 *op, compound_data_t *data,
 			 */
 			LogDebug(COMPONENT_EXPORT,
 				 "NFS4ERR_ACCESS Hiding Export_Id %d Path %s with NFS4ERR_NOENT",
-				 op_ctx->export->export_id,
-				 op_ctx->export->fullpath);
+				 op_ctx->ctx_export->export_id,
+				 op_ctx->ctx_export->fullpath);
 			res_SECINFO4->status = NFS4ERR_NOENT;
 			goto out;
 		}
@@ -152,35 +148,33 @@ int nfs4_op_secinfo(struct nfs_argop4 *op, compound_data_t *data,
 		/* Only other error is NFS4ERR_WRONGSEC which is actually
 		 * what we expect here. Finish crossing the junction.
 		 */
+		fsal_status = nfs_export_get_root_entry(op_ctx->ctx_export,
+							&obj);
 
-		cache_status =
-		    nfs_export_get_root_entry(op_ctx->export, &entry);
-
-		if (cache_status != CACHE_INODE_SUCCESS) {
+		if (FSAL_IS_ERROR(fsal_status)) {
 			LogMajor(COMPONENT_EXPORT,
 				 "PSEUDO FS JUNCTION TRAVERSAL: Failed to get root for %s, id=%d, status = %s",
-				 op_ctx->export->fullpath,
-				 op_ctx->export->export_id,
-				 cache_inode_err_str(cache_status));
+				 op_ctx->ctx_export->fullpath,
+				 op_ctx->ctx_export->export_id,
+				 fsal_err_txt(fsal_status));
 
-			res_SECINFO4->status = nfs4_Errno(cache_status);
+			res_SECINFO4->status = nfs4_Errno_status(fsal_status);
 			goto out;
 		}
 
 		LogDebug(COMPONENT_EXPORT,
 			 "PSEUDO FS JUNCTION TRAVERSAL: Crossed to %s, id=%d for name=%s",
-			 op_ctx->export->fullpath,
-			 op_ctx->export->export_id,
+			 op_ctx->ctx_export->fullpath,
+			 op_ctx->ctx_export->export_id,
 			 secinfo_fh_name);
 
-		/* Swap in the entry on the other side of the junction. */
-		if (entry_src)
-			cache_inode_put(entry_src);
+		/* Swap in the obj on the other side of the junction. */
+		obj_src->obj_ops.put_ref(obj_src);
 
-		entry_src = entry;
+		obj_src = obj;
 	} else {
-		/* Release attr_lock since it wasn't a junction. */
-		PTHREAD_RWLOCK_unlock(&entry_src->attr_lock);
+		/* Not a junction, release lock */
+		PTHREAD_RWLOCK_unlock(&obj_src->state_hdl->state_lock);
 	}
 
 	/* Get the number of entries */
@@ -204,11 +198,6 @@ int nfs4_op_secinfo(struct nfs_argop4 *op, compound_data_t *data,
 
 	res_SECINFO4->SECINFO4res_u.resok4.SECINFO4resok_val =
 	     gsh_calloc(num_entry, sizeof(secinfo4));
-
-	if (res_SECINFO4->SECINFO4res_u.resok4.SECINFO4resok_val == NULL) {
-		res_SECINFO4->status = NFS4ERR_SERVERFAULT;
-		goto out;
-	}
 
 	/**
 	 * @todo We have the opportunity to associate a preferred
@@ -271,9 +260,9 @@ int nfs4_op_secinfo(struct nfs_argop4 *op, compound_data_t *data,
 		data->currentFH.nfs_fh4_len = 0;
 
 		/* Release CurrentFH reference to export. */
-		if (op_ctx->export) {
-			put_gsh_export(op_ctx->export);
-			op_ctx->export = NULL;
+		if (op_ctx->ctx_export) {
+			put_gsh_export(op_ctx->ctx_export);
+			op_ctx->ctx_export = NULL;
 			op_ctx->fsal_export = NULL;
 		}
 
@@ -290,12 +279,12 @@ int nfs4_op_secinfo(struct nfs_argop4 *op, compound_data_t *data,
 
 	if (saved_gsh_export != NULL) {
 		/* Restore export stuff */
-		if (op_ctx->export)
-			put_gsh_export(op_ctx->export);
+		if (op_ctx->ctx_export)
+			put_gsh_export(op_ctx->ctx_export);
 
 		*op_ctx->export_perms = save_export_perms;
-		op_ctx->export = saved_gsh_export;
-		op_ctx->fsal_export = op_ctx->export->fsal_export;
+		op_ctx->ctx_export = saved_gsh_export;
+		op_ctx->fsal_export = op_ctx->ctx_export->fsal_export;
 
 		/* Restore creds */
 		if (nfs_req_creds(data->req) != NFS4_OK) {
@@ -304,8 +293,8 @@ int nfs4_op_secinfo(struct nfs_argop4 *op, compound_data_t *data,
 		}
 	}
 
-	if (entry_src != NULL)
-		cache_inode_put(entry_src);
+	if (obj_src)
+		obj_src->obj_ops.put_ref(obj_src);
 
 	if (secinfo_fh_name)
 		gsh_free(secinfo_fh_name);
@@ -330,5 +319,4 @@ void nfs4_op_secinfo_Free(nfs_resop4 *res)
 		gsh_free(resp->SECINFO4res_u.resok4.SECINFO4resok_val);
 		resp->SECINFO4res_u.resok4.SECINFO4resok_val = NULL;
 	}
-	return;
-}				/* nfs4_op_secinfo_Free */
+}

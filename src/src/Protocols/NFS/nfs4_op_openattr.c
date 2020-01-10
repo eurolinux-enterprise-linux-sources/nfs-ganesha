@@ -34,7 +34,6 @@
 #include "log.h"
 #include "nfs4.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_proto_functions.h"
 
 /**
@@ -74,5 +73,4 @@ int nfs4_op_openattr(struct nfs_argop4 *op, compound_data_t *data,
 void nfs4_op_openattr_Free(nfs_resop4 *resp)
 {
 	/* Nothing to be done */
-	return;
-}				/* nfs4_op_openattr_Free */
+}

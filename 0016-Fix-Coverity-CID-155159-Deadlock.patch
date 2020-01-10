@@ -1,0 +1,86 @@
+From 5f682efef9dd24ee0a8cb89411e9999f687c1dfa Mon Sep 17 00:00:00 2001
+From: Daniel Gryniewicz <dang@redhat.com>
+Date: Tue, 3 Jan 2017 11:36:20 -0500
+Subject: [PATCH 1/2] Fix Coverity CID 155159 - Deadlock
+
+The fix for always locking around mdcache_dirent_invalidate_all() was
+overzealous, and locked when the lock was already taken, triggering a
+coverity error.  Fix this error by backing out those extra locks.
+
+Change-Id: I92023e942e8f9ade894d57dac9c0d48dc351b5a8
+Signed-off-by: Daniel Gryniewicz <dang@redhat.com>
+---
+ src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_handle.c | 17 ++++++-----------
+ 1 file changed, 6 insertions(+), 11 deletions(-)
+
+diff --git a/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_handle.c b/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_handle.c
+index a9171b0..18b749d 100644
+--- a/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_handle.c
++++ b/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_handle.c
+@@ -1,7 +1,7 @@
+ /*
+  * vim:noexpandtab:shiftwidth=8:tabstop=8:
+  *
+- * Copyright 2015-2016 Red Hat, Inc. and/or its affiliates.
++ * Copyright 2015-2017 Red Hat, Inc. and/or its affiliates.
+  * Author: Daniel Gryniewicz <dang@redhat.com>
+  *
+  * This program is free software; you can redistribute it and/or
+@@ -826,9 +826,8 @@ static fsal_status_t mdcache_rename(struct fsal_obj_handle *obj_hdl,
+ 			LogDebug(COMPONENT_CACHE_INODE,
+ 				 "remove entry failed with status %s",
+ 				 fsal_err_txt(status));
+-			PTHREAD_RWLOCK_wrlock(&mdc_newdir->content_lock);
++			/* Protected by mdcache_src_dst_lock() above */
+ 			mdcache_dirent_invalidate_all(mdc_newdir);
+-			PTHREAD_RWLOCK_unlock(&mdc_newdir->content_lock);
+ 		}
+ 
+ 		/* Mark unreachable */
+@@ -849,9 +848,8 @@ static fsal_status_t mdcache_rename(struct fsal_obj_handle *obj_hdl,
+ 		if (FSAL_IS_ERROR(status)) {
+ 			/* We're obviously out of date.  Throw out the cached
+ 			   directory */
+-			PTHREAD_RWLOCK_wrlock(&mdc_newdir->content_lock);
++			/* Protected by mdcache_src_dst_lock() above */
+ 			mdcache_dirent_invalidate_all(mdc_newdir);
+-			PTHREAD_RWLOCK_unlock(&mdc_newdir->content_lock);
+ 		}
+ 	} else {
+ 		LogDebug(COMPONENT_CACHE_INODE,
+@@ -866,9 +864,8 @@ static fsal_status_t mdcache_rename(struct fsal_obj_handle *obj_hdl,
+ 			LogDebug(COMPONENT_CACHE_INODE,
+ 				 "Remove stale dirent returned %s",
+ 				 fsal_err_txt(status));
+-			PTHREAD_RWLOCK_wrlock(&mdc_newdir->content_lock);
++			/* Protected by mdcache_src_dst_lock() above */
+ 			mdcache_dirent_invalidate_all(mdc_newdir);
+-			PTHREAD_RWLOCK_unlock(&mdc_newdir->content_lock);
+ 		}
+ 
+ 		status = mdcache_dirent_add(mdc_newdir, new_name, mdc_obj);
+@@ -878,9 +875,8 @@ static fsal_status_t mdcache_rename(struct fsal_obj_handle *obj_hdl,
+ 			   directory */
+ 			LogCrit(COMPONENT_CACHE_INODE, "Add dirent returned %s",
+ 				fsal_err_txt(status));
+-			PTHREAD_RWLOCK_wrlock(&mdc_newdir->content_lock);
++			/* Protected by mdcache_src_dst_lock() above */
+ 			mdcache_dirent_invalidate_all(mdc_newdir);
+-			PTHREAD_RWLOCK_unlock(&mdc_newdir->content_lock);
+ 		}
+ 
+ 		/* Remove the old entry */
+@@ -889,9 +885,8 @@ static fsal_status_t mdcache_rename(struct fsal_obj_handle *obj_hdl,
+ 			LogDebug(COMPONENT_CACHE_INODE,
+ 				 "Remove old dirent returned %s",
+ 				 fsal_err_txt(status));
+-			PTHREAD_RWLOCK_wrlock(&mdc_olddir->content_lock);
++			/* Protected by mdcache_src_dst_lock() above */
+ 			mdcache_dirent_invalidate_all(mdc_olddir);
+-			PTHREAD_RWLOCK_unlock(&mdc_olddir->content_lock);
+ 		}
+ 	}
+ 
+-- 
+2.5.0
+

@@ -4,8 +4,8 @@
 # Copyright (C) 2014 Panasas Inc.
 #
 # This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
+# it under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
@@ -55,6 +55,11 @@ class ExportMgr(QtDBus.QDBusAbstractInterface):
 
     def AddExport(self, conf_path, exp_expr):
         async = self.asyncCall("AddExport", conf_path, exp_expr)
+        status = QtDBus.QDBusPendingCallWatcher(async, self)
+        status.finished.connect(self.exportadd_done)
+
+    def UpdateExport(self, conf_path, exp_expr):
+        async = self.asyncCall("UpdateExport", conf_path, exp_expr)
         status = QtDBus.QDBusPendingCallWatcher(async, self)
         status.finished.connect(self.exportadd_done)
 

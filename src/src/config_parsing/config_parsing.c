@@ -80,7 +80,7 @@ void config_Print(FILE * output, config_file_t config)
 	print_parse_tree(output, (struct config_root *)config);
 }
 
-/** 
+/**
  * config_Free:
  * Free the memory structure that store the configuration.
  */
@@ -127,7 +127,7 @@ char *err_type_str(struct config_error_type *err_type)
 		fputs("block init, ", fp);
 	if (err_type->fsal)
 		fputs("fsal load, ", fp);
-	if (err_type->export)
+	if (err_type->export_)
 		fputs("export create, ", fp);
 	if (err_type->resource)
 		fputs("resource alloc, ", fp);
@@ -588,13 +588,6 @@ static void convert_inet_addr(struct config_node *node,
 			 &hints, &res);
 	if (rc == 0) {
 		memcpy(sock, res->ai_addr, res->ai_addrlen);
-		if (res->ai_next != NULL) {
-			config_proc_error(node, err_type,
-					  "Multiple addresses for %s",
-					  node->u.term.varvalue);
-			err_type->invalid = true;
-			err_type->errors++;
-		}
 	} else {
 		config_proc_error(node, err_type,
 				  "No IP address found for %s because:%s",
@@ -732,8 +725,6 @@ static const char *config_type_str(enum config_type type)
 		return "CONFIG_LIST";
 	case CONFIG_ENUM:
 		return "CONFIG_ENUM";
-	case CONFIG_ENUM_SET:
-		return "CONFIG_ENUM_SET";
 	case CONFIG_TOKEN:
 		return "CONFIG_TOKEN";
 	case CONFIG_BOOL:
@@ -758,13 +749,13 @@ static bool do_block_init(struct config_node *blk_node,
 			  struct config_error_type *err_type)
 {
 	struct config_item *item;
-	caddr_t *param_addr;
+	void *param_addr;
 	sockaddr_t *sock;
 	int rc;
 	int errors = 0;
 
 	for (item = params; item->name != NULL; item++) {
-		param_addr = (caddr_t *)((uint64_t)param_struct + item->off);
+		param_addr = ((char *)param_struct + item->off);
 		LogFullDebug(COMPONENT_CONFIG,
 			     "%p name=%s type=%s",
 			     param_addr, item->name, config_type_str(item->type));
@@ -832,16 +823,6 @@ static bool do_block_init(struct config_node *blk_node,
 			*(uint32_t *)param_addr |= item->u.lst.def;
 			LogFullDebug(COMPONENT_CONFIG,
 				     "%p CONFIG_ENUM %s mask=%08x def=%08x"
-				     " value=%08"PRIx32,
-				     param_addr,
-				     item->name,
-				     item->u.lst.mask, item->u.lst.def,
-				     *(uint32_t *)param_addr);
-			break;
-		case CONFIG_ENUM_SET:
-			*(uint32_t *)param_addr |= item->u.lst.def;
-			LogFullDebug(COMPONENT_CONFIG,
-				     "%p CONFIG_ENUM_SET %s mask=%08x def=%08x"
 				     " value=%08"PRIx32,
 				     param_addr,
 				     item->name,
@@ -970,7 +951,7 @@ static int do_block_load(struct config_node *blk,
 			 struct config_error_type *err_type)
 {
 	struct config_item *item;
-	caddr_t *param_addr;
+	void *param_addr;
 	struct config_node *node, *term_node, *next_node = NULL;
 	struct glist_head *ns;
 	int errors = 0;
@@ -1002,8 +983,7 @@ static int do_block_load(struct config_node *blk,
 				node = next_node;
 				continue;
 			}
-			param_addr = (caddr_t *)((uint64_t)param_struct
-						 + item->off);
+			param_addr = ((char *)param_struct + item->off);
 			LogFullDebug(COMPONENT_CONFIG,
 				     "%p name=%s type=%s",
 				     param_addr, item->name,
@@ -1051,10 +1031,10 @@ static int do_block_load(struct config_node *blk,
 						   &num64, err_type)) {
 					*(int32_t *)param_addr = num64;
 					if (item->flags & CONFIG_MARK_SET) {
-						caddr_t *mask_addr;
+						void *mask_addr;
 
-						mask_addr = (caddr_t *)
-							((uint64_t)param_struct
+						mask_addr =
+							((char *)param_struct
 							 + item->u.i32.set_off);
 						*(uint32_t *)mask_addr
 							|= item->u.i32.bit;
@@ -1081,10 +1061,10 @@ static int do_block_load(struct config_node *blk,
 						   &num64, err_type)) {
 					*(uid_t *)param_addr = num64;
 					if (item->flags & CONFIG_MARK_SET) {
-						caddr_t *mask_addr;
+						void *mask_addr;
 
-						mask_addr = (caddr_t *)
-							((uint64_t)param_struct
+						mask_addr =
+							((char *)param_struct
 							 + item->u.i64.set_off);
 						*(uint32_t *)mask_addr
 							|= item->u.i64.bit;
@@ -1095,9 +1075,10 @@ static int do_block_load(struct config_node *blk,
 				if (convert_fsid(term_node, param_addr,
 						 err_type)) {
 					if (item->flags & CONFIG_MARK_SET) {
-						caddr_t *mask_addr;
-						mask_addr = (caddr_t *)
-							((uint64_t)param_struct
+						void *mask_addr;
+
+						mask_addr =
+							((char *)param_struct
 							+ item->u.fsid.set_off);
 						*(uint32_t *)mask_addr
 							|= item->u.fsid.bit;
@@ -1137,9 +1118,10 @@ static int do_block_load(struct config_node *blk,
 						*(uint32_t *)param_addr
 							&= ~item->u.bit.bit;
 					if (item->flags & CONFIG_MARK_SET) {
-						caddr_t *mask_addr;
-						mask_addr = (caddr_t *)
-							((uint64_t)param_struct
+						void *mask_addr;
+
+						mask_addr =
+							((char *)param_struct
 							+ item->u.bit.set_off);
 						*(uint32_t *)mask_addr
 							|= item->u.bit.bit;
@@ -1155,9 +1137,10 @@ static int do_block_load(struct config_node *blk,
 						 err_type)) {
 					*(uint32_t *)param_addr |= num32;
 					if (item->flags & CONFIG_MARK_SET) {
-						caddr_t *mask_addr;
-						mask_addr = (caddr_t *)
-							((uint64_t)param_struct
+						void *mask_addr;
+
+						mask_addr =
+							((char *)param_struct
 							+ item->u.lst.set_off);
 						*(uint32_t *)mask_addr
 							|= item->u.lst.mask;
@@ -1180,9 +1163,10 @@ static int do_block_load(struct config_node *blk,
 						 err_type)) {
 					*(uint32_t *)param_addr |= num32;
 					if (item->flags & CONFIG_MARK_SET) {
-						caddr_t *mask_addr;
-						mask_addr = (caddr_t *)
-							((uint64_t)param_struct
+						void *mask_addr;
+
+						mask_addr =
+							((char *)param_struct
 							+ item->u.lst.set_off);
 						*(uint32_t *)mask_addr
 							|= item->u.lst.mask;
@@ -1190,30 +1174,6 @@ static int do_block_load(struct config_node *blk,
 				}
 				LogFullDebug(COMPONENT_CONFIG,
 					     "%p CONFIG_ENUM %s mask=%08x flags=%08x"
-					     " value=%08"PRIx32,
-					     param_addr,
-					     item->name,
-					     item->u.lst.mask, num32,
-					     *(uint32_t *)param_addr);
-			case CONFIG_ENUM_SET:
-				if (item->u.lst.def ==
-				   (*(uint32_t *)param_addr & item->u.lst.mask))
-					*(uint32_t *)param_addr &=
-							~item->u.lst.mask;
-				if (convert_enum(term_node, item, &num32,
-						 err_type)) {
-					*(uint32_t *)param_addr |= num32;
-					if (item->flags & CONFIG_MARK_SET) {
-						caddr_t *mask_addr;
-						mask_addr = (caddr_t *)
-							((uint64_t)param_struct
-							+ item->u.lst.set_off);
-						*(uint32_t *)mask_addr
-							|= item->u.lst.bit;
-					}	
-				}
-				LogFullDebug(COMPONENT_CONFIG,
-					     "%p CONFIG_ENUM_SET %s mask=%08x flags=%08x"
 					     " value=%08"PRIx32,
 					     param_addr,
 					     item->name,
@@ -1384,6 +1344,16 @@ static bool proc_block(struct config_node *node,
 	}
 	if (item->u.blk.display != NULL)
 		item->u.blk.display("RESULT", node, link_mem, param_struct);
+
+	if (err_type->dispose) {
+		/* We had a config update case where this block must be
+		 * disposed of. Need to clear the flag so the next config
+		 * block processed gets a clear slate.
+		 */
+		(void)item->u.blk.init(link_mem, param_struct);
+		err_type->dispose = false;
+	}
+
 	return true;
 
 err_out:
@@ -1561,8 +1531,6 @@ static char *parse_args(char *arg_str, struct expr_parse_arg **argp)
 	saved_char = *sp;
 	*sp = '\0';
 	arg = gsh_calloc(1, sizeof(struct expr_parse_arg));
-	if (arg == NULL)
-		return NULL;
 	arg->name = gsh_strdup(name);
 	arg->value = gsh_strdup(val);
 	*argp = arg;

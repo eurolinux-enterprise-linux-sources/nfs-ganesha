@@ -24,6 +24,7 @@
  */
 
 #include "multilock.h"
+#include "assert.h"
 
 struct command_def commands[NUM_COMMANDS + 1] = {
 	{"OPEN", 4},
@@ -41,12 +42,13 @@ struct command_def commands[NUM_COMMANDS + 1] = {
 	{"COMMENT", 7},
 	{"ALARM", 5},
 	{"HELLO", 5},
+	{"FORK", 4},
 	{"QUIT", 4},
 	{"UNKNOWN", 0},
 };
 
-char errdetail[MAXSTR * 2];
-char badtoken[MAXSTR];
+char errdetail[MAXSTR * 2 + 1];
+char badtoken[MAXSTR + 1];
 struct client *client_list;
 FILE *input;
 FILE *output;
@@ -120,20 +122,20 @@ struct token open_flags[] = {
 	{"", 0, 0}
 };
 
-int sprintf_open_flags(char *line, int flags)
+void sprintf_open_flags(char **rest, int *left, int flags)
 {
-	char *rest = line;
 	int i;
 	int ex_flags = 0;
 
 	for (i = 0; open_flags[i].t_len != 0; i++) {
-		if ((ex_flags & open_flags[i].t_value) == 0
-		    && (flags & open_flags[i].t_value) == open_flags[i].t_value)
-			rest += sprintf(rest, " %s", open_flags[i].t_name);
+		if ((ex_flags & open_flags[i].t_value) == 0 &&
+		    (flags & open_flags[i].t_value) == open_flags[i].t_value) {
+			/* Append open flag to line */
+			sprint_left(*rest, *left, " %s", open_flags[i].t_name);
+		}
+
 		ex_flags |= open_flags[i].t_value;
 	}
-
-	return rest - line;
 }
 
 struct token lock_modes[] = {
@@ -141,6 +143,19 @@ struct token lock_modes[] = {
 	{"OFD", 3, LOCK_MODE_OFD},
 	{"", 0, 0}
 };
+
+void sprintf_lock_modes(char **rest, int *left, int mode)
+{
+	int i;
+
+	for (i = 0; lock_modes[i].t_len != 0; i++) {
+		if (mode == lock_modes[i].t_value) {
+			/* Append lock mode to line */
+			sprint_left(*rest, *left, " %s", lock_modes[i].t_name);
+			break;
+		}
+	}
+}
 
 const char *str_lock_mode(int lock_mode)
 {
@@ -157,6 +172,7 @@ const char *str_lock_mode(int lock_mode)
 int readln(FILE *in, char *buf, int buflen)
 {
 	int len;
+
 	if (fgets(buf, buflen, in) != NULL) {
 		len = strlen(buf);
 		if (buf[len - 1] == '\n')
@@ -178,13 +194,15 @@ char *SkipWhite(char *line, enum requires_more requires_more, const char *who)
 	switch (requires_more) {
 	case REQUIRES_MORE:
 		if (*c == '\0' || *c == '#') {
-			sprintf(errdetail,
-				"Expected more characters on command (%s)",
-				who);
+			array_sprintf(errdetail,
+				      "Expected more characters on command %s",
+				      who);
+
 			if (*c == '\0')
-				strcpy(badtoken, "<NULL>");
+				array_strcpy(badtoken, "<NULL>");
 			else
-				strcpy(badtoken, c);
+				array_strcpy(badtoken, c);
+
 			errno = EINVAL;
 			return NULL;
 		}
@@ -192,9 +210,10 @@ char *SkipWhite(char *line, enum requires_more requires_more, const char *who)
 
 	case REQUIRES_NO_MORE:
 		if (*c != '\0' && *c != '#') {
-			sprintf(errdetail, "Extra characters on command (%s)",
-				who);
-			strcpy(badtoken, c);
+			array_sprintf(errdetail,
+				      "Extra characters on command %s",
+				      who);
+			array_strcpy(badtoken, c);
 			errno = EINVAL;
 			return NULL;
 		}
@@ -253,8 +272,10 @@ char *get_token_value(char *line, int *value, struct token *tokens,
 
 	if (optional && t == NULL) {
 		tok = tokens;
+
 		while (tok->t_len != 0)
 			tok++;
+
 		*value = tok->t_value;
 		return c;
 	}
@@ -262,6 +283,7 @@ char *get_token_value(char *line, int *value, struct token *tokens,
 	for (tok = tokens; tok->t_len != 0; tok++) {
 		if (tok->t_len != len)
 			continue;
+
 		if (strncasecmp(t, tok->t_name, len) == 0) {
 			*value = tok->t_value;
 			return SkipWhite(c, requires_more, invalid);
@@ -276,9 +298,8 @@ char *get_token_value(char *line, int *value, struct token *tokens,
 		return t;
 	}
 
-	strcpy(errdetail, invalid);
-	strncpy(badtoken, t, len);
-	badtoken[len] = '\0';
+	array_strcpy(errdetail, invalid);
+	array_strncpy(badtoken, t, len);
 	errno = EINVAL;
 	return NULL;
 }
@@ -299,6 +320,7 @@ char *get_client(char *line, struct client **pclient, bool create,
 	for (client = client_list; client != NULL; client = client->c_next) {
 		if (strlen(client->c_name) != len)
 			continue;
+
 		if (strncmp(t, client->c_name, len) == 0)
 			break;
 	}
@@ -307,30 +329,33 @@ char *get_client(char *line, struct client **pclient, bool create,
 
 	if (client == NULL) {
 		if (create) {
-			client = malloc(sizeof(*client));
+			client = calloc(1, sizeof(*client));
+
 			if (client == NULL) {
-				strcpy(errdetail, "Could not create client");
+				array_strcpy(errdetail,
+					     "Could not create client");
 				errno = ENOMEM;
-				strncpy(badtoken, t, len);
-				badtoken[len] = '\0';
+				array_strncpy(badtoken, t, len);
 				return NULL;
 			}
-			memset(client, 0, sizeof(*client));
-			memcpy(client->c_name, t, len);
-			client->c_name[len] = '\0';
+
+			array_strncpy(client->c_name, t, len);
+
 			*pclient = client;
+
 			c = SkipWhite(c, requires_more, "get_client");
+
 			if (c == NULL)
 				free(client);
 			else if (!quiet && !syntax)
 				fprintf(output, "Created temp client %s\n",
 					client->c_name);
+
 			return c;
 		} else {
-			strcpy(errdetail, "Could not find client");
+			array_strcpy(errdetail, "Could not find client");
 			errno = ENOENT;
-			strncpy(badtoken, t, len);
-			badtoken[len] = '\0';
+			array_strncpy(badtoken, t, len);
 			return NULL;
 		}
 	}
@@ -358,6 +383,7 @@ char *get_command(char *line, enum commands *cmd)
 		    && strncasecmp(t, commands[i].cmd_name,
 				   commands[i].cmd_len) == 0) {
 			*cmd = i;
+
 			if (i == CMD_QUIT)
 				return SkipWhite(c, REQUIRES_EITHER, "");
 			else
@@ -366,10 +392,12 @@ char *get_command(char *line, enum commands *cmd)
 		}
 	}
 
-	strcpy(errdetail, "Invalid command 3");
-	strcpy(badtoken, line);
+	array_strcpy(errdetail, "Invalid command 3");
+	array_strcpy(badtoken, line);
 	return NULL;
 }
+
+
 
 char *get_long(char *line, long int *value, enum requires_more requires_more,
 	       const char *invalid)
@@ -389,9 +417,8 @@ char *get_long(char *line, long int *value, enum requires_more requires_more,
 	else {
 		*value = strtol(t, &e, 0);
 		if (e != NULL && e != c) {
-			strcpy(errdetail, invalid);
-			strncpy(badtoken, t, len);
-			badtoken[len] = '\0';
+			array_strcpy(errdetail, invalid);
+			array_strncpy(badtoken, t, len);
 			errno = EINVAL;
 			return NULL;
 		}
@@ -417,10 +444,10 @@ char *get_longlong(char *line, long long int *value,
 		*value = -1;
 	else {
 		*value = strtoll(t, &e, 0);
+
 		if (e != NULL && e != c) {
-			strcpy(errdetail, invalid);
-			strncpy(badtoken, t, len);
-			badtoken[len] = '\0';
+			array_strcpy(errdetail, invalid);
+			array_strncpy(badtoken, t, len);
 			errno = EINVAL;
 			return NULL;
 		}
@@ -439,6 +466,7 @@ char *get_on_off(char *line, bool *value)
 {
 	int tvalue;
 	char *rest;
+
 	rest = get_token_value(line, &tvalue, on_off, true, REQUIRES_NO_MORE,
 			       "Invalid on/off");
 	*value = (bool) tvalue;
@@ -455,8 +483,8 @@ char *get_fpos(char *line, long int *fpos, enum requires_more requires_more)
 		return c;
 
 	if (*fpos < 0 || *fpos > MAXFPOS) {
-		strcpy(errdetail, "Invalid fpos");
-		sprintf(badtoken, "%ld", *fpos);
+		array_strcpy(errdetail, "Invalid fpos");
+		array_sprintf(badtoken, "%ld", *fpos);
 		errno = EINVAL;
 		return NULL;
 	}
@@ -464,22 +492,26 @@ char *get_fpos(char *line, long int *fpos, enum requires_more requires_more)
 	return c;
 }
 
-char *get_str(char *line, char *str, long long int *len,
-	      enum requires_more requires_more)
+char *get_rdata(char *line, struct response *resp, int max,
+		enum requires_more requires_more)
 {
 	char *c = line;
 	char *t;
 	int quoted;
+	int len;
 
-	c = SkipWhite(c, REQUIRES_MORE, "get_str 1");
+	assert(max < sizeof(resp->r_data));
+
+	c = SkipWhite(c, REQUIRES_MORE, "get_rdata 1");
+
 	if (c == NULL)
 		return c;
 
 	if (*c != '"') {
 		if (requires_more != REQUIRES_NO_MORE) {
 			errno = EINVAL;
-			strcpy(errdetail, "Expected string");
-			strcpy(badtoken, c);
+			array_strcpy(errdetail, "Expected string");
+			array_strcpy(badtoken, c);
 			return NULL;
 		}
 		quoted = false;
@@ -499,15 +531,26 @@ char *get_str(char *line, char *str, long long int *len,
 
 	if (quoted && *c == '\0') {
 		errno = EINVAL;
-		strcpy(errdetail, "Unterminated string");
-		strcpy(badtoken, t - 1);
+		array_strcpy(errdetail, "Unterminated string");
+		array_strcpy(badtoken, t - 1);
 		return NULL;
 	}
-	*len = c - t;
-	memcpy(str, t, *len);
+
+	len = c - t;
+
+	if (len > max) {
+		errno = EINVAL;
+		array_sprintf(errdetail, "String length %d longer than %d",
+			      len, max);
+		array_strcpy(badtoken, t - 1);
+		return NULL;
+	}
+
+	resp->r_length = len;
+	array_strncpy(resp->r_data, t, len);
 	c++;
 
-	return SkipWhite(c, requires_more, "get_str 2");
+	return SkipWhite(c, requires_more, "get_rdata 2");
 }
 
 char *get_open_opts(char *line, long int *fpos, int *flags, int *mode,
@@ -535,8 +578,10 @@ char *get_open_opts(char *line, long int *fpos, int *flags, int *mode,
 	while (flag2 != 0) {
 		c = get_token_value(c, &flag2, open_flags, true, REQUIRES_MORE,
 				    "Invalid optional open flag");
+
 		if (c == NULL)
 			return c;
+
 		*flags |= flag2;
 	}
 
@@ -577,6 +622,7 @@ const char *str_status(enum status status)
 	case STATUS_ERROR:
 		return "ERROR";
 	}
+
 	return "unknown";
 }
 
@@ -585,8 +631,8 @@ char *get_status(char *line, struct response *resp)
 	enum status stat;
 	char *t;
 	int len;
-	char *c =
-	    get_token(line, &t, &len, false, REQUIRES_EITHER, "Invalid status");
+	char *c = get_token(line, &t, &len, false, REQUIRES_EITHER,
+			    "Invalid status");
 
 	if (c == NULL)
 		return c;
@@ -610,9 +656,8 @@ char *get_status(char *line, struct response *resp)
 		}
 	}
 
-	strcpy(errdetail, "Invalid status");
-	strncpy(badtoken, t, len);
-	badtoken[len] = '\0';
+	array_strcpy(errdetail, "Invalid status");
+	array_strncpy(badtoken, t, len);
 	errno = EINVAL;
 	return NULL;
 }
@@ -666,6 +711,7 @@ const char *str_lock_type(int type)
 	case F_UNLCK:
 		return "unlock";
 	}
+
 	return "unknown";
 }
 
@@ -713,9 +759,11 @@ char *get_rq_tag(char *line, struct response *req, int required,
 	return line;
 }
 
-void sprintf_resp(char *line, const char *lead, struct response *resp)
+void sprintf_resp(char *line, int size, const char *lead,
+		  struct response *resp)
 {
 	char *rest = line;
+	int left = size - 1; /* Leave room for terminating NUL */
 
 	if (lead != NULL) {
 		const char *name = "<NULL>";
@@ -723,20 +771,19 @@ void sprintf_resp(char *line, const char *lead, struct response *resp)
 		if (resp->r_client != NULL)
 			name = resp->r_client->c_name;
 
-		rest = rest + sprintf(line, "%s %s ", lead, name);
+		sprint_left(rest, left, "%s %s ", lead, name);
 	}
 
-	rest =
-	    rest + sprintf(rest, "%ld %s %s", resp->r_tag,
-			   commands[resp->r_cmd].cmd_name,
-			   str_status(resp->r_status));
+	sprint_left(rest, left, "%ld %s %s", resp->r_tag,
+		    commands[resp->r_cmd].cmd_name, str_status(resp->r_status));
 
 	switch (resp->r_status) {
 	case STATUS_OK:
 		switch (resp->r_cmd) {
 		case CMD_COMMENT:
 		case CMD_HELLO:
-			sprintf(rest, " \"%s\"\n", resp->r_data);
+		case CMD_FORK:
+			sprint_left(rest, left, " \"%s\"\n", resp->r_data);
 			break;
 
 		case CMD_LOCKW:
@@ -747,34 +794,35 @@ void sprintf_resp(char *line, const char *lead, struct response *resp)
 		case CMD_HOP:
 		case CMD_UNHOP:
 		case NUM_COMMANDS:
-			sprintf(rest, " Unexpected Status\n");
+			sprint_left(rest, left, " Unexpected Status\n");
 			break;
 
 		case CMD_ALARM:
-			sprintf(rest, " %ld\n", resp->r_secs);
+			sprint_left(rest, left, " %ld\n", resp->r_secs);
 			break;
 
 		case CMD_QUIT:
-			sprintf(rest, "\n");
+			sprint_left(rest, left, "\n");
 			break;
 
 		case CMD_OPEN:
-			sprintf(rest, " %ld %ld\n", resp->r_fpos, resp->r_fno);
+			sprint_left(rest, left, " %ld %ld\n",
+				    resp->r_fpos, resp->r_fno);
 			break;
 
 		case CMD_CLOSE:
 		case CMD_SEEK:
-			sprintf(rest, " %ld\n", resp->r_fpos);
+			sprint_left(rest, left, " %ld\n", resp->r_fpos);
 			break;
 
 		case CMD_WRITE:
-			sprintf(rest, " %ld %lld\n", resp->r_fpos,
-				resp->r_length);
+			sprint_left(rest, left, " %ld %lld\n", resp->r_fpos,
+				    resp->r_length);
 			break;
 
 		case CMD_READ:
-			sprintf(rest, " %ld %lld \"%s\"\n", resp->r_fpos,
-				resp->r_length, resp->r_data);
+			sprint_left(rest, left, " %ld %lld \"%s\"\n",
+				    resp->r_fpos, resp->r_length, resp->r_data);
 			break;
 		}
 		break;
@@ -783,44 +831,51 @@ void sprintf_resp(char *line, const char *lead, struct response *resp)
 	case STATUS_GRANTED:
 	case STATUS_DENIED:
 	case STATUS_DEADLOCK:
-		if (resp->r_cmd == CMD_LIST)
-			sprintf(rest, " %ld %lld %lld\n", resp->r_fpos,
-				resp->r_start, resp->r_length);
-		else
-			sprintf(rest, " %ld %s %lld %lld\n", resp->r_fpos,
-				str_lock_type(resp->r_lock_type), resp->r_start,
-				resp->r_length);
+		if (resp->r_cmd == CMD_LIST) {
+			sprint_left(rest, left, " %ld %lld %lld\n",
+				    resp->r_fpos, resp->r_start,
+				    resp->r_length);
+		} else {
+			sprint_left(rest, left, " %ld %s %lld %lld\n",
+				    resp->r_fpos,
+				    str_lock_type(resp->r_lock_type),
+				    resp->r_start,
+				    resp->r_length);
+		}
 		break;
 
 	case STATUS_CONFLICT:
-		sprintf(rest, " %ld %ld %s %lld %lld\n", resp->r_fpos,
-			resp->r_pid, str_lock_type(resp->r_lock_type),
-			resp->r_start, resp->r_length);
+		sprint_left(rest, left, " %ld %ld %s %lld %lld\n", resp->r_fpos,
+			    resp->r_pid, str_lock_type(resp->r_lock_type),
+			    resp->r_start, resp->r_length);
 		break;
 
 	case STATUS_CANCELED:
 		if (resp->r_cmd == CMD_LOCKW) {
-			sprintf(rest, " %ld %s %lld %lld\n", resp->r_fpos,
-				str_lock_type(resp->r_lock_type), resp->r_start,
-				resp->r_length);
+			sprint_left(rest, left, " %ld %s %lld %lld\n",
+				    resp->r_fpos,
+				    str_lock_type(resp->r_lock_type),
+				    resp->r_start,
+				    resp->r_length);
 		} else if (resp->r_cmd == CMD_ALARM) {
-			sprintf(rest, " %ld\n", resp->r_secs);
-		} else {
+			sprint_left(rest, left, " %ld\n", resp->r_secs);
 		}
 		break;
 
 	case STATUS_COMPLETED:
-		sprintf(rest, "\n");
+		sprint_left(rest, left, "\n");
 		break;
 
 	case STATUS_ERRNO:
-		if (errno == 0)
-			sprintf(rest, " %ld \"%s\"\n", resp->r_errno,
-				errdetail);
-		else
-			sprintf(rest, " %ld \"%s\" \"%s\" bad token \"%s\"\n",
-				resp->r_errno, strerror(resp->r_errno),
-				errdetail, badtoken);
+		if (errno == 0) {
+			sprint_left(rest, left, " %ld \"%s\"\n", resp->r_errno,
+				    errdetail);
+		} else {
+			sprint_left(rest, left,
+				    " %ld \"%s\" \"%s\" bad token \"%s\"\n",
+				    resp->r_errno, strerror(resp->r_errno),
+				    errdetail, badtoken);
+		}
 		break;
 
 	case STATUS_PARSE_ERROR:
@@ -829,13 +884,16 @@ void sprintf_resp(char *line, const char *lead, struct response *resp)
 	case STATUS_ERROR:
 		break;
 	}
+
+	/* Make sure we are NUL terminated even if we used the last byte. */
+	*rest = '\0';
 }
 
 void respond(struct response *resp)
 {
-	char line[MAXSTR * 2];
+	char line[MAXXFER];
 
-	sprintf_resp(line, NULL, resp);
+	sprintf_resp(line, sizeof(line), NULL, resp);
 
 	if (output != stdout) {
 		fputs(line, output);
@@ -851,10 +909,10 @@ void respond(struct response *resp)
 char *parse_response(char *line, struct response *resp)
 {
 	char *rest;
-	long long int dummy_len;
+	long long int verify_len;
 
-	if (resp->r_original == '\0')
-		strcpy(resp->r_original, line);
+	if (resp->r_original[0] == '\0')
+		array_strcpy(resp->r_original, line);
 
 	resp->r_cmd = NUM_COMMANDS;
 	resp->r_tag = -1;
@@ -879,9 +937,8 @@ char *parse_response(char *line, struct response *resp)
 		switch (resp->r_cmd) {
 		case CMD_COMMENT:
 		case CMD_HELLO:
-			rest =
-			    get_str(rest, resp->r_data, &resp->r_length,
-				    REQUIRES_NO_MORE);
+		case CMD_FORK:
+			rest = get_rdata(rest, resp, MAXSTR, REQUIRES_NO_MORE);
 			break;
 
 		case CMD_LOCKW:
@@ -892,9 +949,10 @@ char *parse_response(char *line, struct response *resp)
 		case CMD_HOP:
 		case CMD_UNHOP:
 		case NUM_COMMANDS:
-			strcpy(errdetail, "Unexpected Status");
+			array_strcpy(errdetail, "Unexpected Status");
 			errno = EINVAL;
-			sprintf(badtoken, "%s", str_status(resp->r_status));
+			array_sprintf(badtoken, "%s",
+				      str_status(resp->r_status));
 			goto fail;
 
 		case CMD_ALARM:
@@ -906,11 +964,12 @@ char *parse_response(char *line, struct response *resp)
 
 		case CMD_OPEN:
 			rest = get_fpos(rest, &resp->r_fpos, REQUIRES_MORE);
+
 			if (rest == NULL)
 				goto fail;
-			rest =
-			    get_long(rest, &resp->r_fno, REQUIRES_NO_MORE,
-				     "Invalid file number");
+
+			rest = get_long(rest, &resp->r_fno, REQUIRES_NO_MORE,
+					"Invalid file number");
 			break;
 
 		case CMD_CLOSE:
@@ -920,30 +979,36 @@ char *parse_response(char *line, struct response *resp)
 
 		case CMD_WRITE:
 			rest = get_fpos(rest, &resp->r_fpos, REQUIRES_MORE);
+
 			if (rest == NULL)
 				goto fail;
-			rest =
-			    get_longlong(rest, &resp->r_length,
-					 REQUIRES_NO_MORE, "Invalid length");
+
+			rest = get_longlong(rest, &resp->r_length,
+					    REQUIRES_NO_MORE, "Invalid length");
 			break;
 
 		case CMD_READ:
 			rest = get_fpos(rest, &resp->r_fpos, REQUIRES_MORE);
+
 			if (rest == NULL)
 				goto fail;
-			rest =
-			    get_longlong(rest, &resp->r_length, REQUIRES_MORE,
-					 "Invalid length");
+
+			rest = get_longlong(rest, &resp->r_length,
+					    REQUIRES_MORE, "Invalid length");
+
 			if (rest == NULL)
 				goto fail;
-			rest =
-			    get_str(rest, resp->r_data, &dummy_len,
-				    REQUIRES_NO_MORE);
-			if (dummy_len != resp->r_length) {
-				strcpy(errdetail, "Read length doesn't match");
+
+			verify_len = resp->r_length;
+
+			rest = get_rdata(rest, resp, MAXSTR, REQUIRES_NO_MORE);
+
+			if (verify_len != resp->r_length) {
+				array_strcpy(errdetail,
+					     "Read length doesn't match");
 				errno = EINVAL;
-				sprintf(badtoken, "%lld != %lld", dummy_len,
-					resp->r_length);
+				array_sprintf(badtoken, "%lld != %lld",
+					      verify_len, resp->r_length);
 				goto fail;
 			}
 			break;
@@ -955,67 +1020,76 @@ char *parse_response(char *line, struct response *resp)
 	case STATUS_DENIED:
 	case STATUS_DEADLOCK:
 		rest = get_fpos(rest, &resp->r_fpos, REQUIRES_MORE);
+
 		if (rest == NULL)
 			goto fail;
+
 		if (resp->r_cmd != CMD_LIST) {
 			rest = get_lock_type(rest, &resp->r_lock_type);
 			if (rest == NULL)
 				goto fail;
 		}
-		rest =
-		    get_longlong(rest, &resp->r_start, REQUIRES_MORE,
-				 "Invalid lock start");
+
+		rest = get_longlong(rest, &resp->r_start, REQUIRES_MORE,
+				    "Invalid lock start");
 		if (rest == NULL)
 			goto fail;
-		rest =
-		    get_longlong(rest, &resp->r_length, REQUIRES_NO_MORE,
-				 "Invalid lock length");
+
+		rest = get_longlong(rest, &resp->r_length, REQUIRES_NO_MORE,
+				    "Invalid lock length");
 		break;
 
 	case STATUS_CONFLICT:
 		rest = get_fpos(rest, &resp->r_fpos, REQUIRES_MORE);
+
 		if (rest == NULL)
 			goto fail;
-		rest =
-		    get_long(rest, &resp->r_pid, REQUIRES_MORE,
-			     "Invalid conflict pid");
+
+		rest = get_long(rest, &resp->r_pid, REQUIRES_MORE,
+				"Invalid conflict pid");
+
 		if (rest == NULL)
 			goto fail;
+
 		rest = get_lock_type(rest, &resp->r_lock_type);
+
 		if (rest == NULL)
 			goto fail;
-		rest =
-		    get_longlong(rest, &resp->r_start, REQUIRES_MORE,
-				 "Invalid lock start");
+
+		rest = get_longlong(rest, &resp->r_start, REQUIRES_MORE,
+				    "Invalid lock start");
+
 		if (rest == NULL)
 			goto fail;
-		rest =
-		    get_longlong(rest, &resp->r_length, REQUIRES_NO_MORE,
-				 "Invalid lock length");
+
+		rest = get_longlong(rest, &resp->r_length, REQUIRES_NO_MORE,
+				    "Invalid lock length");
 		break;
 
 	case STATUS_CANCELED:
 		if (resp->r_cmd == CMD_LOCKW) {
 			rest = get_fpos(rest, &resp->r_fpos, REQUIRES_MORE);
+
 			if (rest == NULL)
 				goto fail;
+
 			rest = get_lock_type(rest, &resp->r_lock_type);
+
 			if (rest == NULL)
 				goto fail;
-			rest =
-			    get_longlong(rest, &resp->r_start, REQUIRES_MORE,
-					 "Invalid lock start");
+
+			rest = get_longlong(rest, &resp->r_start, REQUIRES_MORE,
+					    "Invalid lock start");
+
 			if (rest == NULL)
 				goto fail;
-			rest =
-			    get_longlong(rest, &resp->r_length,
-					 REQUIRES_NO_MORE,
-					 "Invalid lock length");
+
+			rest = get_longlong(rest, &resp->r_length,
+					    REQUIRES_NO_MORE,
+					    "Invalid lock length");
 		} else if (resp->r_cmd == CMD_ALARM) {
-			rest =
-			    get_long(rest, &resp->r_secs, REQUIRES_NO_MORE,
-				     "Invalid alarm time");
-		} else {
+			rest = get_long(rest, &resp->r_secs, REQUIRES_NO_MORE,
+					"Invalid alarm time");
 		}
 		break;
 
@@ -1023,12 +1097,13 @@ char *parse_response(char *line, struct response *resp)
 		break;
 
 	case STATUS_ERRNO:
-		rest =
-		    get_long(rest, &resp->r_errno, REQUIRES_MORE,
-			     "Invalid errno");
+		rest = get_long(rest, &resp->r_errno, REQUIRES_MORE,
+				"Invalid errno");
+
 		if (rest == NULL)
 			goto fail;
-		strncpy(resp->r_data, rest, MAXSTR);
+
+		array_strcpy(resp->r_data, rest);
 		rest += strlen(rest);
 		break;
 
@@ -1044,9 +1119,10 @@ char *parse_response(char *line, struct response *resp)
 
  fail:
 	resp->r_status = STATUS_PARSE_ERROR;
-	sprintf(resp->r_data, "%s %ld ERRNO %d \"%s\" \"%s\" bad token \"%s\"",
-		commands[resp->r_cmd].cmd_name, resp->r_tag, errno,
-		strerror(errno), errdetail, badtoken);
+	array_sprintf(resp->r_data,
+		      "%s %ld ERRNO %d \"%s\" \"%s\" bad token \"%s\"",
+		      commands[resp->r_cmd].cmd_name, resp->r_tag, errno,
+		      strerror(errno), errdetail, badtoken);
 	resp->r_cmd = NUM_COMMANDS;
 	return NULL;
 }
@@ -1055,8 +1131,9 @@ char *parse_response(char *line, struct response *resp)
 	do {								\
 		if (expected != -1 &&					\
 		    expected != received) {				\
-			sprintf(errdetail, "Unexpected lock type %s",	\
-				lock_types[received].t_name);		\
+			array_sprintf(errdetail,			\
+				      "Unexpected lock type %s",	\
+				      lock_types[received].t_name);	\
 			return false;					\
 		}							\
 	} while (0)
@@ -1065,7 +1142,7 @@ char *parse_response(char *line, struct response *resp)
 	do {								\
 		if (expected != -1 &&					\
 		    expected != received) {				\
-			sprintf(errdetail, fmt " %ld", received);	\
+			array_sprintf(errdetail, fmt " %ld", received);	\
 			return false;					\
 		}							\
 	} while (0)
@@ -1074,7 +1151,8 @@ char *parse_response(char *line, struct response *resp)
 	do {								\
 		if (expected != -1 &&					\
 		    expected != received) {				\
-			sprintf(errdetail, fmt " %lld", received);	\
+			array_sprintf(errdetail, fmt " %lld",		\
+				      received);			\
 			return false;					\
 		}							\
 	} while (0)
@@ -1083,7 +1161,7 @@ char *parse_response(char *line, struct response *resp)
 	do {								\
 		if (strcmp(expected, "*") != 0 &&			\
 		   strcmp(expected, received) != 0) {			\
-			sprintf(errdetail, fmt " %s", received);	\
+			array_sprintf(errdetail, fmt " %s", received);	\
 			return false;					\
 		}							\
 	} while (0)
@@ -1093,29 +1171,29 @@ int compare_responses(struct response *expected, struct response *received)
 	errno = 0;
 
 	if (received == NULL) {
-		strcpy(errdetail, "Unexpected NULL response");
+		array_strcpy(errdetail, "Unexpected NULL response");
 		return false;
 	}
 
 	if (expected->r_client != received->r_client
 	    && strcmp(expected->r_client->c_name,
 		      received->r_client->c_name) != 0) {
-		sprintf(errdetail, "Unexpected response from %s",
-			received->r_client->c_name);
+		array_sprintf(errdetail, "Unexpected response from %s",
+			      received->r_client->c_name);
 		return false;
 	}
 
 	if (expected->r_cmd != received->r_cmd) {
-		sprintf(errdetail, "Unexpected command %s",
-			commands[received->r_cmd].cmd_name);
+		array_sprintf(errdetail, "Unexpected command %s",
+			      commands[received->r_cmd].cmd_name);
 		return false;
 	}
 
 	return_if_ne_long(expected->r_tag, received->r_tag, "Unexpected tag");
 
 	if (expected->r_status != received->r_status) {
-		sprintf(errdetail, "Unexpected status %s",
-			str_status(received->r_status));
+		array_sprintf(errdetail, "Unexpected status %s",
+			      str_status(received->r_status));
 		return false;
 	}
 
@@ -1124,6 +1202,7 @@ int compare_responses(struct response *expected, struct response *received)
 		switch (expected->r_cmd) {
 		case CMD_COMMENT:
 		case CMD_HELLO:
+		case CMD_FORK:
 			/* could check string, but not worth it - HELLO has
 			 * already set client name and that has been checked
 			 */
@@ -1137,9 +1216,9 @@ int compare_responses(struct response *expected, struct response *received)
 		case CMD_HOP:
 		case CMD_UNHOP:
 		case NUM_COMMANDS:
-			sprintf(errdetail, "Unexpected Status %s for %s",
-				str_status(received->r_status),
-				commands[received->r_cmd].cmd_name);
+			array_sprintf(errdetail, "Unexpected Status %s for %s",
+				      str_status(received->r_status),
+				      commands[received->r_cmd].cmd_name);
 			return false;
 
 		case CMD_ALARM:
@@ -1189,9 +1268,11 @@ int compare_responses(struct response *expected, struct response *received)
 	case STATUS_DEADLOCK:
 		return_if_ne_long(expected->r_fpos, received->r_fpos,
 				  "Unexpected fpos");
+
 		if (expected->r_cmd != CMD_LIST)
 			return_if_ne_lock_type(expected->r_lock_type,
 					       received->r_lock_type);
+
 		return_if_ne_longlong(expected->r_start, received->r_start,
 				      "Unexpected start");
 		return_if_ne_longlong(expected->r_length, received->r_length,
@@ -1226,7 +1307,6 @@ int compare_responses(struct response *expected, struct response *received)
 		} else if (expected->r_cmd == CMD_ALARM) {
 			return_if_ne_long(expected->r_secs, received->r_secs,
 					  "Unexpected secs");
-		} else {
 		}
 		break;
 
@@ -1281,7 +1361,7 @@ char *parse_open(char *line, struct response *req)
 	if (more == NULL)
 		return more;
 
-	return get_str(more, req->r_data, &req->r_length, REQUIRES_NO_MORE);
+	return get_rdata(more, req, PATH_MAX - 1, REQUIRES_NO_MORE);
 }
 
 char *parse_write(char *line, struct response *req)
@@ -1293,7 +1373,7 @@ char *parse_write(char *line, struct response *req)
 	if (more == NULL)
 		return more;
 
-	return get_str(more, req->r_data, &req->r_length, REQUIRES_NO_MORE);
+	return get_rdata(more, req, MAXSTR, REQUIRES_NO_MORE);
 }
 
 char *parse_read(char *line, struct response *req)
@@ -1308,8 +1388,7 @@ char *parse_read(char *line, struct response *req)
 		return more;
 
 	if (*more == '"')
-		return get_str(more, req->r_data, &req->r_length,
-			       REQUIRES_NO_MORE);
+		return get_rdata(more, req, MAXSTR, REQUIRES_NO_MORE);
 	else
 		return get_longlong(more, &req->r_length, REQUIRES_NO_MORE,
 				    "Invalid len");
@@ -1344,13 +1423,12 @@ char *parse_lock(char *line, struct response *req)
 
 	if (req->r_lock_type != F_RDLCK && req->r_lock_type != F_WRLCK) {
 		errno = EINVAL;
-		strcpy(errdetail, "Invalid lock type");
-		sprintf(badtoken, "%s", str_lock_type(req->r_lock_type));
+		array_strcpy(errdetail, "Invalid lock type");
+		array_sprintf(badtoken, "%s", str_lock_type(req->r_lock_type));
 	}
 
-	more =
-	    get_longlong(more, &req->r_start, REQUIRES_MORE,
-			 "Invalid lock start");
+	more = get_longlong(more, &req->r_start, REQUIRES_MORE,
+			    "Invalid lock start");
 
 	if (more == NULL)
 		return more;
@@ -1370,9 +1448,8 @@ char *parse_unlock(char *line, struct response *req)
 	if (more == NULL)
 		return more;
 
-	more =
-	    get_longlong(more, &req->r_start, REQUIRES_MORE,
-			 "Invalid lock start");
+	more = get_longlong(more, &req->r_start, REQUIRES_MORE,
+			    "Invalid lock start");
 
 	if (more == NULL)
 		return more;
@@ -1397,9 +1474,8 @@ char *parse_list(char *line, struct response *req)
 	if (more == NULL)
 		return more;
 
-	more =
-	    get_longlong(more, &req->r_start, REQUIRES_MORE,
-			 "Invalid lock start");
+	more = get_longlong(more, &req->r_start, REQUIRES_MORE,
+			    "Invalid lock start");
 
 	if (more == NULL)
 		return more;
@@ -1410,7 +1486,7 @@ char *parse_list(char *line, struct response *req)
 
 char *parse_string(char *line, struct response *req)
 {
-	return get_str(line, req->r_data, &req->r_length, REQUIRES_NO_MORE);
+	return get_rdata(line, req, MAXSTR, REQUIRES_NO_MORE);
 }
 
 char *parse_empty(char *line, struct response *req)
@@ -1436,6 +1512,7 @@ parse_function_t parse_functions[NUM_COMMANDS] = {
 	parse_string,		/* comment */
 	parse_alarm,
 	parse_string,		/* hello */
+	parse_string,		/* fork */
 	parse_empty,		/* quit */
 };
 
@@ -1473,6 +1550,7 @@ char *parse_request(char *line, struct response *req, int no_tag)
 	case CMD_READ:
 	case CMD_WRITE:
 	case CMD_HELLO:
+	case CMD_FORK:
 	case CMD_COMMENT:
 	case CMD_ALARM:
 	case CMD_QUIT:
@@ -1488,17 +1566,18 @@ char *parse_request(char *line, struct response *req, int no_tag)
 
 void send_cmd(struct response *req)
 {
-	char line[MAXSTR * 2];
+	char line[MAXXFER];
 
-	sprintf_req(line, NULL, req);
+	sprintf_req(line, sizeof(line), NULL, req);
 
 	fputs(line, req->r_client->c_output);
 	fflush(req->r_client->c_output);
 }
 
-void sprintf_req(char *line, const char *lead, struct response *req)
+void sprintf_req(char *line, int size, const char *lead, struct response *req)
 {
 	char *rest = line;
+	int left = size - 1; /* Leave room for terminating NUL */
 
 	if (lead != NULL) {
 		const char *name = "<NULL>";
@@ -1506,69 +1585,75 @@ void sprintf_req(char *line, const char *lead, struct response *req)
 		if (req->r_client != NULL)
 			name = req->r_client->c_name;
 
-		rest = rest + sprintf(line, "%s %s ", lead, name);
+		sprint_left(rest, left, "%s %s ", lead, name);
 	}
 
-	rest =
-	    rest + sprintf(rest, "%ld %s", req->r_tag,
-			   commands[req->r_cmd].cmd_name);
+	sprint_left(rest, left, "%ld %s", req->r_tag,
+		    commands[req->r_cmd].cmd_name);
 
 	switch (req->r_cmd) {
 	case CMD_COMMENT:
 	case CMD_HELLO:
-		sprintf(rest, " \"%s\"\n", req->r_data);
+	case CMD_FORK:
+		sprint_left(rest, left, " \"%s\"\n", req->r_data);
 		break;
 
 	case CMD_LOCKW:
 	case CMD_LOCK:
 	case CMD_TEST:
 	case CMD_HOP:
-		sprintf(rest, " %ld %s %lld %lld\n", req->r_fpos,
-			str_lock_type(req->r_lock_type), req->r_start,
-			req->r_length);
+		sprint_left(rest, left, " %ld %s %lld %lld\n", req->r_fpos,
+			    str_lock_type(req->r_lock_type), req->r_start,
+			    req->r_length);
 		break;
 
 	case CMD_UNLOCK:
 	case CMD_LIST:
 	case CMD_UNHOP:
-		sprintf(rest, " %ld %lld %lld\n", req->r_fpos, req->r_start,
-			req->r_length);
+		sprint_left(rest, left, " %ld %lld %lld\n", req->r_fpos,
+			    req->r_start, req->r_length);
 		break;
 
 	case NUM_COMMANDS:
-		sprintf(rest, " Unexpected Command\n");
+		sprint_left(rest, left, " Unexpected Command\n");
 		break;
 
 	case CMD_ALARM:
-		sprintf(rest, " %ld\n", req->r_secs);
+		sprint_left(rest, left, " %ld\n", req->r_secs);
 		break;
 
 	case CMD_QUIT:
-		sprintf(rest, "\n");
+		sprint_left(rest, left, "\n");
 		break;
 
 	case CMD_OPEN:
-		rest +=
-		    sprintf(rest, " %ld %s", req->r_fpos,
+		sprint_left(rest, left, " %ld %s", req->r_fpos,
 			    str_read_write_flags(req->r_flags));
-		rest += sprintf_open_flags(rest, req->r_flags);
-		rest += sprintf(rest, " \"%s\"\n", req->r_data);
+		sprintf_open_flags(&rest, &left, req->r_flags);
+		sprintf_lock_modes(&rest, &left, req->r_lock_type);
+		sprint_left(rest, left, " \"%s\"\n", req->r_data);
 		break;
 
 	case CMD_CLOSE:
-		sprintf(rest, " %ld\n", req->r_fpos);
+		sprint_left(rest, left, " %ld\n", req->r_fpos);
 		break;
 
 	case CMD_SEEK:
-		sprintf(rest, " %ld %lld\n", req->r_fpos, req->r_start);
+		sprint_left(rest, left, " %ld %lld\n",
+			    req->r_fpos, req->r_start);
 		break;
 
 	case CMD_WRITE:
-		sprintf(rest, " %ld %s\n", req->r_fpos, req->r_data);
+		sprint_left(rest, left, " %ld %s\n",
+			    req->r_fpos, req->r_data);
 		break;
 
 	case CMD_READ:
-		sprintf(rest, " %ld %lld\n", req->r_fpos, req->r_length);
+		sprint_left(rest, left, " %ld %lld\n",
+			    req->r_fpos, req->r_length);
 		break;
 	}
+
+	/* Make sure we are NUL terminated even if we used the last byte. */
+	*rest = '\0';
 }

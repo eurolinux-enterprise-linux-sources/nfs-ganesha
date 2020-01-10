@@ -46,7 +46,7 @@
 #include "delayed_exec.h"
 #include "log.h"
 #include "avltree.h"
-#include "sys/queue.h"
+#include "misc/queue.h"
 #include "gsh_intrinsic.h"
 #include "common_utils.h"
 
@@ -73,9 +73,12 @@ struct delayed_multi {
  */
 
 struct delayed_task {
-	void (*func) (void *);	/*< Function for delayed task */
-	void *arg;		/*< Argument for delayed task */
-	 LIST_ENTRY(delayed_task) link;	/*< Link in the task list. */
+	/** Function for delayed task */
+	void (*func)(void *);
+	/** Argument for delayed task */
+	void *arg;
+	/** Link in the task list. */
+	LIST_ENTRY(delayed_task) link;
 };
 
 /**
@@ -218,8 +221,9 @@ void *delayed_thread(void *arg)
 	PTHREAD_MUTEX_lock(&mtx);
 	while (delayed_state == delayed_running) {
 		struct timespec then;
-		void (*func) (void *);
+		void (*func)(void *);
 		void *arg;
+
 		switch (delayed_get_work(&then, &func, &arg)) {
 		case delayed_unemployed:
 			pthread_cond_wait(&cv, &mtx);
@@ -267,8 +271,11 @@ void delayed_start(void)
 			 "You can't execute tasks with zero threads.");
 	}
 
-	pthread_attr_init(&attr);
-	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	if (pthread_attr_init(&attr) != 0)
+		LogFatal(COMPONENT_THREAD, "can't init pthread's attributes");
+
+	if (pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) != 0)
+		LogFatal(COMPONENT_THREAD, "can't set pthread's join state");
 
 	PTHREAD_MUTEX_lock(&mtx);
 	delayed_state = delayed_running;
@@ -278,11 +285,6 @@ void delayed_start(void)
 		    gsh_malloc(sizeof(struct delayed_thread));
 		int rc = 0;
 
-		if (thread == NULL) {
-			LogFatal(COMPONENT_THREAD,
-				 "Unable to start delayed executor: "
-				 "no memory.");
-		}
 		rc = pthread_create(&thread->id, &attr, delayed_thread, thread);
 		if (rc != 0) {
 			LogFatal(COMPONENT_THREAD,
@@ -301,6 +303,7 @@ void delayed_shutdown(void)
 {
 	int rc = -1;
 	struct timespec then;
+
 	now(&then);
 	then.tv_sec += 120;
 
@@ -314,8 +317,7 @@ void delayed_shutdown(void)
 		struct delayed_thread *thr;
 
 		LogMajor(COMPONENT_THREAD,
-			 "Delayed executor threads not shutting down cleanly, "
-			 "taking harsher measures.");
+			 "Delayed executor threads not shutting down cleanly, taking harsher measures.");
 		while ((thr = LIST_FIRST(&thread_list)) != NULL) {
 			LIST_REMOVE(thr, link);
 			pthread_cancel(thr->id);
@@ -344,21 +346,7 @@ int delayed_submit(void (*func) (void *), void *arg, nsecs_elapsed_t delay)
 	struct avltree_node *first = NULL;
 
 	mul = gsh_malloc(sizeof(struct delayed_multi));
-
-	if (mul == NULL) {
-		LogMajor(COMPONENT_THREAD,
-			 "Unable to allocate memory for delayed task.");
-		return ENOMEM;
-	}
-
 	task = gsh_malloc(sizeof(struct delayed_task));
-
-	if (task == NULL) {
-		gsh_free(mul);
-		LogMajor(COMPONENT_THREAD,
-			 "Unable to allocate memory for delayed task.");
-		return ENOMEM;
-	}
 
 	now(&mul->realtime);
 	timespec_add_nsecs(delay, &mul->realtime);

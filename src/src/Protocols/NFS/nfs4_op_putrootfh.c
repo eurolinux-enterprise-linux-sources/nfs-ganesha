@@ -60,8 +60,8 @@
 int nfs4_op_putrootfh(struct nfs_argop4 *op, compound_data_t *data,
 		      struct nfs_resop4 *resp)
 {
-	cache_inode_status_t cache_status;
-	cache_entry_t *file_entry;
+	fsal_status_t status = {0, 0};
+	struct fsal_obj_handle *file_obj;
 
 	PUTROOTFH4res * const res_PUTROOTFH4 = &resp->nfs_resop4_u.opputrootfh;
 
@@ -72,19 +72,19 @@ int nfs4_op_putrootfh(struct nfs_argop4 *op, compound_data_t *data,
 	resp->resop = NFS4_OP_PUTROOTFH;
 
 	/* Release any old export reference */
-	if (op_ctx->export != NULL)
-		put_gsh_export(op_ctx->export);
+	if (op_ctx->ctx_export != NULL)
+		put_gsh_export(op_ctx->ctx_export);
 
-	op_ctx->export = NULL;
+	op_ctx->ctx_export = NULL;
 	op_ctx->fsal_export = NULL;
 
 	/* Clear out current entry for now */
 	set_current_entry(data, NULL);
 
 	/* Get the root export of the Pseudo FS */
-	op_ctx->export = get_gsh_export_by_pseudo("/", true);
+	op_ctx->ctx_export = get_gsh_export_by_pseudo("/", true);
 
-	if (op_ctx->export == NULL) {
+	if (op_ctx->ctx_export == NULL) {
 		LogCrit(COMPONENT_EXPORT,
 			"Could not get export for Pseudo Root");
 
@@ -92,7 +92,7 @@ int nfs4_op_putrootfh(struct nfs_argop4 *op, compound_data_t *data,
 		return res_PUTROOTFH4->status;
 	}
 
-	op_ctx->fsal_export = op_ctx->export->fsal_export;
+	op_ctx->fsal_export = op_ctx->ctx_export->fsal_export;
 
 	/* Build credentials */
 	res_PUTROOTFH4->status = nfs4_export_check_access(data->req);
@@ -112,34 +112,28 @@ int nfs4_op_putrootfh(struct nfs_argop4 *op, compound_data_t *data,
 	}
 
 	/* Get the Pesudo Root inode of the mounted on export */
-	cache_status = nfs_export_get_root_entry(op_ctx->export,
-						 &file_entry);
-
-	if (cache_status != CACHE_INODE_SUCCESS) {
+	status = nfs_export_get_root_entry(op_ctx->ctx_export, &file_obj);
+	if (FSAL_IS_ERROR(status)) {
 		LogCrit(COMPONENT_EXPORT,
 			"Could not get root inode for Pseudo Root");
 
-		res_PUTROOTFH4->status = nfs4_Errno(cache_status);
+		res_PUTROOTFH4->status = nfs4_Errno_status(status);
 		return res_PUTROOTFH4->status;
 	}
 
 	LogMidDebug(COMPONENT_EXPORT,
-		    "Root node %p", data->current_entry);
+		    "Root node %p", data->current_obj);
 
-	/* Set the current entry using the ref from get */
-	set_current_entry(data, file_entry);
+	set_current_entry(data, file_obj);
 
-	/* If no currentFH were set, allocate one */
-	if (data->currentFH.nfs_fh4_val == NULL) {
-		res_PUTROOTFH4->status = nfs4_AllocateFH(&(data->currentFH));
-		if (res_PUTROOTFH4->status != NFS4_OK)
-			return res_PUTROOTFH4->status;
-	}
+	/* Put our ref */
+	file_obj->obj_ops.put_ref(file_obj);
 
 	/* Convert it to a file handle */
-	if (!nfs4_FSALToFhandle(&data->currentFH,
-				data->current_entry->obj_handle,
-				op_ctx->export)) {
+	if (!nfs4_FSALToFhandle(data->currentFH.nfs_fh4_val == NULL,
+				&data->currentFH,
+				data->current_obj,
+				op_ctx->ctx_export)) {
 		LogCrit(COMPONENT_EXPORT,
 			"Could not get handle for Pseudo Root");
 
@@ -164,5 +158,4 @@ int nfs4_op_putrootfh(struct nfs_argop4 *op, compound_data_t *data,
 void nfs4_op_putrootfh_Free(nfs_resop4 *resp)
 {
 	/* Nothing to be done */
-	return;
-}				/* nfs4_op_putrootfh_Free */
+}

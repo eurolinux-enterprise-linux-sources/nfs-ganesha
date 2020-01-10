@@ -39,27 +39,26 @@
 #include "nfs_core.h"
 #include "nfs_exports.h"
 #include "log.h"
-#include "cache_inode.h"
 #include "fsal.h"
 #include "9p.h"
 
 #define FREE_FID(pfid, fid, req9p) do {                                 \
-	/* Tell cache_inode that the entry is no longer reachable */    \
-	cache_inode_put(pfid->pentry);                                  \
+	/* mark object no longer reachable */				\
+	pfid->pentry->obj_ops.put_ref(pfid->pentry);			\
+	pfid->pentry = NULL;						\
 	/* Free the fid */                                              \
-	gsh_free(pfid);                                                 \
+	free_fid(pfid);							\
 	req9p->pconn->fids[*fid] = NULL;                                \
 } while (0)
 
-int _9p_remove(struct _9p_request_data *req9p, void *worker_data,
-	       u32 *plenout, char *preply)
+int _9p_remove(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 {
 	char *cursor = req9p->_9pmsg + _9P_HDR_SIZE + _9P_TYPE_SIZE;
 
 	u16 *msgtag = NULL;
 	u32 *fid = NULL;
 	struct _9p_fid *pfid = NULL;
-	cache_inode_status_t cache_status;
+	fsal_status_t fsal_status;
 
 	/* Get data */
 	_9p_getptr(cursor, msgtag, u16);
@@ -68,47 +67,44 @@ int _9p_remove(struct _9p_request_data *req9p, void *worker_data,
 	LogDebug(COMPONENT_9P, "TREMOVE: tag=%u fid=%u", (u32) *msgtag, *fid);
 
 	if (*fid >= _9P_FID_PER_CONN)
-		return _9p_rerror(req9p, worker_data, msgtag, ERANGE, plenout,
-				  preply);
+		return _9p_rerror(req9p, msgtag, ERANGE, plenout, preply);
 
 	pfid = req9p->pconn->fids[*fid];
 
 	/* Check that it is a valid fid */
 	if (pfid == NULL || pfid->pentry == NULL) {
 		LogDebug(COMPONENT_9P, "request on invalid fid=%u", *fid);
-		return _9p_rerror(req9p, worker_data, msgtag, EIO, plenout,
-				  preply);
+		return _9p_rerror(req9p, msgtag, EIO, plenout, preply);
 	}
 
-	if ((pfid->op_context.export_perms->options &
+	_9p_init_opctx(pfid, req9p);
+
+	if ((op_ctx->export_perms->options &
 				 EXPORT_OPTION_WRITE_ACCESS) == 0)
-		return _9p_rerror(req9p, worker_data, msgtag, EROFS, plenout,
-				  preply);
+		return _9p_rerror(req9p, msgtag, EROFS, plenout, preply);
 
-	op_ctx = &pfid->op_context;
-
-	cache_status = cache_inode_remove(pfid->ppentry, pfid->name);
-	if (cache_status != CACHE_INODE_SUCCESS)
-		return _9p_rerror(req9p, worker_data, msgtag,
-				  _9p_tools_errno(cache_status), plenout,
+	fsal_status = fsal_remove(pfid->ppentry, pfid->name);
+	if (FSAL_IS_ERROR(fsal_status))
+		return _9p_rerror(req9p, msgtag,
+				  _9p_tools_errno(fsal_status), plenout,
 				  preply);
 
 	/* If object is an opened file, close it */
-	if ((pfid->pentry->type == REGULAR_FILE) && is_open(pfid->pentry)) {
-		if (pfid->opens) {
-			cache_inode_dec_pin_ref(pfid->pentry, false);
+	if ((pfid->pentry->type == REGULAR_FILE) && pfid->opens) {
+			pfid->pentry->obj_ops.put_ref(pfid->pentry);
 			pfid->opens = 0;	/* dead */
 
-			/* Under this flag, pin ref is still checked */
-			cache_status =
-			    cache_inode_close(pfid->pentry,
-					      CACHE_INODE_FLAG_REALLYCLOSE);
-			if (cache_status != CACHE_INODE_SUCCESS) {
-				FREE_FID(pfid, fid, req9p);
-				return _9p_rerror(req9p, worker_data, msgtag,
-						  _9p_tools_errno(cache_status),
-						  plenout, preply);
-			}
+		if (pfid->pentry->fsal->m_ops.support_ex(pfid->pentry))
+			fsal_status = pfid->pentry->obj_ops.close2(pfid->pentry,
+								   pfid->state);
+		else
+			fsal_status = fsal_close(pfid->pentry);
+
+		if (FSAL_IS_ERROR(fsal_status)) {
+			FREE_FID(pfid, fid, req9p);
+			return _9p_rerror(req9p, msgtag,
+					  _9p_tools_errno(fsal_status),
+					  plenout, preply);
 		}
 	}
 

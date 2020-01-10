@@ -1,0 +1,68 @@
+From db6ca8d20c0faa156e5b3ff91179a5fa40e770a7 Mon Sep 17 00:00:00 2001
+From: Daniel Gryniewicz <dang@redhat.com>
+Date: Fri, 3 Mar 2017 11:03:12 -0500
+Subject: [PATCH 2/2] Reduce and mitigate a rename/readir race window
+
+There is a race window in rename() with readdir().  This steps are this:
+mdcache_rename() calls the sub-FSAL rename(), which does the actual
+rename.  Then, it locks the src and dst dirs, and renames the dirent.
+However, between the real rename and the dirent rename, another client
+may have come in and done a readdir(), refreshing the dirent cache.  The
+lookup on the old dirent then fails, returning ENOENT to  the client.
+
+Reduce this race window, by moving the locking to immediately after the
+rename.  This should also make it much less likely that the dirents are
+refreshed, since we haven't marked them stale yet.
+
+In addition, handle ENOENT on the src dirent as an indication that this
+race has occurred, and do not treat it as a user-visible error.
+
+RH Bug #1428798
+
+Change-Id: I9a7e706b25a8a2f1df54a982b2952aad7134a89d
+Signed-off-by: Daniel Gryniewicz <dang@redhat.com>
+---
+ src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_handle.c | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_handle.c b/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_handle.c
+index 18b749d..ca50873 100644
+--- a/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_handle.c
++++ b/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_handle.c
+@@ -796,6 +796,9 @@ static fsal_status_t mdcache_rename(struct fsal_obj_handle *obj_hdl,
+ 	if (FSAL_IS_ERROR(status))
+ 		goto out;
+ 
++	/* Now update cached dirents.  Must take locks in the correct order */
++	mdcache_src_dest_lock(mdc_olddir, mdc_newdir);
++
+ 	if (mdc_lookup_dst != NULL) {
+ 		/* Mark target file attributes as invalid */
+ 		atomic_clear_uint32_t_bits(&mdc_lookup_dst->mde_flags,
+@@ -815,9 +818,6 @@ static fsal_status_t mdcache_rename(struct fsal_obj_handle *obj_hdl,
+ 					   MDCACHE_TRUST_ATTRS);
+ 	}
+ 
+-	/* Now update cached dirents.  Must take locks in the correct order */
+-	mdcache_src_dest_lock(mdc_olddir, mdc_newdir);
+-
+ 	if (mdc_lookup_dst) {
+ 		/* Remove the entry from parent dir_entries avl */
+ 		status = mdcache_dirent_remove(mdc_newdir, new_name);
+@@ -846,6 +846,13 @@ static fsal_status_t mdcache_rename(struct fsal_obj_handle *obj_hdl,
+ 
+ 		status = mdcache_dirent_rename(mdc_newdir, old_name, new_name);
+ 		if (FSAL_IS_ERROR(status)) {
++			if (status.major == ERR_FSAL_NOENT) {
++				/* Someone raced us, and reloaded the directory
++				 * after the sub-FSAL rename.  This is not an
++				 * error. Fall through to invalidate just in
++				 * case. */
++				status = fsalstat(ERR_FSAL_NO_ERROR, 0);
++			}
+ 			/* We're obviously out of date.  Throw out the cached
+ 			   directory */
+ 			/* Protected by mdcache_src_dst_lock() above */
+-- 
+2.5.0
+

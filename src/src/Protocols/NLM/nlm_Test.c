@@ -37,19 +37,15 @@
  * @brief Test lock
  *
  * @param[in]  args
- * @param[in]  export
- * @param[in]  worker
  * @param[in]  req
  * @param[out] res
  *
  */
 
-int nlm4_Test(nfs_arg_t *args,
-	      nfs_worker_data_t *worker,
-	      struct svc_req *req, nfs_res_t *res)
+int nlm4_Test(nfs_arg_t *args, struct svc_req *req, nfs_res_t *res)
 {
 	nlm4_testargs *arg = &args->arg_nlm4_test;
-	cache_entry_t *pentry;
+	struct fsal_obj_handle *obj;
 	state_status_t state_status = STATE_SUCCESS;
 	char buffer[MAXNETOBJ_SZ * 2];
 	state_nsm_client_t *nsm_client;
@@ -57,12 +53,13 @@ int nlm4_Test(nfs_arg_t *args,
 	state_owner_t *nlm_owner, *holder;
 	fsal_lock_param_t lock, conflict;
 	int rc;
+	state_t *state;
 
 	/* NLM doesn't have a BADHANDLE error, nor can rpc_execute deal with
 	 * responding to an NLM_*_MSG call, so we check here if the export is
 	 * NULL and if so, handle the response.
 	 */
-	if (op_ctx->export == NULL) {
+	if (op_ctx->ctx_export == NULL) {
 		res->res_nlm4test.test_stat.stat = NLM4_STALE_FH;
 		LogInfo(COMPONENT_NLM, "INVALID HANDLE: nlm4_Test");
 		return NFS_REQ_OK;
@@ -77,13 +74,7 @@ int nlm4_Test(nfs_arg_t *args,
 		 (unsigned long long)arg->alock.l_len,
 		 buffer);
 
-	if (!copy_netobj(&res->res_nlm4test.cookie, &arg->cookie)) {
-		res->res_nlm4test.test_stat.stat = NLM4_FAILED;
-		LogDebug(COMPONENT_NLM,
-			 "REQUEST RESULT: nlm4_Test %s",
-			 lock_result_str(res->res_nlm4.stat.stat));
-		return NFS_REQ_OK;
-	}
+	copy_netobj(&res->res_nlm4test.cookie, &arg->cookie);
 
 	if (nfs_in_grace()) {
 		res->res_nlm4test.test_stat.stat = NLM4_DENIED_GRACE_PERIOD;
@@ -105,12 +96,15 @@ int nlm4_Test(nfs_arg_t *args,
 				    arg->exclusive,
 				    &arg->alock,
 				    &lock,
-				    &pentry,
+				    &obj,
 				    CARE_NO_MONITOR,
 				    &nsm_client,
 				    &nlm_client,
 				    &nlm_owner,
-				    NULL);
+				    NULL,
+				    false,
+				    0,
+				    &state);
 
 	if (rc >= 0) {
 		/* resent the error back to the client */
@@ -121,7 +115,8 @@ int nlm4_Test(nfs_arg_t *args,
 		return NFS_REQ_OK;
 	}
 
-	state_status = state_test(pentry,
+	state_status = state_test(obj,
+				  state,
 				  nlm_owner,
 				  &lock,
 				  &holder,
@@ -143,11 +138,15 @@ int nlm4_Test(nfs_arg_t *args,
 
 	LogFullDebug(COMPONENT_NLM, "Back from state_test");
 
+	/* Release state_t reference if we got one */
+	if (state != NULL)
+		dec_nlm_state_ref(state);
+
 	/* Release the NLM Client and NLM Owner references we have */
 	dec_nsm_client_ref(nsm_client);
 	dec_nlm_client_ref(nlm_client);
 	dec_state_owner_ref(nlm_owner);
-	cache_inode_put(pentry);
+	obj->obj_ops.put_ref(obj);
 
 	LogDebug(COMPONENT_NLM,
 		 "REQUEST RESULT: nlm4_Test %s",
@@ -190,16 +189,12 @@ static void nlm4_test_message_resp(state_async_queue_t *arg)
  * @brief Test lock Message
  *
  * @param[in]  args
- * @param[in]  export
- * @param[in]  worker
  * @param[in]  req
  * @param[out] res
  *
  */
 
-int nlm4_Test_Message(nfs_arg_t *args,
-		      nfs_worker_data_t *worker, struct svc_req *req,
-		      nfs_res_t *res)
+int nlm4_Test_Message(nfs_arg_t *args, struct svc_req *req, nfs_res_t *res)
 {
 	state_nlm_client_t *nlm_client = NULL;
 	state_nsm_client_t *nsm_client;
@@ -221,7 +216,7 @@ int nlm4_Test_Message(nfs_arg_t *args,
 	if (nlm_client == NULL)
 		rc = NFS_REQ_DROP;
 	else
-		rc = nlm4_Test(args, worker, req, res);
+		rc = nlm4_Test(args, req, res);
 
 	if (rc == NFS_REQ_OK)
 		rc = nlm_send_async_res_nlm4test(nlm_client,

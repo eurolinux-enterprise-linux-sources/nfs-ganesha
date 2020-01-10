@@ -111,6 +111,8 @@ int nfs4_op_locku(struct nfs_argop4 *op, compound_data_t *data,
 	}
 
 	lock_desc.lock_start = arg_LOCKU4->offset;
+	lock_desc.lock_sle_type = FSAL_POSIX_LOCK;
+	lock_desc.lock_reclaim = false;
 
 	if (arg_LOCKU4->length != STATE_LOCK_OFFSET_EOF)
 		lock_desc.lock_length = arg_LOCKU4->length;
@@ -119,7 +121,7 @@ int nfs4_op_locku(struct nfs_argop4 *op, compound_data_t *data,
 
 	/* Check stateid correctness and get pointer to state */
 	nfs_status = nfs4_Check_Stateid(&arg_LOCKU4->lock_stateid,
-					data->current_entry,
+					data->current_obj,
 					&state_found,
 					data,
 					STATEID_SPECIAL_FOR_LOCK,
@@ -147,7 +149,7 @@ int nfs4_op_locku(struct nfs_argop4 *op, compound_data_t *data,
 		if (!Check_nfs4_seqid(lock_owner,
 				      arg_LOCKU4->seqid,
 				      op,
-				      data->current_entry,
+				      data->current_obj,
 				      resp,
 				      locku_tag)) {
 			/* Response is all setup for us and LogDebug
@@ -173,7 +175,7 @@ int nfs4_op_locku(struct nfs_argop4 *op, compound_data_t *data,
 	}
 
 	LogLock(COMPONENT_NFS_V4_LOCK, NIV_FULL_DEBUG, locku_tag,
-		data->current_entry, lock_owner, &lock_desc);
+		data->current_obj, lock_owner, &lock_desc);
 
 	if (data->minorversion == 0) {
 		op_ctx->clientid =
@@ -182,9 +184,11 @@ int nfs4_op_locku(struct nfs_argop4 *op, compound_data_t *data,
 
 	/* Now we have a lock owner and a stateid.  Go ahead and push
 	   unlock into SAL (and FSAL). */
-	state_status = state_unlock(data->current_entry,
-				    lock_owner,
+	state_status = state_unlock(data->current_obj,
 				    state_found,
+				    lock_owner,
+				    false,
+				    0,
 				    &lock_desc);
 
 	if (state_status != STATE_SUCCESS) {
@@ -210,7 +214,7 @@ int nfs4_op_locku(struct nfs_argop4 *op, compound_data_t *data,
 		Copy_nfs4_state_req(lock_owner,
 				    arg_LOCKU4->seqid,
 				    op,
-				    data->current_entry,
+				    data->current_obj,
 				    resp,
 				    locku_tag);
 	}
@@ -236,11 +240,10 @@ int nfs4_op_locku(struct nfs_argop4 *op, compound_data_t *data,
  */
 void nfs4_op_locku_Free(nfs_resop4 *resp)
 {
-	return;
-}				/* nfs4_op_locku_Free */
+	/* Nothing to be done */
+}
 
 void nfs4_op_locku_CopyRes(LOCKU4res *res_dst, LOCKU4res *res_src)
 {
 	/* Nothing to deep copy */
-	return;
-}				/* nfs4_op_locku_CopyRes */
+}

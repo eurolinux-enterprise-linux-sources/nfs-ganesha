@@ -45,9 +45,11 @@
 
 struct nfs4_op_desc {
 	char *name;
-	int (*funct) (struct nfs_argop4 *, compound_data_t *,
-		      struct nfs_resop4 *);
-	void (*free_res) (nfs_resop4 *);
+	int (*funct)(struct nfs_argop4 *,
+		     compound_data_t *,
+		     struct nfs_resop4 *);
+
+	void (*free_res)(nfs_resop4 *);
 	int exp_perm_flags;
 };
 
@@ -411,8 +413,35 @@ static const struct nfs4_op_desc optabv4[] = {
 				.exp_perm_flags = 0},
 	[NFS4_OP_WRITE_SAME] = {
 				.name = "OP_WRITE_SAME",
-				.funct = nfs4_op_write_plus,
-				.free_res = nfs4_op_write_Free,
+				.funct = nfs4_op_write_same,
+				.free_res = nfs4_op_write_same_Free,
+				.exp_perm_flags = 0},
+	[NFS4_OP_CLONE] = {
+				.name = "OP_CLONE",
+				.funct = nfs4_op_notsupp,
+				.free_res = nfs4_op_notsupp_Free,
+				.exp_perm_flags = 0},
+
+	/* NFSv4.3 */
+	[NFS4_OP_GETXATTR] = {
+				.name = "OP_GETXATTR",
+				.funct = nfs4_op_getxattr,
+				.free_res = nfs4_op_getxattr_Free,
+				.exp_perm_flags = 0},
+	[NFS4_OP_SETXATTR] = {
+				.name = "OP_SETXATTR",
+				.funct = nfs4_op_setxattr,
+				.free_res = nfs4_op_setxattr_Free,
+				.exp_perm_flags = 0},
+	[NFS4_OP_LISTXATTR] = {
+				.name = "OP_LISTXATTR",
+				.funct = nfs4_op_listxattr,
+				.free_res = nfs4_op_listxattr_Free,
+				.exp_perm_flags = 0},
+	[NFS4_OP_REMOVEXATTR] = {
+				.name = "OP_REMOVEXATTR",
+				.funct = nfs4_op_removexattr,
+				.free_res = nfs4_op_removexattr_Free,
 				.exp_perm_flags = 0},
 };
 
@@ -422,7 +451,7 @@ static const struct nfs4_op_desc optabv4[] = {
 nfs_opnum4 LastOpcode[] = {
 	NFS4_OP_RELEASE_LOCKOWNER,
 	NFS4_OP_RECLAIM_COMPLETE,
-	NFS4_OP_WRITE_SAME
+	NFS4_OP_REMOVEXATTR
 };
 
 /**
@@ -436,8 +465,6 @@ nfs_opnum4 LastOpcode[] = {
  *
  *
  *  @param[in]  arg        Generic nfs arguments
- *  @param[in]  export     The full export list
- *  @param[in]  worker     Worker thread data
  *  @param[in]  req        NFSv4 request structure
  *  @param[out] res        NFSv4 reply structure
  *
@@ -448,9 +475,7 @@ nfs_opnum4 LastOpcode[] = {
  * @retval NFS_REQ_DROP if we pretend we never saw the request.
  */
 
-int nfs4_Compound(nfs_arg_t *arg,
-		  nfs_worker_data_t *worker,
-		  struct svc_req *req, nfs_res_t *res)
+int nfs4_Compound(nfs_arg_t *arg, struct svc_req *req, nfs_res_t *res)
 {
 	unsigned int i = 0;
 	int status = NFS4_OK;
@@ -458,12 +483,14 @@ int nfs4_Compound(nfs_arg_t *arg,
 	nfs_opnum4 opcode;
 	const uint32_t compound4_minor = arg->arg_compound4.minorversion;
 	const uint32_t argarray_len = arg->arg_compound4.argarray.argarray_len;
+	/* Array of op arguments */
 	nfs_argop4 * const argarray = arg->arg_compound4.argarray.argarray_val;
 	nfs_resop4 *resarray;
 	nsecs_elapsed_t op_start_time;
 	struct timespec ts;
 	int perm_flags;
 	char *tagname = NULL;
+	char *notag = "NO TAG";
 
 	if (compound4_minor > 2) {
 		LogCrit(COMPONENT_NFS_V4, "Bad Minor Version %d",
@@ -482,9 +509,6 @@ int nfs4_Compound(nfs_arg_t *arg,
 		res->res_compound4.tag.utf8string_val =
 		    gsh_malloc(res->res_compound4.tag.utf8string_len + 1);
 
-		if (!res->res_compound4.tag.utf8string_val)
-			return NFS_REQ_DROP;
-
 		memcpy(res->res_compound4.tag.utf8string_val,
 		       arg->arg_compound4.tag.utf8string_val,
 		       res->res_compound4.tag.utf8string_len);
@@ -502,11 +526,18 @@ int nfs4_Compound(nfs_arg_t *arg,
 			res->res_compound4.resarray.resarray_len = 0;
 			return NFS_REQ_OK;
 		}
-		gsh_free(tagname);
-
 	} else {
 		res->res_compound4.tag.utf8string_val = NULL;
+		tagname = notag;
 	}
+
+	/* Managing the operation list */
+	LogDebug(COMPONENT_NFS_V4,
+		 "COMPOUND: There are %d operations, res = %p, tag = %s",
+		 argarray_len, res, tagname);
+
+	if (tagname != notag)
+		gsh_free(tagname);
 
 	/* Check for empty COMPOUND request */
 	if (argarray_len == 0) {
@@ -535,7 +566,6 @@ int nfs4_Compound(nfs_arg_t *arg,
 
 	/* Minor version related stuff */
 	data.minorversion = compound4_minor;
-	data.worker = worker;
 	data.req = req;
 
 	/* Building the client credential field */
@@ -550,16 +580,8 @@ int nfs4_Compound(nfs_arg_t *arg,
 	res->res_compound4.resarray.resarray_val =
 		gsh_calloc(argarray_len, sizeof(struct nfs_resop4));
 
-	if (res->res_compound4.resarray.resarray_val == NULL)
-		return NFS_REQ_DROP;
-
 	res->res_compound4.resarray.resarray_len = argarray_len;
 	resarray = res->res_compound4.resarray.resarray_val;
-
-	/* Managing the operation list */
-	LogDebug(COMPONENT_NFS_V4,
-		 "COMPOUND: There are %d operations",
-		 argarray_len);
 
 	/* Manage errors NFS4ERR_OP_NOT_IN_SESSION and NFS4ERR_NOT_ONLY_OP.
 	 * These checks apply only to 4.1 */
@@ -655,7 +677,7 @@ int nfs4_Compound(nfs_arg_t *arg,
 		LogDebug(COMPONENT_NFS_V4, "Request %d: opcode %d is %s", i,
 			 argarray[i].argop, optabv4[opcode].name);
 		perm_flags =
-		    optabv4[opcode].exp_perm_flags & EXPORT_OPTION_ACCESS_TYPE;
+		    optabv4[opcode].exp_perm_flags & EXPORT_OPTION_ACCESS_MASK;
 
 		if (perm_flags != 0) {
 			status = nfs4_Is_Fh_Empty(&data.currentFH);
@@ -675,7 +697,7 @@ int nfs4_Compound(nfs_arg_t *arg,
 			LogMidDebugAlt(COMPONENT_NFS_V4, COMPONENT_EXPORT,
 				       "Check export perms export = %08x req = %08x",
 				       op_ctx->export_perms->options &
-						EXPORT_OPTION_ACCESS_TYPE,
+						EXPORT_OPTION_ACCESS_MASK,
 				       perm_flags);
 			if ((op_ctx->export_perms->options &
 			     perm_flags) != perm_flags) {
@@ -720,8 +742,7 @@ int nfs4_Compound(nfs_arg_t *arg,
 		 */
 		resarray[i].nfs_resop4_u.opaccess.status = status;
 
-		server_stats_nfsv4_op_done(opcode,
-					   op_start_time, status == NFS4_OK);
+		server_stats_nfsv4_op_done(opcode, op_start_time, status);
 
 		if (status != NFS4_OK) {
 			/* An error occured, we do not manage the other requests
@@ -860,6 +881,7 @@ void nfs4_Compound_Free(nfs_res_t *res)
 
 	for (i = 0; i < res->res_compound4.resarray.resarray_len; i++) {
 		nfs_resop4 *val = &res->res_compound4.resarray.resarray_val[i];
+
 		if (val) {
 			/* !val is an error case, but it can occur, so avoid
 			 * indirect on NULL
@@ -872,8 +894,6 @@ void nfs4_Compound_Free(nfs_res_t *res)
 
 	if (res->res_compound4.tag.utf8string_val)
 		gsh_free(res->res_compound4.tag.utf8string_val);
-
-	return;
 }
 
 /**
@@ -887,11 +907,14 @@ void nfs4_Compound_Free(nfs_res_t *res)
 void compound_data_Free(compound_data_t *data)
 {
 	/* Release refcounted cache entries */
-	if (data->current_entry)
-		cache_inode_put(data->current_entry);
-
-	if (data->saved_entry)
-		cache_inode_put(data->saved_entry);
+	if (data->current_obj) {
+		set_current_entry(data, NULL);
+		data->current_obj = NULL;
+	}
+	if (data->saved_obj) {
+		set_saved_entry(data, NULL);
+		data->saved_obj = NULL;
+	}
 
 	if (data->current_ds) {
 		ds_handle_put(data->current_ds);
@@ -909,9 +932,9 @@ void compound_data_Free(compound_data_t *data)
 	}
 
 	/* Release CurrentFH reference to export. */
-	if (op_ctx->export) {
-		put_gsh_export(op_ctx->export);
-		op_ctx->export = NULL;
+	if (op_ctx->ctx_export) {
+		put_gsh_export(op_ctx->ctx_export);
+		op_ctx->ctx_export = NULL;
 		op_ctx->fsal_export = NULL;
 	}
 
@@ -1055,6 +1078,14 @@ void nfs4_Compound_CopyResOne(nfs_resop4 *res_dst, nfs_resop4 *res_src)
 	case NFS4_OP_READ_PLUS:
 	case NFS4_OP_SEEK:
 	case NFS4_OP_WRITE_SAME:
+	case NFS4_OP_CLONE:
+
+	/* NFSv4.3 */
+	case NFS4_OP_GETXATTR:
+	case NFS4_OP_SETXATTR:
+	case NFS4_OP_LISTXATTR:
+	case NFS4_OP_REMOVEXATTR:
+
 	case NFS4_OP_LAST_ONE:
 		break;
 

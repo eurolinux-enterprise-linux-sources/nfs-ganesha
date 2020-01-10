@@ -39,6 +39,7 @@
 #include <ctype.h>
 #include <netdb.h>
 
+#include "gsh_config.h"
 #include "sal_functions.h"
 #include "nsm.h"
 #include "log.h"
@@ -119,6 +120,7 @@ int display_nsm_client(struct display_buffer *dspbuf, state_nsm_client_t *key)
 int display_nsm_client_key(struct gsh_buffdesc *buff, char *str)
 {
 	struct display_buffer dspbuf = {HASHTABLE_DISPLAY_STRLEN, str, str};
+
 	display_nsm_client(&dspbuf, buff->addr);
 	return display_buffer_len(&dspbuf);
 }
@@ -134,6 +136,7 @@ int display_nsm_client_key(struct gsh_buffdesc *buff, char *str)
 int display_nsm_client_val(struct gsh_buffdesc *buff, char *str)
 {
 	struct display_buffer dspbuf = {HASHTABLE_DISPLAY_STRLEN, str, str};
+
 	display_nsm_client(&dspbuf, buff->addr);
 	return display_buffer_len(&dspbuf);
 }
@@ -332,6 +335,7 @@ int display_nlm_client(struct display_buffer *dspbuf, state_nlm_client_t *key)
 int display_nlm_client_key(struct gsh_buffdesc *buff, char *str)
 {
 	struct display_buffer dspbuf = {HASHTABLE_DISPLAY_STRLEN, str, str};
+
 	display_nlm_client(&dspbuf, buff->addr);
 	return display_buffer_len(&dspbuf);
 }
@@ -347,6 +351,7 @@ int display_nlm_client_key(struct gsh_buffdesc *buff, char *str)
 int display_nlm_client_val(struct gsh_buffdesc *buff, char *str)
 {
 	struct display_buffer dspbuf = {HASHTABLE_DISPLAY_STRLEN, str, str};
+
 	display_nlm_client(&dspbuf, buff->addr);
 	return display_buffer_len(&dspbuf);
 }
@@ -538,6 +543,7 @@ int display_nlm_owner(struct display_buffer *dspbuf, state_owner_t *owner)
 int display_nlm_owner_key(struct gsh_buffdesc *buff, char *str)
 {
 	struct display_buffer dspbuf = {HASHTABLE_DISPLAY_STRLEN, str, str};
+
 	display_nlm_owner(&dspbuf, buff->addr);
 	return display_buffer_len(&dspbuf);
 }
@@ -553,6 +559,7 @@ int display_nlm_owner_key(struct gsh_buffdesc *buff, char *str)
 int display_nlm_owner_val(struct gsh_buffdesc *buff, char *str)
 {
 	struct display_buffer dspbuf = {HASHTABLE_DISPLAY_STRLEN, str, str};
+
 	display_nlm_owner(&dspbuf, buff->addr);
 	return display_buffer_len(&dspbuf);
 }
@@ -757,7 +764,7 @@ int Init_nlm_hash(void)
  */
 void inc_nsm_client_ref(state_nsm_client_t *client)
 {
-	atomic_inc_int32_t(&client->ssc_refcount);
+	(void) atomic_inc_int32_t(&client->ssc_refcount);
 }
 
 /**
@@ -848,21 +855,11 @@ void dec_nsm_client_ref(state_nsm_client_t *client)
 	}
 
 	/* use the key to delete the entry */
-	rc = hashtable_deletelatched(ht_nsm_client, &buffkey, &latch, &old_key,
-				     &old_value);
+	hashtable_deletelatched(ht_nsm_client, &buffkey, &latch, &old_key,
+				&old_value);
 
-	if (rc != HASHTABLE_SUCCESS) {
-		if (rc == HASHTABLE_ERROR_NO_SUCH_KEY)
-			hashtable_releaselatched(ht_nsm_client, &latch);
-
-		if (!str_valid)
-			display_nsm_client(&dspbuf, client);
-
-		LogCrit(COMPONENT_STATE, "Error %s, could not remove {%s}",
-			hash_table_err_to_str(rc), str);
-
-		return;
-	}
+	/* Release the latch */
+	hashtable_releaselatched(ht_nsm_client, &latch);
 
 	LogFullDebug(COMPONENT_STATE, "Free {%s}", str);
 
@@ -976,26 +973,12 @@ state_nsm_client_t *get_nsm_client(care_t care, SVCXPRT *xprt,
 
 	pclient = gsh_malloc(sizeof(*pclient));
 
-	if (pclient == NULL) {
-		display_nsm_client(&dspbuf, &key);
-		LogCrit(COMPONENT_STATE, "No memory for {%s}", str);
-
-		return NULL;
-	}
-
 	/* Copy everything over */
 	memcpy(pclient, &key, sizeof(key));
 
 	PTHREAD_MUTEX_init(&pclient->ssc_mutex, NULL);
 
 	pclient->ssc_nlm_caller_name = gsh_strdup(key.ssc_nlm_caller_name);
-
-	if (pclient->ssc_nlm_caller_name == NULL) {
-		/* Discard the created client */
-		PTHREAD_MUTEX_destroy(&pclient->ssc_mutex);
-		free_nsm_client(pclient);
-		return NULL;
-	}
 
 	glist_init(&pclient->ssc_lock_list);
 	glist_init(&pclient->ssc_share_list);
@@ -1072,7 +1055,7 @@ void free_nlm_client(state_nlm_client_t *client)
  */
 void inc_nlm_client_ref(state_nlm_client_t *client)
 {
-	atomic_inc_int32_t(&client->slc_refcount);
+	(void) atomic_inc_int32_t(&client->slc_refcount);
 }
 
 /**
@@ -1145,21 +1128,11 @@ void dec_nlm_client_ref(state_nlm_client_t *client)
 	}
 
 	/* use the key to delete the entry */
-	rc = hashtable_deletelatched(ht_nlm_client, &buffkey, &latch, &old_key,
-				     &old_value);
+	hashtable_deletelatched(ht_nlm_client, &buffkey, &latch, &old_key,
+				&old_value);
 
-	if (rc != HASHTABLE_SUCCESS) {
-		if (rc == HASHTABLE_ERROR_NO_SUCH_KEY)
-			hashtable_releaselatched(ht_nlm_client, &latch);
-
-		if (!str_valid)
-			display_nlm_client(&dspbuf, client);
-
-		LogCrit(COMPONENT_STATE, "Error %s, could not remove {%s}",
-			hash_table_err_to_str(rc), str);
-
-		return;
-	}
+	/* Release the latch */
+	hashtable_releaselatched(ht_nlm_client, &latch);
 
 	if (str_valid)
 		LogFullDebug(COMPONENT_STATE, "Free {%s}", str);
@@ -1276,13 +1249,6 @@ state_nlm_client_t *get_nlm_client(care_t care, SVCXPRT *xprt,
 	}
 
 	pclient = gsh_malloc(sizeof(*pclient));
-
-	if (pclient == NULL) {
-		display_nlm_client(&dspbuf, &key);
-		LogCrit(COMPONENT_STATE, "No memory for {%s}", str);
-
-		return NULL;
-	}
 
 	/* Copy everything over */
 	memcpy(pclient, &key, sizeof(key));

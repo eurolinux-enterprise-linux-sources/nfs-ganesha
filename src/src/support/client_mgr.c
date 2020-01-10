@@ -41,6 +41,10 @@
 
 #include <time.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#ifdef RPC_VSOCK
+#include <linux/vm_sockets.h>
+#endif /* VSOCK */
 #include <sys/types.h>
 #include <sys/param.h>
 #include <pthread.h>
@@ -156,6 +160,18 @@ struct gsh_client *get_gsh_client(sockaddr_t *client_ipaddr, bool lookup_only)
 		       (uint8_t *) &((struct sockaddr_in6 *)client_ipaddr)->
 		       sin6_addr, sizeof(ipaddr));
 		break;
+#ifdef RPC_VSOCK
+	case AF_VSOCK:
+	{
+		struct sockaddr_vm *svm; /* XXX checkpatch bs */
+
+		svm = (struct sockaddr_vm *)client_ipaddr;
+		addr = (uint8_t *)&(svm->svm_cid);
+		addr_len = sizeof(svm->svm_cid);
+		ipaddr = svm->svm_cid;
+	}
+	break;
+#endif /* VSOCK */
 	default:
 		assert(0);
 	}
@@ -194,9 +210,6 @@ struct gsh_client *get_gsh_client(sockaddr_t *client_ipaddr, bool lookup_only)
 	PTHREAD_RWLOCK_unlock(&client_by_ip.lock);
 
 	server_st = gsh_calloc(1, (sizeof(struct server_stats) + addr_len));
-
-	if (server_st == NULL)
-		return NULL;
 
 	cl = &server_st->client;
 	memcpy(cl->addrbuf, addr, addr_len);
@@ -277,6 +290,18 @@ int remove_gsh_client(sockaddr_t *client_ipaddr)
 		       (uint8_t *) &((struct sockaddr_in6 *)client_ipaddr)->
 		       sin6_addr, sizeof(ipaddr));
 		break;
+#ifdef RPC_VSOCK
+	case AF_VSOCK:
+	{
+		struct sockaddr_vm *svm; /* XXX checkpatch horror */
+
+		svm = (struct sockaddr_vm *)client_ipaddr;
+		addr = (uint8_t *)&(svm->svm_cid);
+		addr_len = sizeof(svm->svm_cid);
+		ipaddr = svm->svm_cid;
+	}
+	break;
+#endif /* VSOCK */
 	default:
 		assert(0);
 	}
@@ -353,6 +378,10 @@ static bool arg_ipaddr(DBusMessageIter *args, sockaddr_t *sp, char **errormsg)
 	char *client_addr;
 	unsigned char addrbuf[16];
 	bool success = true;
+
+	/* XXX AF_VSOCK addresses are not self-describing--and one might
+	 * question whether inet addresses really are, either...so?
+	 */
 
 	if (args == NULL) {
 		success = false;
@@ -550,14 +579,17 @@ static struct gsh_dbus_interface cltmgr_client_table = {
 static struct gsh_client *lookup_client(DBusMessageIter *args, char **errormsg)
 {
 	sockaddr_t sockaddr;
+	struct gsh_client *client = NULL;
 	bool success = true;
 
 	success = arg_ipaddr(args, &sockaddr, errormsg);
 
-	if (success)
-		return get_gsh_client(&sockaddr, true);
-	else
-		return NULL;
+	if (success) {
+		client = get_gsh_client(&sockaddr, true);
+		if (client == NULL)
+			*errormsg = "Client IP address not found";
+	}
+	return client;
 }
 
 /**
@@ -796,6 +828,7 @@ static struct gsh_dbus_method cltmgr_show_delegations = {
 		 END_ARG_LIST}
 };
 
+#ifdef _USE_9P
 /**
  * DBUS method to report 9p I/O statistics
  *
@@ -890,6 +923,57 @@ static struct gsh_dbus_method cltmgr_show_9p_trans = {
 		 END_ARG_LIST}
 };
 
+/**
+ * DBUS method to report 9p protocol operation statistics
+ *
+ */
+
+static bool get_9p_client_op_stats(DBusMessageIter *args,
+				   DBusMessage *reply,
+				   DBusError *error)
+{
+	struct gsh_client *client = NULL;
+	struct server_stats *server_st = NULL;
+	u8 opcode;
+	bool success = true;
+	char *errormsg = "OK";
+	DBusMessageIter iter;
+
+	dbus_message_iter_init_append(reply, &iter);
+	client = lookup_client(args, &errormsg);
+	if (client == NULL) {
+		success = false;
+	} else {
+		server_st = container_of(client, struct server_stats, client);
+		if (server_st->st._9p == NULL) {
+			success = false;
+			errormsg = "Client does not have any 9p activity";
+		}
+	}
+	dbus_message_iter_next(args);
+	if (success)
+		success = arg_9p_op(args, &opcode, &errormsg);
+	dbus_status_reply(&iter, success, errormsg);
+	if (success)
+		server_dbus_9p_opstats(server_st->st._9p, opcode, &iter);
+
+	if (client != NULL)
+		put_gsh_client(client);
+	return true;
+}
+
+static struct gsh_dbus_method cltmgr_show_9p_op_stats = {
+	.name = "Get9pOpStats",
+	.method = get_9p_client_op_stats,
+	.args = {IPADDR_ARG,
+		 _9P_OP_ARG,
+		 STATUS_REPLY,
+		 TIMESTAMP_REPLY,
+		 OP_STATS_REPLY,
+		 END_ARG_LIST}
+};
+#endif
+
 
 static struct gsh_dbus_method *cltmgr_stats_methods[] = {
 	&cltmgr_show_v3_io,
@@ -897,8 +981,11 @@ static struct gsh_dbus_method *cltmgr_stats_methods[] = {
 	&cltmgr_show_v41_io,
 	&cltmgr_show_v41_layouts,
 	&cltmgr_show_delegations,
+#ifdef _USE_9P
 	&cltmgr_show_9p_io,
 	&cltmgr_show_9p_trans,
+	&cltmgr_show_9p_op_stats,
+#endif
 	NULL
 };
 

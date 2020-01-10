@@ -48,8 +48,10 @@ struct flock
 
 #define GPFS_DEVNAMEX "/dev/ss0"  /* Must be the same as GPFS_DEVNAME */
 #define kGanesha 140             /* Must be the same as Ganesha in enum kxOps */
+#define kLWEvent 169             /* Must be the same as LWEvent in enum kxOps */
 
 #define OPENHANDLE_GET_VERSION    100
+#define OPENHANDLE_GET_VERSION2   1002
 #define OPENHANDLE_NAME_TO_HANDLE 101
 #define OPENHANDLE_OPEN_BY_HANDLE 102
 #define OPENHANDLE_LAYOUT_TYPE    106
@@ -90,9 +92,18 @@ struct flock
 #define OPENHANDLE_FADVISE_BY_FD  141
 #define OPENHANDLE_SEEK_BY_FD     142
 #define OPENHANDLE_STATFS_BY_FH   143
+#define OPENHANDLE_GETXATTRS      144
+#define OPENHANDLE_SETXATTRS      145
+#define OPENHANDLE_REMOVEXATTRS   146
+#define OPENHANDLE_LISTXATTRS     147
+#define OPENHANDLE_FS_LOCATIONS   148
+#define OPENHANDLE_reserved       149
 #define OPENHANDLE_TRACE_ME       150
 #define OPENHANDLE_QUOTA          151
-#define OPENHANDLE_FS_LOCATIONS   152
+#define OPENHANDLE_MKNODE_BY_NAME 152
+
+#define LWE_UPDATE 201
+#define MAX_PATH_LEN 1024
 
 struct trace_arg
 {
@@ -101,11 +112,14 @@ struct trace_arg
   char     *str;
 };
 
+#define ganesha_v1 1
+#define ganesha_v2 2
+
 int gpfs_ganesha(int op, void *oarg);
 
 #define OPENHANDLE_HANDLE_LEN 40
 #define OPENHANDLE_KEY_LEN 28
-#define OPENHANDLE_VERSION 1
+#define OPENHANDLE_VERSION 2
 
 struct xstat_cred_t
 {
@@ -139,6 +153,7 @@ struct name_handle_arg
   int flag;
   const char *name;
   struct gpfs_file_handle *handle;
+  int expfd;
 };
 
 struct get_handle_arg
@@ -156,6 +171,7 @@ struct open_arg
   int flags;
   int openfd;
   struct gpfs_file_handle *handle;
+	const char *cli_ip;
 };
 
 struct link_fh_arg
@@ -563,7 +579,7 @@ struct create_name_arg
 {
     int mountdirfd;                 /* in     */
     struct gpfs_file_handle *dir_fh;/* in     */
-    uint32_t dev;                   /* in     */
+    uint32_t dev;                   /* in dev or posix flags */
     int mode;                       /* in     */
     int len;                        /* in     */
     const char *name;               /* in     */
@@ -659,6 +675,42 @@ struct xstat_arg
     struct stat *buf;
     struct fsal_fsid *fsid;
     uint32_t *expire_attr;
+};
+
+struct getxattr_arg {
+	int mountdirfd;
+	struct gpfs_file_handle *handle;
+	uint32_t name_len;
+	char *name;
+	uint32_t value_len;
+	void *value;
+};
+
+struct setxattr_arg {
+	int mountdirfd;
+	struct gpfs_file_handle *handle;
+	int type;
+	uint32_t name_len;
+	char *name;
+	uint32_t value_len;
+	void *value;
+};
+
+struct removexattr_arg {
+	int mountdirfd;
+	struct gpfs_file_handle *handle;
+	uint32_t name_len;
+	char *name;
+};
+
+struct listxattr_arg {
+	int mountdirfd;
+	struct gpfs_file_handle *handle;
+	uint64_t cookie;
+	uint64_t verifier;
+	uint32_t eof;
+	uint32_t name_len;
+	void *names;
 };
 
 struct fs_loc_arg {

@@ -32,132 +32,31 @@
 #include "fsal_convert.h"
 #include "nfs4_acls.h"
 #include "FSAL/fsal_commonlib.h"
+#include "posix_acls.h"
 
 /**
  * @brief FSAL status mapping from GlusterFS errors
  *
  * This function returns a fsal_status_t with the FSAL error as the
- * major, and the posix error as minor.
+ * major, and the posix error as minor. Please note that this routine
+ * needs to be used only in case of failures.
  *
  * @param[in] gluster_errorcode Gluster error
  *
  * @return FSAL status.
  */
 
-fsal_status_t gluster2fsal_error(const int gluster_errorcode)
+fsal_status_t gluster2fsal_error(const int err)
 {
 	fsal_status_t status;
-	status.minor = gluster_errorcode;
+	int g_err = err;
 
-	switch (gluster_errorcode) {
-
-	case 0:
-		status.major = ERR_FSAL_NO_ERROR;
-		break;
-
-	case EPERM:
-		status.major = ERR_FSAL_PERM;
-		break;
-
-	case ENOENT:
-		status.major = ERR_FSAL_NOENT;
-		break;
-
-	case ECONNREFUSED:
-	case ECONNABORTED:
-	case ECONNRESET:
-	case EIO:
-	case ENFILE:
-	case EMFILE:
-	case EPIPE:
-		status.major = ERR_FSAL_IO;
-		break;
-
-	case ENODEV:
-	case ENXIO:
-		status.major = ERR_FSAL_NXIO;
-		break;
-
-	case EBADF:
-			/**
-			 * @todo: The EBADF error also happens when file is
-			 *	  opened for reading, and we try writting in
-			 *	  it.  In this case, we return
-			 *	  ERR_FSAL_NOT_OPENED, but it doesn't seems to
-			 *	  be a correct error translation.
-			 */
-		status.major = ERR_FSAL_NOT_OPENED;
-		break;
-
-	case ENOMEM:
-		status.major = ERR_FSAL_NOMEM;
-		break;
-
-	case EACCES:
-		status.major = ERR_FSAL_ACCESS;
-		break;
-
-	case EFAULT:
-		status.major = ERR_FSAL_FAULT;
-		break;
-
-	case EEXIST:
-		status.major = ERR_FSAL_EXIST;
-		break;
-
-	case EXDEV:
-		status.major = ERR_FSAL_XDEV;
-		break;
-
-	case ENOTDIR:
-		status.major = ERR_FSAL_NOTDIR;
-		break;
-
-	case EISDIR:
-		status.major = ERR_FSAL_ISDIR;
-		break;
-
-	case EINVAL:
-		status.major = ERR_FSAL_INVAL;
-		break;
-
-	case EFBIG:
-		status.major = ERR_FSAL_FBIG;
-		break;
-
-	case ENOSPC:
-		status.major = ERR_FSAL_NOSPC;
-		break;
-
-	case EMLINK:
-		status.major = ERR_FSAL_MLINK;
-		break;
-
-	case EDQUOT:
-		status.major = ERR_FSAL_DQUOT;
-		break;
-
-	case ENAMETOOLONG:
-		status.major = ERR_FSAL_NAMETOOLONG;
-		break;
-
-	case ENOTEMPTY:
-		status.major = ERR_FSAL_NOTEMPTY;
-		break;
-
-	case ESTALE:
-		status.major = ERR_FSAL_STALE;
-		break;
-
-	case EAGAIN:
-	case EBUSY:
-		status.major = ERR_FSAL_DELAY;
-		break;
-
-	default:
-		status.major = ERR_FSAL_SERVERFAULT;
-		break;
+	if (!g_err) {
+		LogWarn(COMPONENT_FSAL, "appropriate errno not set");
+		g_err = EINVAL;
 	}
+	status.minor = g_err;
+	status.major = posix2fsal_error(g_err);
 
 	return status;
 }
@@ -175,51 +74,44 @@ fsal_status_t gluster2fsal_error(const int gluster_errorcode)
 void stat2fsal_attributes(const struct stat *buffstat,
 			  struct attrlist *fsalattr)
 {
+	/* Indicate which atrributes we have set without affecting the
+	 * other bits in the mask.
+	 */
+	fsalattr->valid_mask |= ATTRS_POSIX;
+
 	/* Fills the output struct */
-	if (FSAL_TEST_MASK(fsalattr->mask, ATTR_TYPE))
-		fsalattr->type = posix2fsal_type(buffstat->st_mode);
+	fsalattr->type = posix2fsal_type(buffstat->st_mode);
 
-	if (FSAL_TEST_MASK(fsalattr->mask, ATTR_SIZE))
-		fsalattr->filesize = buffstat->st_size;
+	fsalattr->filesize = buffstat->st_size;
 
-	if (FSAL_TEST_MASK(fsalattr->mask, ATTR_FSID))
-		fsalattr->fsid = posix2fsal_fsid(buffstat->st_dev);
+	fsalattr->fsid = posix2fsal_fsid(buffstat->st_dev);
 
-	if (FSAL_TEST_MASK(fsalattr->mask, ATTR_FILEID))
-		fsalattr->fileid = buffstat->st_ino;
+	fsalattr->fileid = buffstat->st_ino;
 
-	if (FSAL_TEST_MASK(fsalattr->mask, ATTR_MODE))
-		fsalattr->mode = unix2fsal_mode(buffstat->st_mode);
+	fsalattr->mode = unix2fsal_mode(buffstat->st_mode);
 
-	if (FSAL_TEST_MASK(fsalattr->mask, ATTR_NUMLINKS))
-		fsalattr->numlinks = buffstat->st_nlink;
+	fsalattr->numlinks = buffstat->st_nlink;
 
-	if (FSAL_TEST_MASK(fsalattr->mask, ATTR_OWNER))
-		fsalattr->owner = buffstat->st_uid;
+	fsalattr->owner = buffstat->st_uid;
 
-	if (FSAL_TEST_MASK(fsalattr->mask, ATTR_GROUP))
-		fsalattr->group = buffstat->st_gid;
+	fsalattr->group = buffstat->st_gid;
 
-	if (FSAL_TEST_MASK(fsalattr->mask, ATTR_ATIME))
-		fsalattr->atime = posix2fsal_time(buffstat->st_atime, 0);
+	/** @todo: gfapi currently only fills in the legacy time_t fields
+	 *         when it supports the timespec fields calls to this
+	 *         function should be replaced with calls to
+	 *         posix2fsal_attributes rather than changing this code.
+	 */
+	fsalattr->atime = posix2fsal_time(buffstat->st_atime, 0);
+	fsalattr->ctime = posix2fsal_time(buffstat->st_ctime, 0);
+	fsalattr->mtime = posix2fsal_time(buffstat->st_mtime, 0);
 
-	if (FSAL_TEST_MASK(fsalattr->mask, ATTR_CTIME))
-		fsalattr->ctime = posix2fsal_time(buffstat->st_ctime, 0);
-
-	if (FSAL_TEST_MASK(fsalattr->mask, ATTR_MTIME))
-		fsalattr->mtime = posix2fsal_time(buffstat->st_mtime, 0);
-
-	if (FSAL_TEST_MASK(fsalattr->mask, ATTR_CHGTIME)) {
-		fsalattr->chgtime = posix2fsal_time(MAX(buffstat->st_mtime,
+	fsalattr->chgtime = posix2fsal_time(MAX(buffstat->st_mtime,
 						buffstat->st_ctime), 0);
-		fsalattr->change = fsalattr->chgtime.tv_sec;
-	}
+	fsalattr->change = fsalattr->chgtime.tv_sec;
 
-	if (FSAL_TEST_MASK(fsalattr->mask, ATTR_SPACEUSED))
-		fsalattr->spaceused = buffstat->st_blocks * S_BLKSIZE;
+	fsalattr->spaceused = buffstat->st_blocks * S_BLKSIZE;
 
-	if (FSAL_TEST_MASK(fsalattr->mask, ATTR_RAWDEV))
-		fsalattr->rawdev = posix2fsal_devt(buffstat->st_rdev);
+	fsalattr->rawdev = posix2fsal_devt(buffstat->st_rdev);
 }
 
 struct fsal_staticfsinfo_t *gluster_staticinfo(struct fsal_module *hdl)
@@ -244,63 +136,40 @@ struct fsal_staticfsinfo_t *gluster_staticinfo(struct fsal_module *hdl)
  * @return 0 on success, negative error codes on failure.
  */
 
-int construct_handle(struct glusterfs_export *glexport, const struct stat *sb,
-		     struct glfs_object *glhandle, unsigned char *globjhdl,
-		     int len, struct glusterfs_handle **obj,
-		     const char *vol_uuid)
+void construct_handle(struct glusterfs_export *glexport, const struct stat *st,
+		      struct glfs_object *glhandle, unsigned char *globjhdl,
+		      int len, struct glusterfs_handle **obj,
+		      const char *vol_uuid)
 {
 	struct glusterfs_handle *constructing = NULL;
-	fsal_status_t status = { ERR_FSAL_NO_ERROR, 0 };
 	glusterfs_fsal_xstat_t buffxstat;
 
-	*obj = NULL;
 	memset(&buffxstat, 0, sizeof(glusterfs_fsal_xstat_t));
 
 	constructing = gsh_calloc(1, sizeof(struct glusterfs_handle));
-	if (constructing == NULL) {
-		errno = ENOMEM;
-		return -1;
-	}
-
-	constructing->handle.attributes.mask =
-		glexport->export.exp_ops.fs_supported_attrs(&glexport->export);
-
-	stat2fsal_attributes(sb, &constructing->handle.attributes);
-
-	status = glusterfs_get_acl(glexport, glhandle, &buffxstat,
-				   &constructing->handle.attributes);
-
-	if (FSAL_IS_ERROR(status)) {
-		/* TODO: Is the error appropriate */
-		errno = EINVAL;
-		gsh_free(constructing);
-		return -1;
-	}
 
 	constructing->glhandle = glhandle;
 	memcpy(constructing->globjhdl, vol_uuid, GLAPI_UUID_LENGTH);
 	memcpy(constructing->globjhdl+GLAPI_UUID_LENGTH, globjhdl,
 	       GFAPI_HANDLE_LENGTH);
-	constructing->glfd = NULL;
+	constructing->globalfd.glfd = NULL;
 
 	fsal_obj_handle_init(&constructing->handle, &glexport->export,
-			     constructing->handle.attributes.type);
+			     posix2fsal_type(st->st_mode));
+	constructing->handle.fsid = posix2fsal_fsid(st->st_dev);
+	constructing->handle.fileid = st->st_ino;
 	handle_ops_init(&constructing->handle.obj_ops);
 
 	*obj = constructing;
-
-	return 0;
 }
 
 void gluster_cleanup_vars(struct glfs_object *glhandle)
 {
 	if (glhandle) {
-		/* Error ignored, this is a cleanup operation, can't do much.
-		 * TODO: Useful point for logging? */
+		/* Error ignored, this is a cleanup operation, can't do much. */
+		/** @todo: Useful point for logging? */
 		glfs_h_close(glhandle);
 	}
-
-	return;
 }
 
 /* fs_specific_has() parses the fs_specific string for a particular key,
@@ -322,10 +191,6 @@ bool fs_specific_has(const char *fs_specific, const char *key, char *val,
 		return false;
 
 	fso_dup = gsh_strdup(fs_specific);
-	if (!fso_dup) {
-		LogCrit(COMPONENT_FSAL, "strdup(%s) failed", fs_specific);
-		return false;
-	}
 
 	for (option = strtok_r(fso_dup, ",", &next_comma); option;
 	     option = strtok_r(NULL, ",", &next_comma)) {
@@ -381,94 +246,6 @@ int setglustercreds(struct glusterfs_export *glfs_export, uid_t *uid,
 	return rc;
 }
 
-#ifdef POSIX_ACL_CONVERSION
-/*
- *  Given a FSAL ACL convert it into an equivalent POSIX ACL
- */
-fsal_status_t fsal_acl_2_glusterfs_posix_acl(fsal_acl_t *p_fsalacl,
-				  char *p_buffacl)
-{
-	int i;
-	fsal_ace_t *pace;
-	glusterfs_acl_t *p_glusterfsacl;
-
-	p_glusterfsacl = (glusterfs_acl_t *) p_buffacl;
-
-	p_glusterfsacl->acl_level = 0;
-	p_glusterfsacl->acl_version = GLUSTERFS_ACL_VERSION_POSIX;
-	p_glusterfsacl->acl_type = GLUSTERFS_ACL_TYPE_ACCESS;
-	p_glusterfsacl->acl_nace = 0;
-
-	for (pace = p_fsalacl->aces, i = 0;
-	     pace < p_fsalacl->aces + p_fsalacl->naces; pace++, i++) {
-
-		if (!IS_FSAL_ACE_ALLOW(*pace))
-			continue;
-
-		p_glusterfsacl->acl_nace++;
-		if (IS_FSAL_ACE_SPECIAL_ID(*pace)) {
-			/* POSIX ACLs do not contain IDs for the special ACEs */
-			p_glusterfsacl->ace_v1[i].ace_id =
-				GLUSTERFS_ACL_UNDEFINED_ID;
-			switch (pace->who.uid) {
-			case FSAL_ACE_SPECIAL_OWNER:
-				p_glusterfsacl->ace_v1[i].ace_tag =
-					 GLUSTERFS_ACL_USER_OBJ;
-				break;
-			case FSAL_ACE_SPECIAL_GROUP:
-				p_glusterfsacl->ace_v1[i].ace_tag =
-				       GLUSTERFS_ACL_GROUP_OBJ;
-				break;
-			case FSAL_ACE_SPECIAL_EVERYONE:
-				p_glusterfsacl->ace_v1[i].ace_tag =
-					GLUSTERFS_ACL_OTHER;
-				break;
-			}
-		} else {
-			/*
-			 * TODO: POSIX ACLs do not support multiple USER/GROUP
-			 * Aces with same UID/GID. What about duplicates
-			 */
-			if (IS_FSAL_ACE_GROUP_ID(*pace)) {
-				p_glusterfsacl->ace_v1[i].ace_tag =
-					GLUSTERFS_ACL_GROUP;
-				p_glusterfsacl->ace_v1[i].ace_id =
-					pace->who.gid;
-			} else {
-				p_glusterfsacl->ace_v1[i].ace_tag =
-					GLUSTERFS_ACL_USER;
-				p_glusterfsacl->ace_v1[i].ace_id =
-					pace->who.uid;
-			}
-		}
-		p_glusterfsacl->ace_v1[i].ace_perm = 0;
-		p_glusterfsacl->ace_v1[i].ace_perm |=
-			((pace->perm & ACE4_MASK_READ_DATA) ?
-				GLUSTERFS_ACL_READ : 0);
-		p_glusterfsacl->ace_v1[i].ace_perm |=
-			((pace->perm & ACE4_MASK_WRITE_DATA) ?
-				GLUSTERFS_ACL_WRITE : 0);
-		p_glusterfsacl->ace_v1[i].ace_perm |=
-			((pace->perm & ACE4_MASK_EXECUTE) ?
-				GLUSTERFS_ACL_EXECUTE : 0);
-	}
-	/* TODO: calculate appropriate aceMask */
-	p_glusterfsacl->ace_v1[i].ace_tag = GLUSTERFS_ACL_MASK;
-	p_glusterfsacl->ace_v1[i].ace_perm |=  (GLUSTERFS_ACL_READ |
-							GLUSTERFS_ACL_WRITE);
-	p_glusterfsacl->acl_nace++;
-
-	/* One extra ace for mask */
-	p_glusterfsacl->acl_len =
-	    ((int)(signed long)&(((glusterfs_acl_t *) 0)->ace_v1)) +
-	    (p_glusterfsacl->acl_nace) * sizeof(glusterfs_ace_v1_t);
-
-	/* TODO: Sort the aces in the order of OWNER, USER, GROUP & EVRYONE */
-
-	return fsalstat(ERR_FSAL_NO_ERROR, 0);
-}
-#endif
-
 /*
  * Read the ACL in GlusterFS format and convert it into fsal ACL before
  * storing it in fsalattr
@@ -478,40 +255,98 @@ fsal_status_t glusterfs_get_acl(struct glusterfs_export *glfs_export,
 				glusterfs_fsal_xstat_t *buffxstat,
 				struct attrlist *fsalattr)
 {
-	int rc = 0;
-	const char *acl_key = "user.nfsv4_acls";
-	glusterfs_acl_t *acl = NULL;
+	fsal_status_t status = { ERR_FSAL_NO_ERROR, 0 };
+	fsal_acl_data_t acldata;
+	fsal_acl_status_t aclstatus;
+	fsal_ace_t *pace = NULL;
+	int e_count = 0, i_count = 0, new_count = 0, new_i_count = 0;
 
-	fsalattr->acl = NULL;
+	if (fsalattr->acl != NULL) {
+		/* We should never be passed attributes that have an
+		 * ACL attached, but just in case some future code
+		 * path changes that assumption, let's release the
+		 * old ACL properly.
+		 */
+		int acl_status;
 
-	if (NFSv4_ACL_SUPPORT && FSAL_TEST_MASK(fsalattr->mask, ATTR_ACL)) {
-		rc = glfs_h_getxattrs(glfs_export->gl_fs,
-				      glhandle,
-				      acl_key, buffxstat->buffacl,
-				      GLFS_ACL_BUF_SIZE);
-		if (rc > 0) {
-			/* rc is the size of buffacl */
-			acl = (glusterfs_acl_t *) buffxstat->buffacl;
-			FSAL_SET_MASK(buffxstat->attr_valid, XATTR_ACL);
-			LogFullDebug(COMPONENT_FSAL, "acl = %p", fsalattr->acl);
-		} else if (rc == 0 || (rc == -1 && errno == ENOATTR)) {
-			/* ACL is empty, or no ACL has been set */
-			FSAL_SET_MASK(buffxstat->attr_valid, XATTR_ACL);
-			LogFullDebug(COMPONENT_FSAL, "no ACL-xattr set");
-		} else {
-			/* some real error occurred */
-			LogMajor(COMPONENT_FSAL, "failed to fetch ACL");
-			return fsalstat(ERR_FSAL_SERVERFAULT, errno);
-		}
+		acl_status = nfs4_acl_release_entry(fsalattr->acl);
 
-		rc = glusterfs_acl_2_fsal_acl(fsalattr, acl);
-		if (rc != ERR_FSAL_NO_ERROR) {
-			LogMajor(COMPONENT_FSAL, "failed to convert ACL");
-			return fsalstat(ERR_FSAL_SERVERFAULT, errno);
-		}
+		if (acl_status != NFS_V4_ACL_SUCCESS)
+			LogCrit(COMPONENT_FSAL,
+				"Failed to release old acl, status=%d",
+				acl_status);
+
+		fsalattr->acl = NULL;
 	}
 
-	return fsalstat(ERR_FSAL_NO_ERROR, 0);
+	if (NFSv4_ACL_SUPPORT) {
+
+		buffxstat->e_acl = glfs_h_acl_get(glfs_export->gl_fs,
+						glhandle, ACL_TYPE_ACCESS);
+
+		if (!buffxstat->e_acl) {
+			status = gluster2fsal_error(errno);
+			return status;
+		}
+
+		e_count = ace_count(buffxstat->e_acl);
+
+		if (buffxstat->is_dir) {
+			buffxstat->i_acl = glfs_h_acl_get(glfs_export->gl_fs,
+						glhandle, ACL_TYPE_DEFAULT);
+			i_count = ace_count(buffxstat->i_acl);
+		}
+
+		/* Allocating memory for both ALLOW and DENY entries */
+		acldata.naces = 2 * (e_count  + i_count);
+
+		LogDebug(COMPONENT_FSAL, "No of aces present in fsal_acl_t = %d"
+					, acldata.naces);
+		if (!acldata.naces)
+			return status;
+
+		FSAL_SET_MASK(buffxstat->attr_valid, XATTR_ACL);
+
+		acldata.aces = (fsal_ace_t *) nfs4_ace_alloc(acldata.naces);
+		pace = acldata.aces;
+
+		new_count = posix_acl_2_fsal_acl(buffxstat->e_acl,
+					buffxstat->is_dir, false, &pace);
+		if (new_count < 0)
+			return fsalstat(ERR_FSAL_NO_ACE, -1);
+
+		if (i_count > 0) {
+			new_i_count = posix_acl_2_fsal_acl(buffxstat->i_acl,
+							true, true, &pace);
+			if (new_i_count > 0)
+				new_count += new_i_count;
+			else
+				LogDebug(COMPONENT_FSAL,
+				"Inherit acl is not set for this directory");
+		}
+
+		/* Reallocating acldata into the required size */
+		acldata.aces = (fsal_ace_t *) gsh_realloc(acldata.aces,
+				new_count*sizeof(fsal_ace_t));
+		acldata.naces = new_count;
+
+		fsalattr->acl = nfs4_acl_new_entry(&acldata, &aclstatus);
+		LogDebug(COMPONENT_FSAL, "fsal acl = %p, fsal_acl_status = %u",
+				fsalattr->acl, aclstatus);
+		if (fsalattr->acl == NULL) {
+			LogCrit(COMPONENT_FSAL,
+			"failed to create a new acl entry");
+			return fsalstat(ERR_FSAL_NOMEM, -1);
+		}
+
+		fsalattr->valid_mask |= ATTR_ACL;
+	} else {
+		/* We were asked for ACL but do not support. */
+		status = fsalstat(ERR_FSAL_NOTSUPP, 0);
+	}
+
+	return status;
+
 }
 
 /*
@@ -522,398 +357,25 @@ fsal_status_t glusterfs_set_acl(struct glusterfs_export *glfs_export,
 				glusterfs_fsal_xstat_t *buffxstat)
 {
 	int rc = 0;
-	char *acl_key = "user.nfsv4_acls";
-	glusterfs_acl_t *acl_p;
-	unsigned int acl_total_size = 0;
 
-	if (!NFSv4_ACL_SUPPORT)
-		return fsalstat(ERR_FSAL_ATTRNOTSUPP, 0);
-
-	acl_p = (glusterfs_acl_t *)(buffxstat->buffacl);
-	acl_total_size = acl_p->acl_len;
-	rc = glfs_h_setxattrs(glfs_export->gl_fs, objhandle->glhandle,
-			      acl_key, buffxstat->buffacl,
-			      acl_total_size, 0);
-
+	rc = glfs_h_acl_set(glfs_export->gl_fs, objhandle->glhandle,
+				ACL_TYPE_ACCESS, buffxstat->e_acl);
 	if (rc < 0) {
-		/* TODO: check if error is appropriate.*/
+		/** @todo: check if error is appropriate.*/
+		LogMajor(COMPONENT_FSAL, "failed to set access type posix acl");
 		return fsalstat(ERR_FSAL_INVAL, 0);
 	}
-
+	/* For directories consider inherited acl too */
+	if (buffxstat->is_dir && buffxstat->i_acl) {
+		rc = glfs_h_acl_set(glfs_export->gl_fs, objhandle->glhandle,
+				ACL_TYPE_DEFAULT, buffxstat->i_acl);
+		if (rc < 0) {
+			LogMajor(COMPONENT_FSAL,
+				 "failed to set default type posix acl");
+			return fsalstat(ERR_FSAL_INVAL, 0);
+		}
+	}
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
-}
-
-/*
- *  Given a FSAL ACL convert it into GLUSTERFS ACL format.
- *  Also, compute mode-bits equivalent to the ACL set and
- *  store in st_mode.
- */
-fsal_status_t fsal_acl_2_glusterfs_acl(fsal_acl_t *p_fsalacl,
-				  char *p_buffacl, uint32_t *st_mode)
-{
-	int i;
-	fsal_ace_t *pace;
-	glusterfs_acl_t *p_glusterfsacl;
-
-	/* sanity checks */
-	if (!p_fsalacl || !p_buffacl || !st_mode)
-		return fsalstat(ERR_FSAL_FAULT, 0);
-
-	p_glusterfsacl = (glusterfs_acl_t *) p_buffacl;
-
-	p_glusterfsacl->acl_level = 0;
-	p_glusterfsacl->acl_version = GLUSTERFS_ACL_VERSION_NFS4;
-	p_glusterfsacl->acl_type = GLUSTERFS_ACL_TYPE_NFS4;
-	p_glusterfsacl->acl_nace = p_fsalacl->naces;
-	p_glusterfsacl->acl_len =
-	    ((int)(signed long)&(((glusterfs_acl_t *) 0)->ace_v1)) +
-	    p_glusterfsacl->acl_nace * sizeof(glusterfs_ace_v4_t);
-
-	for (pace = p_fsalacl->aces, i = 0;
-	     pace < p_fsalacl->aces + p_fsalacl->naces; pace++, i++) {
-
-		/* check for the unsupported ACE types. */
-		if (!(IS_FSAL_ACE_ALLOW(*pace) ||
-				 IS_FSAL_ACE_DENY(*pace))) {
-			return fsalstat(ERR_FSAL_ATTRNOTSUPP, 0);
-		}
-
-		/*
-		 * Check for unsupported ACE flags
-		 * Apart from 'ACE4_IDENTIFIER_GROUP', currently we do
-		 * not support Inherit and AUDIT/ALARM ACE flags
-		 */
-		if (GET_FSAL_ACE_FLAG(*pace) & ~ACE4_FLAG_SUPPORTED)
-			return fsalstat(ERR_FSAL_ATTRNOTSUPP, 0);
-
-		p_glusterfsacl->ace_v4[i].aceType = pace->type;
-		p_glusterfsacl->ace_v4[i].aceFlags = pace->flag;
-		p_glusterfsacl->ace_v4[i].aceIFlags = pace->iflag;
-		p_glusterfsacl->ace_v4[i].aceMask = pace->perm;
-
-		if (IS_FSAL_ACE_SPECIAL_ID(*pace)) {
-			p_glusterfsacl->ace_v4[i].aceWho = pace->who.uid;
-			if (IS_FSAL_ACE_ALLOW(*pace))
-				CHANGE_MODE_BITS(*pace);
-		} else {
-			if (IS_FSAL_ACE_GROUP_ID(*pace))
-				p_glusterfsacl->ace_v4[i].aceWho =
-					pace->who.gid;
-			else
-				p_glusterfsacl->ace_v4[i].aceWho =
-					pace->who.uid;
-		}
-
-		LogMidDebug(COMPONENT_FSAL,
-			 "fsal_acl_2_glusterfs_acl:glusterfs ace:type = 0x%x, flag = 0x%x, perm = 0x%x, special = %d, %s = 0x%x",
-			 p_glusterfsacl->ace_v4[i].aceType,
-			 p_glusterfsacl->ace_v4[i].aceFlags,
-			 p_glusterfsacl->ace_v4[i].aceMask,
-			 (p_glusterfsacl->ace_v4[i].
-			  aceIFlags & FSAL_ACE_IFLAG_SPECIAL_ID) ? 1 : 0,
-			 (p_glusterfsacl->ace_v4[i].
-			  aceFlags & FSAL_ACE_FLAG_GROUP_ID) ? "gid" : "uid",
-			 p_glusterfsacl->ace_v4[i].aceWho);
-
-	}
-
-	return fsalstat(ERR_FSAL_NO_ERROR, 0);
-}
-
-/*
- *  Given a GLUSTERFS ACL convert it into FSAL ACL format
- */
-int glusterfs_acl_2_fsal_acl(struct attrlist *p_object_attributes,
-			       glusterfs_acl_t *p_glusterfsacl)
-{
-	fsal_acl_status_t status;
-	fsal_acl_data_t acldata;
-	fsal_ace_t *pace = NULL;
-	fsal_acl_t *pacl = NULL;
-	glusterfs_ace_v4_t *pace_glusterfs;
-
-	/* sanity checks */
-	if (!p_object_attributes)
-		return ERR_FSAL_FAULT;
-
-	if (!FSAL_TEST_MASK(p_object_attributes->mask, ATTR_ACL))
-		return ERR_FSAL_ATTRNOTSUPP;
-
-	/* Create fsal acl data. */
-	acldata.naces = (p_glusterfsacl ? p_glusterfsacl->acl_nace : 0);
-	acldata.aces = (fsal_ace_t *) nfs4_ace_alloc(acldata.naces);
-
-	/* return if ACL not present
-	 *
-	 * TODO: should the ACL be built from the p_object_attributes->mode?
-	 */
-	if (!acldata.naces)
-		return ERR_FSAL_NO_ERROR;
-
-	/* Fill fsal acl data from glusterfs acl. */
-	for (pace = acldata.aces, pace_glusterfs = p_glusterfsacl->ace_v4;
-	     pace < acldata.aces + acldata.naces; pace++, pace_glusterfs++) {
-		pace->type = pace_glusterfs->aceType;
-		pace->flag = pace_glusterfs->aceFlags;
-		pace->iflag = pace_glusterfs->aceIFlags;
-		pace->perm = pace_glusterfs->aceMask;
-
-		if (IS_FSAL_ACE_SPECIAL_ID(*pace)) { /* Record special user. */
-			pace->who.uid = pace_glusterfs->aceWho;
-		} else {
-			if (IS_FSAL_ACE_GROUP_ID(*pace))
-				pace->who.gid = pace_glusterfs->aceWho;
-			else	/* Record user. */
-				pace->who.uid = pace_glusterfs->aceWho;
-		}
-
-		LogMidDebug(COMPONENT_FSAL,
-			 "glusterfs_acl_2_fsal_acl: fsal ace: type = 0x%x, flag = 0x%x, perm = 0x%x, special = %d, %s = 0x%x",
-			 pace->type, pace->flag, pace->perm,
-			 IS_FSAL_ACE_SPECIAL_ID(*pace),
-			 GET_FSAL_ACE_WHO_TYPE(*pace), GET_FSAL_ACE_WHO(*pace));
-	}
-
-	/* Create a new hash table entry for fsal acl. */
-	pacl = nfs4_acl_new_entry(&acldata, &status);
-	LogMidDebug(COMPONENT_FSAL, "fsal acl = %p, fsal_acl_status = %u", pacl,
-		 status);
-
-	if (pacl == NULL) {
-		LogCrit(COMPONENT_FSAL,
-			"glusterfs_acl_2_fsal_acl: failed to create a new acl entry");
-		return ERR_FSAL_FAULT;
-	}
-
-	/* Add fsal acl to attribute. */
-	p_object_attributes->acl = pacl;
-
-	return ERR_FSAL_NO_ERROR;
-}
-
-/*
- *  Given mode-bits, first verify if the object already has an ACL set.
- *  Only if there is an ACL present, modify it accordingly as per
- *  the mode-bits set.
- */
-fsal_status_t mode_bits_to_acl(struct glfs *fs,
-			       struct glusterfs_handle *objhandle,
-			       struct attrlist *attrs, int *attrs_valid,
-			       glusterfs_fsal_xstat_t *buffxstat,
-			       bool is_dir)
-{
-	fsal_status_t status = { ERR_FSAL_NO_ERROR, 0 };
-	int rc = 0;
-	char *acl_key = "user.nfsv4_acls";
-	glusterfs_acl_t *p_glusterfsacl;
-	glusterfs_ace_v4_t *pace_Aowner = NULL;
-	glusterfs_ace_v4_t *pace_Downer = NULL;
-	glusterfs_ace_v4_t *pace_Agroup = NULL;
-	glusterfs_ace_v4_t *pace_Dgroup = NULL;
-	glusterfs_ace_v4_t *pace_Aeveryone = NULL;
-	glusterfs_ace_v4_t *pace_Deveryone = NULL;
-	glusterfs_ace_v4_t *pace = NULL;
-	fsal_ace_t face;
-	bool read_owner = false;
-	bool write_owner = false;
-	bool execute_owner = false;
-	bool read_group = false;
-	bool write_group = false;
-	bool execute_group = false;
-	bool read_everyone = false;
-	bool write_everyone = false;
-	bool execute_everyone = false;
-
-	rc = glfs_h_getxattrs(fs, objhandle->glhandle,
-			      acl_key, buffxstat->buffacl,
-			      GLFS_ACL_BUF_SIZE);
-	if (rc == 0 || (rc == -1 && errno == ENOATTR)) {
-		/* No ACL found
-		   TODO : Do we need to construct aces?
-		   TODO: check for failure conditions */
-		LogFullDebug(COMPONENT_FSAL, "no ACL-xattr set");
-		goto out;
-	} else if (rc == -1) {
-		LogMajor(COMPONENT_FSAL, "failed to fetch ACL");
-		status = fsalstat(ERR_FSAL_SERVERFAULT, errno);
-		goto out;
-	}
-	/* there is an existing acl. modify it */
-	FSAL_SET_MASK(*attrs_valid, XATTR_ACL);
-
-	p_glusterfsacl = (glusterfs_acl_t *)buffxstat->buffacl;
-
-	read_owner = IS_READ_OWNER(attrs->mode);
-	write_owner = IS_WRITE_OWNER(attrs->mode);
-	execute_owner = IS_EXECUTE_OWNER(attrs->mode);
-	read_group = IS_READ_GROUP(attrs->mode);
-	write_group = IS_WRITE_GROUP(attrs->mode);
-	execute_group = IS_EXECUTE_GROUP(attrs->mode);
-	read_everyone = IS_READ_OTHERS(attrs->mode);
-	write_everyone = IS_WRITE_OTHERS(attrs->mode);
-	execute_everyone = IS_EXECUTE_OTHERS(attrs->mode);
-
-	for (pace = p_glusterfsacl->ace_v4;
-	     pace < p_glusterfsacl->ace_v4 + p_glusterfsacl->acl_nace;
-	     pace++) {
-		/* TODO: try to avoid converting it to FSAL ACE format */
-		face.type = pace->aceType;
-		face.flag = pace->aceFlags;
-		face.iflag = pace->aceIFlags;
-		face.who.uid = pace->aceWho;
-
-		if (IS_FSAL_ACE_ALLOW(face)) {
-			if (IS_FSAL_ACE_SPECIAL_ID(face)) {
-				/* NULL out the mask */
-				pace->aceMask = 0;
-				if (IS_FSAL_ACE_SPECIAL_OWNER(face)) {
-					pace_Aowner = pace;
-				} else if (IS_FSAL_ACE_SPECIAL_GROUP(face)) {
-					pace_Agroup = pace;
-				} else { /* everyone */
-					pace_Aeveryone = pace;
-				}
-			}
-			pace->aceMask |= ACE4_OTHERS_AUTOSET;
-		} else { /* deny ace */
-			if (IS_FSAL_ACE_SPECIAL_ID(face)) {
-				if (IS_FSAL_ACE_SPECIAL_OWNER(face)) {
-					pace_Downer = pace;
-				} else if (IS_FSAL_ACE_SPECIAL_GROUP(face)) {
-					pace_Dgroup = pace;
-				} else { /* everyone */
-					pace_Deveryone = pace;
-				}
-			}
-			pace->aceMask &= ~(ACE4_OTHERS_AUTOSET);
-		}
-	}
-
-	/*
-	 *  Now add the missing Allow aces (if any) at the end in the order of
-	 *  OWNER@, GROUP@, EVERYONE@. Deny aces need not be added as the masks
-	 *  will by default be denied if not present in the Allow ace.
-	 */
-	if (!pace_Aowner) {
-		p_glusterfsacl->acl_nace++;
-		p_glusterfsacl->acl_len += sizeof(glusterfs_ace_v4_t);
-		pace->aceType = FSAL_ACE_TYPE_ALLOW;
-		pace->aceIFlags = FSAL_ACE_IFLAG_SPECIAL_ID;
-		pace->aceFlags = 0;
-		pace->aceMask = 0;
-		/* No need to set aceFlags as its default ace */
-		pace->aceWho = FSAL_ACE_SPECIAL_OWNER;
-		pace->aceMask |= ACE4_OTHERS_AUTOSET;
-		pace_Aowner = pace;
-		pace++;
-	}
-	if (!pace_Agroup) {
-		p_glusterfsacl->acl_nace++;
-		p_glusterfsacl->acl_len += sizeof(glusterfs_ace_v4_t);
-		pace->aceType = FSAL_ACE_TYPE_ALLOW;
-		pace->aceIFlags = FSAL_ACE_IFLAG_SPECIAL_ID;
-		pace->aceFlags = 0;
-		pace->aceMask = 0;
-		/* No need to set aceFlags as its default ace*/
-		pace->aceWho = FSAL_ACE_SPECIAL_GROUP;
-		pace->aceMask |= ACE4_OTHERS_AUTOSET;
-		pace_Agroup = pace;
-		pace++;
-	}
-	if (!pace_Aeveryone) {
-		p_glusterfsacl->acl_nace++;
-		p_glusterfsacl->acl_len += sizeof(glusterfs_ace_v4_t);
-		pace->aceType = FSAL_ACE_TYPE_ALLOW;
-		pace->aceIFlags = FSAL_ACE_IFLAG_SPECIAL_ID;
-		pace->aceFlags = 0;
-		pace->aceMask = 0;
-		/* No need to set aceFlags as its default ace */
-		pace->aceWho = FSAL_ACE_SPECIAL_EVERYONE;
-		pace->aceMask |= ACE4_OTHERS_AUTOSET;
-		pace_Aeveryone = pace;
-		pace++;
-	}
-
-	/* Now adjust perms for special aces */
-	if (pace_Aowner) {
-		pace_Aowner->aceMask |= ACE4_OWNER_AUTOSET;
-		if (read_owner) {
-			pace_Aowner->aceMask |=
-			     is_dir ? ACE4_READ_DIR_ALL : ACE4_READ_ALL;
-		}
-		if (write_owner) {
-			pace_Aowner->aceMask |=
-			     is_dir ? ACE4_WRITE_DIR_ALL : ACE4_WRITE_ALL;
-		}
-		if (execute_owner)
-			pace_Aowner->aceMask |= ACE4_EXECUTE_ALL;
-	}
-	if (pace_Downer) {
-		pace_Downer->aceMask &= ~(ACE4_OWNER_AUTOSET);
-		if (read_owner) {
-			pace_Downer->aceMask &=
-			     is_dir ? ~(ACE4_READ_DIR_ALL) : ~(ACE4_READ_ALL);
-		}
-		if (write_owner) {
-			pace_Downer->aceMask &=
-			     is_dir ? ~(ACE4_WRITE_DIR_ALL) : ~(ACE4_WRITE_ALL);
-		}
-		if (execute_owner)
-			pace_Downer->aceMask &= is_dir ? : ~(ACE4_EXECUTE_ALL);
-	}
-	if (pace_Agroup) {
-		if (read_group) {
-			pace_Agroup->aceMask |=
-			     is_dir ? ACE4_READ_DIR_ALL : ACE4_READ_ALL;
-		}
-		if (write_group) {
-			pace_Agroup->aceMask |=
-			     is_dir ? ACE4_WRITE_DIR_ALL : ACE4_WRITE_ALL;
-		}
-		if (execute_group)
-			pace_Agroup->aceMask |= ACE4_EXECUTE_ALL;
-	}
-	if (pace_Dgroup) {
-		if (read_group) {
-			pace_Dgroup->aceMask &=
-			     is_dir ? ~(ACE4_READ_DIR_ALL) : ~(ACE4_READ_ALL);
-		}
-		if (write_group) {
-			pace_Dgroup->aceMask &=
-			     is_dir ? ~(ACE4_WRITE_DIR_ALL) : ~(ACE4_WRITE_ALL);
-		}
-		if (execute_group)
-			pace_Dgroup->aceMask &= is_dir ? : ~(ACE4_EXECUTE_ALL);
-	}
-	if (pace_Aeveryone) {
-		if (read_everyone) {
-			pace_Aeveryone->aceMask |=
-			     is_dir ? ACE4_READ_DIR_ALL : ACE4_READ_ALL;
-		}
-		if (write_everyone) {
-			pace_Aeveryone->aceMask |=
-			     is_dir ? ACE4_WRITE_DIR_ALL : ACE4_WRITE_ALL;
-		}
-		if (execute_everyone)
-			pace_Aeveryone->aceMask |= ACE4_EXECUTE_ALL;
-	}
-	if (pace_Deveryone) {
-		if (read_everyone) {
-			pace_Deveryone->aceMask &=
-			     is_dir ? ~(ACE4_READ_DIR_ALL) : ~(ACE4_READ_ALL);
-		}
-		if (write_everyone) {
-			pace_Deveryone->aceMask &=
-			     is_dir ? ~(ACE4_WRITE_DIR_ALL) : ~(ACE4_WRITE_ALL);
-		}
-		if (execute_everyone) {
-			pace_Deveryone->aceMask &=
-			     is_dir ? : ~(ACE4_EXECUTE_ALL);
-		}
-	}
-
-out:
-	return status;
 }
 
 /*
@@ -924,32 +386,105 @@ fsal_status_t glusterfs_process_acl(struct glfs *fs,
 				    struct attrlist *attrs,
 				    glusterfs_fsal_xstat_t *buffxstat)
 {
-	fsal_status_t status = { ERR_FSAL_NO_ERROR, 0 };
-	uint32_t fsal_mode;
-
-	memset(&buffxstat->buffacl, 0, GLFS_ACL_BUF_SIZE);
-	fsal_mode = unix2fsal_mode(buffxstat->buffstat.st_mode);
-
 	if (attrs->acl) {
 		LogDebug(COMPONENT_FSAL, "setattr acl = %p",
 			 attrs->acl);
 
-		/* Clear owner,group,everyone mode-bits */
-		fsal_mode &= CLEAR_MODE_BITS;
+		/* Convert FSAL ACL to POSIX ACL */
+		buffxstat->e_acl = fsal_acl_2_posix_acl(attrs->acl,
+						ACL_TYPE_ACCESS);
+		if (!buffxstat->e_acl) {
+			LogMajor(COMPONENT_FSAL,
+				 "failed to set access type posix acl");
+			return fsalstat(ERR_FSAL_FAULT, 0);
+		}
+		/* For directories consider inherited acl too */
+		if (buffxstat->is_dir) {
+			buffxstat->i_acl = fsal_acl_2_posix_acl(attrs->acl,
+							ACL_TYPE_DEFAULT);
+			if (!buffxstat->i_acl)
+				LogDebug(COMPONENT_FSAL,
+				"inherited acl is not defined for directory");
+		}
 
-		/* Convert FSAL ACL to GLUSTERFS NFS4 ACL and fill buffer. */
-		status =
-		    fsal_acl_2_glusterfs_acl(attrs->acl,
-					buffxstat->buffacl, &fsal_mode);
-		buffxstat->buffstat.st_mode = fsal2unix_mode(fsal_mode);
-
-		if (FSAL_IS_ERROR(status))
-			return status;
 	} else {
 		LogCrit(COMPONENT_FSAL, "setattr acl is NULL");
 		return fsalstat(ERR_FSAL_FAULT, 0);
 	}
-	return status;
+	return fsalstat(ERR_FSAL_NO_ERROR, 0);
+}
+
+int initiate_up_thread(struct glusterfs_export *glfsexport)
+{
+
+	pthread_attr_t up_thr_attr;
+	int retval  = -1;
+	int err   = 0;
+	int retries = 10;
+
+	memset(&up_thr_attr, 0, sizeof(up_thr_attr));
+
+	/* Initialization of thread attributes from nfs_init.c */
+	err = pthread_attr_init(&up_thr_attr);
+	if (err) {
+		LogCrit(COMPONENT_THREAD,
+			"can't init pthread's attributes (%s)",
+			strerror(err));
+		goto out;
+	}
+
+	err = pthread_attr_setscope(&up_thr_attr,
+				      PTHREAD_SCOPE_SYSTEM);
+	if (err) {
+		LogCrit(COMPONENT_THREAD,
+			"can't set pthread's scope (%s)",
+			strerror(err));
+		goto out;
+	}
+
+	err = pthread_attr_setdetachstate(&up_thr_attr,
+					  PTHREAD_CREATE_JOINABLE);
+	if (err) {
+		LogCrit(COMPONENT_THREAD,
+			"can't set pthread's join state (%s)",
+			strerror(err));
+		goto out;
+	}
+
+	err = pthread_attr_setstacksize(&up_thr_attr, 2116488);
+	if (err) {
+		LogCrit(COMPONENT_THREAD,
+			"can't set pthread's stack size (%s)",
+			strerror(err));
+		goto out;
+	}
+
+	do {
+		err = pthread_create(&glfsexport->up_thread,
+					&up_thr_attr,
+					GLUSTERFSAL_UP_Thread,
+					glfsexport);
+		sleep(1);
+	} while (err && (err == EAGAIN) && (retries-- > 0));
+
+	if (err) {
+		LogCrit(COMPONENT_THREAD,
+			"can't create upcall pthread (%s)",
+			strerror(err));
+		goto out;
+	}
+
+	retval = 0;
+
+out:
+	err = pthread_attr_destroy(&up_thr_attr);
+	if (err) {
+		LogCrit(COMPONENT_THREAD,
+			"can't destroy pthread's attributes (%s)",
+			strerror(err));
+	}
+
+	return retval;
 }
 
 #ifdef GLTIMING
@@ -965,9 +500,8 @@ void latency_dump(void)
 	int i = 0;
 
 	for (; i < LATENCY_SLOTS; i++) {
-		LogCrit(COMPONENT_FSAL, "Op:%d:Count:%llu:nsecs:%llu", i,
-			(long long unsigned int)glfsal_latencies[i].count,
-			(long long unsigned int)glfsal_latencies[i].
+		LogCrit(COMPONENT_FSAL, "Op:%d:Count:%"PRIu64":nsecs:%"PRIu64,
+			i, glfsal_latencies[i].count, glfsal_latencies[i].
 			overall_time);
 	}
 }

@@ -6,7 +6,7 @@
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
- * as published by the Free Software F oundation; either version 3 of
+ * as published by the Free Software Foundation; either version 3 of
  * the License, or (at your option) any later version.
  *
  * This program is distributed in the hope that it will be useful, but
@@ -46,7 +46,6 @@
 #include "nfs4.h"
 #include "fsal.h"
 #include "sal_functions.h"
-#include "cache_inode_lru.h"
 #include "abstract_atomic.h"
 #include "city.h"
 #include "client_mgr.h"
@@ -189,10 +188,13 @@ int display_client_id_rec(struct display_buffer *dspbuf,
 	if (b_left <= 0)
 		return b_left;
 
-	b_left = display_client_record(dspbuf, clientid->cid_client_record);
+	if (clientid->cid_client_record != NULL) {
+		b_left = display_client_record(dspbuf,
+					       clientid->cid_client_record);
 
-	if (b_left <= 0)
-		return b_left;
+		if (b_left <= 0)
+			return b_left;
+	}
 
 	if (clientid->cid_lease_reservations > 0)
 		delta = 0;
@@ -230,6 +232,9 @@ int display_client_id_rec(struct display_buffer *dspbuf,
 int display_clientid_name(struct display_buffer *dspbuf,
 			  nfs_client_id_t *clientid)
 {
+	if (clientid->cid_client_record == NULL)
+		return display_start(dspbuf);
+
 	return display_opaque_value(
 		dspbuf,
 		clientid->cid_client_record->cr_client_val,
@@ -309,11 +314,17 @@ bool client_id_has_state(nfs_client_id_t *clientid)
 
 void free_client_id(nfs_client_id_t *clientid)
 {
+	struct svc_rpc_gss_data *gd;
+
 	assert(atomic_fetch_int32_t(&clientid->cid_refcount) == 0);
 
 	if (clientid->cid_client_record != NULL)
 		dec_client_record_ref(clientid->cid_client_record);
 
+	if (clientid->cid_credential.flavor == RPCSEC_GSS) {
+		gd = clientid->cid_credential.auth_union.auth_gss.gd;
+		unref_svc_rpc_gss_data(gd, 0);
+	}
 	/* For NFSv4.1 clientids, destroy all associated sessions */
 	if (clientid->cid_minorversion > 0) {
 		struct glist_head *glist = NULL;
@@ -328,11 +339,15 @@ void free_client_id(nfs_client_id_t *clientid)
 		}
 	}
 
+	if (clientid->cid_recov_dir) {
+		gsh_free(clientid->cid_recov_dir);
+		clientid->cid_recov_dir = NULL;
+	}
+
 	PTHREAD_MUTEX_destroy(&clientid->cid_mutex);
 	PTHREAD_MUTEX_destroy(&clientid->cid_owner.so_mutex);
-	if (clientid->cid_minorversion == 0) {
+	if (clientid->cid_minorversion == 0)
 		PTHREAD_MUTEX_destroy(&clientid->cid_cb.v40.cb_chan.mtx);
-	}
 
 	put_gsh_client(clientid->gsh_client);
 
@@ -454,6 +469,7 @@ int compare_client_id(struct gsh_buffdesc *buff1, struct gsh_buffdesc *buff2)
 {
 	clientid4 cl1 = *((clientid4 *) (buff1->addr));
 	clientid4 cl2 = *((clientid4 *) (buff2->addr));
+
 	return (cl1 == cl2) ? 0 : 1;
 }
 
@@ -511,15 +527,9 @@ nfs_client_id_t *create_client_id(clientid4 clientid,
 				  nfs_client_cred_t *credential,
 				  uint32_t minorversion)
 {
-	nfs_client_id_t *client_rec = pool_alloc(client_id_pool, NULL);
+	nfs_client_id_t *client_rec = pool_alloc(client_id_pool);
 	state_owner_t *owner;
-
-	if (client_rec == NULL) {
-		LogCrit(COMPONENT_CLIENTID,
-			"Unable to allocate memory for clientid %" PRIx64,
-			clientid);
-		return NULL;
-	}
+	struct svc_rpc_gss_data *gd;
 
 	PTHREAD_MUTEX_init(&client_rec->cid_mutex, NULL);
 
@@ -542,6 +552,16 @@ nfs_client_id_t *create_client_id(clientid4 clientid,
 	client_rec->cid_last_renew = time(NULL);
 	client_rec->cid_client_record = client_record;
 	client_rec->cid_credential = *credential;
+
+	/* We store the credential which includes gss context here for
+	 * using it later, so we should make sure that this doesn't go
+	 * away until we destroy this nfs clientid.
+	 */
+	if (credential->flavor == RPCSEC_GSS) {
+		gd = credential->auth_union.auth_gss.gd;
+		(void)atomic_inc_uint32_t(&gd->refcnt);
+	}
+
 	client_rec->cid_minorversion = minorversion;
 	client_rec->gsh_client = op_ctx->client;
 	inc_gsh_client_refcount(op_ctx->client);
@@ -653,7 +673,8 @@ int remove_confirmed_client_id(nfs_client_id_t *clientid)
 		return rc;
 	}
 
-	clientid->cid_client_record->cr_confirmed_rec = NULL;
+	if (clientid->cid_client_record != NULL)
+		clientid->cid_client_record->cr_confirmed_rec = NULL;
 
 	/* Set this up so this client id record will be freed. */
 	clientid->cid_confirmed = EXPIRED_CLIENT_ID;
@@ -696,7 +717,8 @@ int remove_unconfirmed_client_id(nfs_client_id_t *clientid)
 	/* XXX prevents calling remove_confirmed before removed_confirmed,
 	 * if we failed to maintain the invariant that the cases are
 	 * disjoint */
-	clientid->cid_client_record->cr_unconfirmed_rec = NULL;
+	if (clientid->cid_client_record != NULL)
+		clientid->cid_client_record->cr_unconfirmed_rec = NULL;
 
 	/* Set this up so this client id record will be freed. */
 	clientid->cid_confirmed = EXPIRED_CLIENT_ID;
@@ -747,8 +769,8 @@ clientid_status_t nfs_client_id_confirm(nfs_client_id_t *clientid,
 			display_client_id_rec(&dspbuf, clientid);
 
 			LogCrit(COMPONENT_CLIENTID,
-				"Unexpected problem %s, could not remove "
-				"{%s}", hash_table_err_to_str(rc), str);
+				"Unexpected problem %s, could not remove {%s}",
+				hash_table_err_to_str(rc), str);
 		}
 
 		return CLIENT_ID_INVALID_ARGUMENT;
@@ -768,8 +790,8 @@ clientid_status_t nfs_client_id_confirm(nfs_client_id_t *clientid,
 			display_client_id_rec(&dspbuf, clientid);
 
 			LogCrit(COMPONENT_CLIENTID,
-				"Unexpected problem %s, could not "
-				"insert {%s}", hash_table_err_to_str(rc), str);
+				"Unexpected problem %s, could not insert {%s}",
+				hash_table_err_to_str(rc), str);
 		}
 
 		/* Set this up so this client id record will be
@@ -793,9 +815,51 @@ clientid_status_t nfs_client_id_confirm(nfs_client_id_t *clientid,
 }
 
 /**
+ * @brief Check if a clientid has state associated with it.
+ *
+ * @param[in] clientid The client id of interest
+ *
+ * @retval true if the clientid has associated state.
+ */
+bool clientid_has_state(nfs_client_id_t *clientid)
+{
+	bool live_state = false;
+	struct glist_head *glist;
+
+	PTHREAD_MUTEX_lock(&clientid->cid_mutex);
+
+	/* Don't bother checking lock owners, there must ALSO be an
+	 * open owner with active open state in order for there to be
+	 * active lock state.
+	 */
+
+	/* Check if any open owners have active open state. */
+	glist_for_each(glist, &clientid->cid_openowners) {
+		live_state = owner_has_state(glist_entry(
+			glist,
+			state_owner_t,
+			so_owner.so_nfs4_owner.so_perclient));
+
+		if (live_state)
+			break;
+	}
+
+	/* Delegations and Layouts are owned by clientid, so check for
+	 * active state held by the cid_owner.
+	 */
+	if (!live_state)
+		live_state = owner_has_state(&clientid->cid_owner);
+
+	PTHREAD_MUTEX_unlock(&clientid->cid_mutex);
+
+	return live_state;
+}
+
+/**
  * @brief Client expires, need to take care of owners
  *
- * This function assumes caller holds record->cr_mutex and holds a
+ * If there is a client_record attached to the clientid,
+ * this function assumes caller holds record->cr_mutex and holds a
  * reference to record also.
  *
  * @param[in] clientid The client id to expire
@@ -844,22 +908,31 @@ bool nfs_client_id_expire(nfs_client_id_t *clientid, bool make_stale)
 	else
 		ht_expire = ht_unconfirmed_client_id;
 
-	if (make_stale) {
-		clientid->cid_confirmed = STALE_CLIENT_ID;
-		PTHREAD_MUTEX_unlock(&clientid->cid_mutex);
-	} else {
-		clientid->cid_confirmed = EXPIRED_CLIENT_ID;
-		/* Need to clean up the client record. */
-		record = clientid->cid_client_record;
+	/* Need to clean up the client record. */
+	record = clientid->cid_client_record;
+	clientid->cid_client_record = NULL;
 
-		PTHREAD_MUTEX_unlock(&clientid->cid_mutex);
-
+	if (record != NULL) {
 		/* Detach the clientid record from the client record */
 		if (record->cr_confirmed_rec == clientid)
 			record->cr_confirmed_rec = NULL;
 
 		if (record->cr_unconfirmed_rec == clientid)
 			record->cr_unconfirmed_rec = NULL;
+
+		/* the linkage was removed, update refcount */
+		dec_client_record_ref(record);
+	}
+
+	if (make_stale) {
+		/* Keep clientid hashed, but mark it as stale */
+		clientid->cid_confirmed = STALE_CLIENT_ID;
+		PTHREAD_MUTEX_unlock(&clientid->cid_mutex);
+	} else {
+		/* unhash clientids that are truly expired */
+		clientid->cid_confirmed = EXPIRED_CLIENT_ID;
+
+		PTHREAD_MUTEX_unlock(&clientid->cid_mutex);
 
 		buffkey.addr = &clientid->cid_clientid;
 		buffkey.len = sizeof(clientid->cid_clientid);
@@ -1023,7 +1096,7 @@ bool nfs_client_id_expire(nfs_client_id_t *clientid, bool make_stale)
 		}
 	}
 
-	if (clientid->cid_recov_dir != NULL) {
+	if (clientid->cid_recov_dir != NULL && !make_stale) {
 		nfs4_rm_clid(clientid->cid_recov_dir, v4_recov_dir, 0);
 		gsh_free(clientid->cid_recov_dir);
 		clientid->cid_recov_dir = NULL;
@@ -1071,8 +1144,6 @@ clientid_status_t nfs_client_id_get(hash_table_t *ht, clientid4 clientid,
 	uint64_t epoch_low = ServerEpoch & 0xFFFFFFFF;
 	uint64_t cid_epoch = (uint64_t) (clientid >> (clientid4) 32);
 	nfs_client_id_t *pclientid;
-	int rc;
-
 
 	/* Don't even bother to look up clientid if epochs don't match */
 	if (cid_epoch != epoch_low) {
@@ -1109,18 +1180,8 @@ clientid_status_t nfs_client_id_get(hash_table_t *ht, clientid4 clientid,
 		if (pclientid->cid_confirmed == STALE_CLIENT_ID) {
 			/* Stale client becuse of ip detach and attach to
 			 * same node */
+			dec_client_id_ref(pclientid);
 			status = CLIENT_ID_STALE;
-			dec_client_id_ref(pclientid);
-			pclientid->cid_confirmed = EXPIRED_CLIENT_ID;
-			rc = HashTable_Del(ht, &buffkey, NULL, NULL);
-			if (rc != HASHTABLE_SUCCESS) {
-				LogWarn(COMPONENT_CLIENTID,
-				"Could not remove unconfirmed clientid %" PRIx64
-				" error=%s", pclientid->cid_clientid,
-				hash_table_err_to_str(rc));
-			}
-
-			dec_client_id_ref(pclientid);
 			*client_rec = NULL;
 		} else {
 			*client_rec = pclientid;
@@ -1244,14 +1305,7 @@ int nfs_Init_client_id(void)
 	}
 
 	client_id_pool =
-	    pool_init("NFS4 Client ID Pool", sizeof(nfs_client_id_t),
-		      pool_basic_substrate, NULL, NULL, NULL);
-
-	if (client_id_pool == NULL) {
-		LogCrit(COMPONENT_INIT,
-			"NFS CLIENT_ID: Cannot init Client Id Pool");
-		return -1;
-	}
+	    pool_basic_init("NFS4 Client ID Pool", sizeof(nfs_client_id_t));
 
 	return CLIENT_ID_SUCCESS;
 }
@@ -1431,20 +1485,11 @@ int32_t dec_client_record_ref(nfs_client_record_t *record)
 	}
 
 	/* use the key to delete the entry */
-	rc = hashtable_deletelatched(ht_client_record, &buffkey, &latch,
-				     &old_key, &old_value);
+	hashtable_deletelatched(ht_client_record, &buffkey, &latch,
+				&old_key, &old_value);
 
-	if (rc != HASHTABLE_SUCCESS) {
-		if (rc == HASHTABLE_ERROR_NO_SUCH_KEY)
-			hashtable_releaselatched(ht_client_record, &latch);
-
-		display_client_record(&dspbuf, record);
-
-		LogCrit(COMPONENT_CLIENTID, "Error %s, could not remove {%s}",
-			hash_table_err_to_str(rc), str);
-
-		return refcount;
-	}
+	/* Release the latch */
+	hashtable_releaselatched(ht_client_record, &latch);
 
 	LogFullDebug(COMPONENT_CLIENTID, "Free {%s}", str);
 
@@ -1597,10 +1642,14 @@ nfs_client_record_t *get_client_record(const char *const value,
 	struct hash_latch latch;
 	hash_error_t rc;
 
-	record = gsh_malloc(sizeof(nfs_client_record_t) + len);
 
-	if (record == NULL)
+	if (len == 0) {
+		LogInfo(COMPONENT_CLIENTID,
+			"Refusing to create a record with an empty client_val, stopping.");
 		return NULL;
+	}
+
+	record = gsh_malloc(sizeof(nfs_client_record_t) + len);
 
 	record->cr_refcount = 1;
 	record->cr_client_val_len = len;
@@ -1716,14 +1765,8 @@ nfs41_foreach_client_callback(bool(*cb) (nfs_client_id_t *cl, void *state),
 
 			if (pclientid->cid_minorversion > 0) {
 				cb_arg = gsh_malloc(
-						sizeof(struct
-							client_callback_arg));
-				if (cb_arg == NULL) {
-					LogCrit(COMPONENT_CLIENTID,
-						"malloc failed for %p",
-						pclientid);
-					continue;
-				}
+					sizeof(struct client_callback_arg));
+
 				cb_arg->cb = cb;
 				cb_arg->state = state;
 				cb_arg->pclientid = pclientid;
@@ -1742,7 +1785,6 @@ nfs41_foreach_client_callback(bool(*cb) (nfs_client_id_t *cl, void *state),
 		}
 		PTHREAD_RWLOCK_unlock(&(ht->partitions[i].lock));
 	}
-	return;
 }
 
 /** @} */

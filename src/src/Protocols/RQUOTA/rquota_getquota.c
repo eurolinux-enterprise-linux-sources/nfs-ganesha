@@ -32,7 +32,6 @@
 #include "nfs23.h"
 #include "nfs4.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_exports.h"
 #include "mount.h"
 #include <os/quota.h>		/* For USRQUOTA */
@@ -44,15 +43,11 @@
  * @brief The Rquota getquota function, for all versions.
  *
  * @param[in]  arg    Ignored
- * @param[in]  export Ignored
- * @param[in]  worker Ignored
  * @param[in]  req    Ignored
  * @param[out] res    Ignored
  *
  */
-int rquota_getquota(nfs_arg_t *arg,
-		    nfs_worker_data_t *worker,
-		    struct svc_req *req, nfs_res_t *res)
+int rquota_getquota(nfs_arg_t *arg, struct svc_req *req, nfs_res_t *res)
 {
 	fsal_status_t fsal_status;
 	fsal_quota_t fsal_quota;
@@ -60,21 +55,27 @@ int rquota_getquota(nfs_arg_t *arg,
 	struct gsh_export *exp;
 	char *quota_path;
 	getquota_rslt *qres = &res->res_rquota_getquota;
+	char path[MAXPATHLEN];
+	int quota_id;
 
 	LogFullDebug(COMPONENT_NFSPROTO,
 		     "REQUEST PROCESSING: Calling rquota_getquota");
 
-	if (req->rq_vers == EXT_RQUOTAVERS)
+	if (req->rq_vers == EXT_RQUOTAVERS) {
 		quota_type = arg->arg_ext_rquota_getquota.gqa_type;
+		quota_id = arg->arg_ext_rquota_getquota.gqa_id;
+	} else {
+		quota_id = arg->arg_rquota_getquota.gqa_uid;
+	}
 	qres->status = Q_EPERM;
 
-	if (arg->arg_rquota_getquota.gqa_pathp[0] == '/') {
-		exp = get_gsh_export_by_path(arg->arg_rquota_getquota.gqa_pathp,
-					     false);
-		if (exp == NULL)
-			goto out;
-		quota_path = arg->arg_rquota_getquota.gqa_pathp;
-	} else {
+	quota_path = check_handle_lead_slash(arg->arg_rquota_getquota.gqa_pathp,
+					     path, MAXPATHLEN);
+	if (quota_path == NULL)
+		goto out;
+
+	exp = get_gsh_export_by_path(quota_path, false);
+	if (exp == NULL) {
 		exp =
 		    get_gsh_export_by_tag(arg->arg_rquota_getquota.gqa_pathp);
 		if (exp == NULL)
@@ -84,7 +85,7 @@ int rquota_getquota(nfs_arg_t *arg,
 	fsal_status =
 	    exp->fsal_export->exp_ops.get_quota(exp->fsal_export,
 					     quota_path, quota_type,
-					     &fsal_quota);
+					     quota_id, &fsal_quota);
 	if (FSAL_IS_ERROR(fsal_status)) {
 		if (fsal_status.major == ERR_FSAL_NO_QUOTA)
 			qres->status = Q_NOQUOTA;
@@ -117,5 +118,5 @@ int rquota_getquota(nfs_arg_t *arg,
  */
 void rquota_getquota_Free(nfs_res_t *res)
 {
-	return;
+	/* Nothing to do */
 }

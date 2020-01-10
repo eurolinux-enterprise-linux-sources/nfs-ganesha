@@ -39,23 +39,22 @@
 #include "nfs_core.h"
 #include "nfs_exports.h"
 #include "log.h"
-#include "cache_inode.h"
 #include "fsal.h"
 #include "9p.h"
 
-int _9p_unlinkat(struct _9p_request_data *req9p, void *worker_data,
-		 u32 *plenout, char *preply)
+int _9p_unlinkat(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 {
 	char *cursor = req9p->_9pmsg + _9P_HDR_SIZE + _9P_TYPE_SIZE;
 	u16 *msgtag = NULL;
 	u32 *dfid = NULL;
 	u16 *name_len = NULL;
 	char *name_str = NULL;
+	/* flags are not used */
 	__attribute__ ((unused)) u32 *flags = NULL;
 
 	struct _9p_fid *pdfid = NULL;
 
-	cache_inode_status_t cache_status;
+	fsal_status_t fsal_status;
 	char name[MAXNAMLEN];
 
 	/* Get data */
@@ -69,32 +68,29 @@ int _9p_unlinkat(struct _9p_request_data *req9p, void *worker_data,
 		 (u32) *msgtag, *dfid, *name_len, name_str);
 
 	if (*dfid >= _9P_FID_PER_CONN)
-		return _9p_rerror(req9p, worker_data, msgtag, ERANGE, plenout,
-				  preply);
+		return _9p_rerror(req9p, msgtag, ERANGE, plenout, preply);
 
 	pdfid = req9p->pconn->fids[*dfid];
 
 	/* Check that it is a valid fid */
 	if (pdfid == NULL || pdfid->pentry == NULL) {
 		LogDebug(COMPONENT_9P, "request on invalid fid=%u", *dfid);
-		return _9p_rerror(req9p, worker_data, msgtag, EIO, plenout,
-				  preply);
+		return _9p_rerror(req9p, msgtag, EIO, plenout, preply);
 	}
 
-	if ((pdfid->op_context.export_perms->options &
-				 EXPORT_OPTION_WRITE_ACCESS) == 0)
-		return _9p_rerror(req9p, worker_data, msgtag, EROFS, plenout,
-				  preply);
+	_9p_init_opctx(pdfid, req9p);
 
-	op_ctx = &pdfid->op_context;
+	if ((op_ctx->export_perms->options &
+				 EXPORT_OPTION_WRITE_ACCESS) == 0)
+		return _9p_rerror(req9p, msgtag, EROFS, plenout, preply);
 
 	/* Let's do the job */
 	snprintf(name, MAXNAMLEN, "%.*s", *name_len, name_str);
 
-	cache_status = cache_inode_remove(pdfid->pentry, name);
-	if (cache_status != CACHE_INODE_SUCCESS)
-		return _9p_rerror(req9p, worker_data, msgtag,
-				  _9p_tools_errno(cache_status), plenout,
+	fsal_status = fsal_remove(pdfid->pentry, name);
+	if (FSAL_IS_ERROR(fsal_status))
+		return _9p_rerror(req9p, msgtag,
+				  _9p_tools_errno(fsal_status), plenout,
 				  preply);
 
 	/* Build the reply */

@@ -1,0 +1,40 @@
+From 99780afe45deae216fe06decdc0eb488b9ab49a8 Mon Sep 17 00:00:00 2001
+From: Daniel Gryniewicz <dang@redhat.com>
+Date: Mon, 9 Jan 2017 09:15:49 -0500
+Subject: [PATCH] MDCACHE - Only rename dirents if both found
+
+A dirent could be not found, but still return success, if the dirent
+cache is not trusted.  Ensure that, if we're going to rename a dirent,
+we found both the source and dest dirents.
+
+Change-Id: If026af9c18e2dd0de0d0eeb7f248fe25e976fe59
+Signed-off-by: Daniel Gryniewicz <dang@redhat.com>
+---
+ src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_helpers.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_helpers.c b/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_helpers.c
+index fa07418..09de106 100644
+--- a/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_helpers.c
++++ b/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_helpers.c
+@@ -1,7 +1,7 @@
+ /*
+  * vim:noexpandtab:shiftwidth=8:tabstop=8:
+  *
+- * Copyright 2015-2016 Red Hat, Inc. and/or its affiliates.
++ * Copyright 2015-2017 Red Hat, Inc. and/or its affiliates.
+  * Author: Daniel Gryniewicz <dang@redhat.com>
+  *
+  * This program is free software; you can redistribute it and/or
+@@ -1329,7 +1329,7 @@ mdcache_dirent_rename(mdcache_entry_t *parent, const char *oldname,
+ 
+ 	if (dirent2) {
+ 		/* rename would cause a collision */
+-		if (parent->mde_flags & MDCACHE_TRUST_CONTENT) {
++		if (dirent && parent->mde_flags & MDCACHE_TRUST_CONTENT) {
+ 			/* overwrite, replace entry and expire the old */
+ 			mdcache_entry_t *oldentry;
+ 
+-- 
+2.5.0
+

@@ -42,8 +42,7 @@
 /* Atomic uint64_t that is used to generate inode numbers in the Pseudo FS */
 uint64_t inode_number;
 
-#define V4_FH_OPAQUE_SIZE (sizeof(struct alloc_file_handle_v4) - \
-			   sizeof(struct file_handle_v4))
+#define V4_FH_OPAQUE_SIZE (NFS4_FHSIZE - sizeof(struct file_handle_v4))
 
 /* helpers
  */
@@ -88,26 +87,6 @@ avltree_inline_name_lookup(
 
 	while (node) {
 		res = pseudofs_n_cmpf(node, key);
-		if (res == 0)
-			return node;
-		if (res > 0)
-			node = node->left;
-		else
-			node = node->right;
-	}
-	return NULL;
-}
-
-static inline struct avltree_node *
-avltree_inline_index_lookup(
-	const struct avltree_node *key,
-	const struct avltree *tree)
-{
-	struct avltree_node *node = tree->root;
-	int res = 0;
-
-	while (node) {
-		res = pseudofs_i_cmpf(node, key);
 		if (res == 0)
 			return node;
 		if (res > 0)
@@ -208,7 +187,7 @@ static struct pseudo_fsal_obj_handle
 *alloc_directory_handle(struct pseudo_fsal_obj_handle *parent,
 			const char *name,
 			struct fsal_export *exp_hdl,
-			mode_t unix_mode)
+			struct attrlist *attrs)
 {
 	struct pseudo_fsal_obj_handle *hdl;
 	char path[MAXPATHLEN];
@@ -217,12 +196,6 @@ static struct pseudo_fsal_obj_handle
 
 	hdl = gsh_calloc(1, sizeof(struct pseudo_fsal_obj_handle) +
 			    V4_FH_OPAQUE_SIZE);
-
-	if (hdl == NULL) {
-		LogDebug(COMPONENT_FSAL,
-			 "Could not allocate handle");
-		return NULL;
-	}
 
 	/* Establish tree details for this directory */
 	hdl->name = gsh_strdup(name);
@@ -251,55 +224,58 @@ static struct pseudo_fsal_obj_handle
 	hdl->obj_handle.type = DIRECTORY;
 
 	/* Fills the output struct */
-	hdl->obj_handle.attributes.type = DIRECTORY;
-	FSAL_SET_MASK(hdl->obj_handle.attributes.mask, ATTR_TYPE);
+	hdl->attributes.type = DIRECTORY;
 
-	hdl->obj_handle.attributes.filesize = 0;
-	FSAL_SET_MASK(hdl->obj_handle.attributes.mask, ATTR_SIZE);
+	hdl->attributes.filesize = 0;
 
 	/* fsid will be supplied later */
-	hdl->obj_handle.attributes.fsid.major = 0;
-	hdl->obj_handle.attributes.fsid.minor = 0;
-	FSAL_SET_MASK(hdl->obj_handle.attributes.mask, ATTR_FSID);
+	hdl->obj_handle.fsid.major = 0;
+	hdl->obj_handle.fsid.minor = 0;
+	hdl->attributes.fsid.major = 0;
+	hdl->attributes.fsid.minor = 0;
 
-	hdl->obj_handle.attributes.fileid =
-		atomic_postinc_uint64_t(&inode_number);
-	FSAL_SET_MASK(hdl->obj_handle.attributes.mask, ATTR_FILEID);
+	hdl->obj_handle.fileid = atomic_postinc_uint64_t(&inode_number);
+	hdl->attributes.fileid = hdl->obj_handle.fileid;
 
-	hdl->obj_handle.attributes.mode = unix2fsal_mode(unix_mode);
-	FSAL_SET_MASK(hdl->obj_handle.attributes.mask, ATTR_MODE);
+	hdl->attributes.mode = attrs->mode & (~S_IFMT & 0xFFFF) &
+		~op_ctx->fsal_export->exp_ops.fs_umask(op_ctx->fsal_export);
 
-	hdl->obj_handle.attributes.numlinks = 2;
+	hdl->attributes.numlinks = 2;
 	hdl->numlinks = 2;
-	FSAL_SET_MASK(hdl->obj_handle.attributes.mask, ATTR_NUMLINKS);
 
-	hdl->obj_handle.attributes.owner = op_ctx->creds->caller_uid;
+	if ((attrs->valid_mask & ATTR_OWNER) != 0)
+		hdl->attributes.owner = attrs->owner;
+	else
+		hdl->attributes.owner = op_ctx->creds->caller_uid;
 
-	FSAL_SET_MASK(hdl->obj_handle.attributes.mask, ATTR_OWNER);
-
-	hdl->obj_handle.attributes.group = op_ctx->creds->caller_gid;
-
-	FSAL_SET_MASK(hdl->obj_handle.attributes.mask, ATTR_GROUP);
+	if ((attrs->valid_mask & ATTR_GROUP) != 0)
+		hdl->attributes.group = attrs->group;
+	else
+		hdl->attributes.group = op_ctx->creds->caller_gid;
 
 	/* Use full timer resolution */
-	now(&hdl->obj_handle.attributes.atime);
-	hdl->obj_handle.attributes.ctime = hdl->obj_handle.attributes.atime;
-	hdl->obj_handle.attributes.mtime = hdl->obj_handle.attributes.atime;
-	hdl->obj_handle.attributes.chgtime = hdl->obj_handle.attributes.atime;
-	FSAL_SET_MASK(hdl->obj_handle.attributes.mask, ATTR_ATIME);
-	FSAL_SET_MASK(hdl->obj_handle.attributes.mask, ATTR_CTIME);
-	FSAL_SET_MASK(hdl->obj_handle.attributes.mask, ATTR_MTIME);
+	now(&hdl->attributes.ctime);
+	hdl->attributes.chgtime = hdl->attributes.ctime;
 
-	hdl->obj_handle.attributes.change =
-			timespec_to_nsecs(&hdl->obj_handle.attributes.chgtime);
-	FSAL_SET_MASK(hdl->obj_handle.attributes.mask, ATTR_CHGTIME);
+	if ((attrs->valid_mask & ATTR_ATIME) != 0)
+		hdl->attributes.atime = attrs->atime;
+	else
+		hdl->attributes.atime = hdl->attributes.ctime;
 
-	hdl->obj_handle.attributes.spaceused = 0;
-	FSAL_SET_MASK(hdl->obj_handle.attributes.mask, ATTR_SPACEUSED);
+	if ((attrs->valid_mask & ATTR_MTIME) != 0)
+		hdl->attributes.mtime = attrs->mtime;
+	else
+		hdl->attributes.mtime = hdl->attributes.ctime;
 
-	hdl->obj_handle.attributes.rawdev.major = 0;
-	hdl->obj_handle.attributes.rawdev.minor = 0;
-	FSAL_SET_MASK(hdl->obj_handle.attributes.mask, ATTR_RAWDEV);
+	hdl->attributes.change =
+		timespec_to_nsecs(&hdl->attributes.chgtime);
+
+	hdl->attributes.spaceused = 0;
+	hdl->attributes.rawdev.major = 0;
+	hdl->attributes.rawdev.minor = 0;
+
+	/* Set the mask at the end. */
+	hdl->attributes.valid_mask = ATTRS_POSIX;
 
 	fsal_obj_handle_init(&hdl->obj_handle, exp_hdl, DIRECTORY);
 	pseudofs_handle_ops_init(&hdl->obj_handle.obj_ops);
@@ -336,9 +312,10 @@ static struct pseudo_fsal_obj_handle
 
 static fsal_status_t lookup(struct fsal_obj_handle *parent,
 			    const char *path,
-			    struct fsal_obj_handle **handle)
+			    struct fsal_obj_handle **handle,
+			    struct attrlist *attrs_out)
 {
-	struct pseudo_fsal_obj_handle *myself, *hdl;
+	struct pseudo_fsal_obj_handle *myself, *hdl = NULL;
 	struct pseudo_fsal_obj_handle key[1];
 	struct avltree_node *node;
 	fsal_errors_t error = ERR_FSAL_NOENT;
@@ -388,27 +365,43 @@ out:
 	if (op_ctx->fsal_private != parent)
 		PTHREAD_RWLOCK_unlock(&parent->lock);
 
+	if (error == ERR_FSAL_NO_ERROR && attrs_out != NULL) {
+		/* This is unlocked, however, for the most part, attributes
+		 * are read-only. Come back later and do some lock protection.
+		 */
+		fsal_copy_attrs(attrs_out, &hdl->attributes, false);
+	}
+
 	return fsalstat(error, 0);
 }
 
-static fsal_status_t create(struct fsal_obj_handle *dir_hdl,
-			    const char *name,
-			    struct attrlist *attrib,
-			    struct fsal_obj_handle **handle)
-{
-	/* PSEUDOFS doesn't support non-directory inodes */
-	LogCrit(COMPONENT_FSAL,
-		"Invoking unsupported FSAL operation");
-	return fsalstat(ERR_FSAL_NOTSUPP, ENOTSUP);
-}
-
+/**
+ * @brief Create a directory
+ *
+ * This function creates a new directory.
+ *
+ * While FSAL_PSEUDO is a support_ex FSAL, it doesn't actually support
+ * setting attributes, so only the mode attribute is relevant. Any other
+ * attributes set on creation will be ignored. The owner and group will be
+ * set from the active credentials.
+ *
+ * @param[in]     dir_hdl   Directory in which to create the directory
+ * @param[in]     name      Name of directory to create
+ * @param[in]     attrs_in  Attributes to set on newly created object
+ * @param[out]    handle    Newly created object
+ * @param[in,out] attrs_out Optional attributes for newly created object
+ *
+ * @note On success, @a new_obj has been ref'd
+ *
+ * @return FSAL status.
+ */
 static fsal_status_t makedir(struct fsal_obj_handle *dir_hdl,
 			     const char *name,
-			     struct attrlist *attrib,
-			     struct fsal_obj_handle **handle)
+			     struct attrlist *attrs_in,
+			     struct fsal_obj_handle **handle,
+			     struct attrlist *attrs_out)
 {
 	struct pseudo_fsal_obj_handle *myself, *hdl;
-	mode_t unix_mode;
 	uint32_t numlinks;
 
 	LogDebug(COMPONENT_FSAL, "create %s", name);
@@ -426,17 +419,11 @@ static fsal_status_t makedir(struct fsal_obj_handle *dir_hdl,
 			      struct pseudo_fsal_obj_handle,
 			      obj_handle);
 
-	unix_mode = fsal2unix_mode(attrib->mode)
-	    & ~op_ctx->fsal_export->exp_ops.fs_umask(op_ctx->fsal_export);
-
 	/* allocate an obj_handle and fill it up */
 	hdl = alloc_directory_handle(myself,
 				     name,
 				     op_ctx->fsal_export,
-				     unix_mode);
-
-	if (hdl == NULL)
-		return fsalstat(ERR_FSAL_NOMEM, ENOMEM);
+				     attrs_in);
 
 	numlinks = atomic_inc_uint32_t(&myself->numlinks);
 
@@ -446,58 +433,10 @@ static fsal_status_t makedir(struct fsal_obj_handle *dir_hdl,
 
 	*handle = &hdl->obj_handle;
 
+	if (attrs_out != NULL)
+		fsal_copy_attrs(attrs_out, &hdl->attributes, false);
+
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
-}
-
-static fsal_status_t makenode(struct fsal_obj_handle *dir_hdl,
-			      const char *name,
-			      object_file_type_t nodetype,
-			      fsal_dev_t *dev,
-			      struct attrlist *attrib,
-			      struct fsal_obj_handle **handle)
-{
-	/* PSEUDOFS doesn't support non-directory inodes */
-	LogCrit(COMPONENT_FSAL,
-		"Invoking unsupported FSAL operation");
-	return fsalstat(ERR_FSAL_NOTSUPP, ENOTSUP);
-}
-
-/** makesymlink
- *  Note that we do not set mode bits on symlinks for Linux/POSIX
- *  They are not really settable in the kernel and are not checked
- *  anyway (default is 0777) because open uses that target's mode
- */
-
-static fsal_status_t makesymlink(struct fsal_obj_handle *dir_hdl,
-				 const char *name,
-				 const char *link_path,
-				 struct attrlist *attrib,
-				 struct fsal_obj_handle **handle)
-{
-	/* PSEUDOFS doesn't support non-directory inodes */
-	LogCrit(COMPONENT_FSAL,
-		"Invoking unsupported FSAL operation");
-	return fsalstat(ERR_FSAL_NOTSUPP, ENOTSUP);
-}
-
-static fsal_status_t readsymlink(struct fsal_obj_handle *obj_hdl,
-				 struct gsh_buffdesc *link_content,
-				 bool refresh)
-{
-	/* PSEUDOFS doesn't support non-directory inodes */
-	LogCrit(COMPONENT_FSAL,
-		"Invoking unsupported FSAL operation");
-	return fsalstat(ERR_FSAL_NOTSUPP, ENOTSUP);
-}
-
-static fsal_status_t linkfile(struct fsal_obj_handle *obj_hdl,
-			      struct fsal_obj_handle *destdir_hdl,
-			      const char *name)
-{
-	/* PSEUDOFS doesn't support non-directory inodes */
-	LogCrit(COMPONENT_FSAL,
-		"Invoking unsupported FSAL operation");
-	return fsalstat(ERR_FSAL_NOTSUPP, ENOTSUP);
 }
 
 /**
@@ -515,11 +454,14 @@ static fsal_status_t read_dirents(struct fsal_obj_handle *dir_hdl,
 				  fsal_cookie_t *whence,
 				  void *dir_state,
 				  fsal_readdir_cb cb,
+				  attrmask_t attrmask,
 				  bool *eof)
 {
 	struct pseudo_fsal_obj_handle *myself, *hdl;
 	struct avltree_node *node;
 	fsal_cookie_t seekloc;
+	struct attrlist attrs;
+	bool cb_rc;
 
 	if (whence != NULL)
 		seekloc = *whence;
@@ -553,7 +495,15 @@ static fsal_status_t read_dirents(struct fsal_obj_handle *dir_hdl,
 		if (hdl->index < seekloc)
 			continue;
 
-		if (!cb(hdl->name, dir_state, hdl->index)) {
+		fsal_prepare_attrs(&attrs, attrmask);
+		fsal_copy_attrs(&attrs, &hdl->attributes, false);
+
+		cb_rc = cb(hdl->name, &hdl->obj_handle, &attrs,
+			   dir_state, hdl->index);
+
+		fsal_release_attrs(&attrs);
+
+		if (!cb_rc) {
 			*eof = false;
 			break;
 		}
@@ -566,19 +516,8 @@ static fsal_status_t read_dirents(struct fsal_obj_handle *dir_hdl,
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
 
-static fsal_status_t renamefile(struct fsal_obj_handle *obj_hdl,
-				struct fsal_obj_handle *olddir_hdl,
-				const char *old_name,
-				struct fsal_obj_handle *newdir_hdl,
-				const char *new_name)
-{
-	/* PSEUDOFS doesn't support non-directory inodes */
-	LogCrit(COMPONENT_FSAL,
-		"Invoking unsupported FSAL operation");
-	return fsalstat(ERR_FSAL_NOTSUPP, ENOTSUP);
-}
-
-static fsal_status_t getattrs(struct fsal_obj_handle *obj_hdl)
+static fsal_status_t getattrs(struct fsal_obj_handle *obj_hdl,
+			      struct attrlist *outattrs)
 {
 	struct pseudo_fsal_obj_handle *myself;
 
@@ -595,29 +534,16 @@ static fsal_status_t getattrs(struct fsal_obj_handle *obj_hdl)
 	}
 
 	/* We need to update the numlinks under attr lock. */
-	myself->obj_handle.attributes.numlinks =
-		atomic_fetch_uint32_t(&myself->numlinks);
+	myself->attributes.numlinks = atomic_fetch_uint32_t(&myself->numlinks);
+	*outattrs = myself->attributes;
 
 	LogFullDebug(COMPONENT_FSAL,
 		     "hdl=%p, name=%s numlinks %"PRIu32,
 		     myself,
 		     myself->name,
-		     myself->obj_handle.attributes.numlinks);
+		     myself->attributes.numlinks);
 
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
-}
-
-/*
- * NOTE: this is done under protection of the attributes rwlock
- *       in the cache entry.
- */
-
-static fsal_status_t setattrs(struct fsal_obj_handle *obj_hdl,
-			      struct attrlist *attrs)
-{
-	LogCrit(COMPONENT_FSAL,
-		"Invoking unsupported FSAL operation");
-	return fsalstat(ERR_FSAL_NOTSUPP, ENOTSUP);
 }
 
 /* file_unlink
@@ -625,48 +551,44 @@ static fsal_status_t setattrs(struct fsal_obj_handle *obj_hdl,
  */
 
 static fsal_status_t file_unlink(struct fsal_obj_handle *dir_hdl,
+				 struct fsal_obj_handle *obj_hdl,
 				 const char *name)
 {
 	struct pseudo_fsal_obj_handle *myself, *hdl;
 	fsal_errors_t error = ERR_FSAL_NOENT;
-	struct pseudo_fsal_obj_handle key[1];
-	struct avltree_node *node;
 	uint32_t numlinks;
 
 	myself = container_of(dir_hdl,
 			      struct pseudo_fsal_obj_handle,
 			      obj_handle);
+	hdl = container_of(obj_hdl,
+			      struct pseudo_fsal_obj_handle,
+			      obj_handle);
 
 	PTHREAD_RWLOCK_wrlock(&dir_hdl->lock);
 
-	key->name = (char *) name;
-	node = avltree_inline_name_lookup(&key->avl_n, &myself->avl_name);
-	if (node) {
-		hdl = avltree_container_of(node, struct pseudo_fsal_obj_handle,
-					   avl_n);
-		/* Check if directory is empty */
-		numlinks = atomic_fetch_uint32_t(&hdl->numlinks);
-		if (numlinks != 2) {
-			LogFullDebug(COMPONENT_FSAL,
-				     "%s numlinks %"PRIu32,
-				     hdl->name, numlinks);
-			error = ERR_FSAL_NOTEMPTY;
-			goto unlock;
-		}
-
-		/* We need to update the numlinks. */
-		numlinks = atomic_dec_uint32_t(&myself->numlinks);
+	/* Check if directory is empty */
+	numlinks = atomic_fetch_uint32_t(&hdl->numlinks);
+	if (numlinks != 2) {
 		LogFullDebug(COMPONENT_FSAL,
 			     "%s numlinks %"PRIu32,
-			     myself->name, numlinks);
-
-		/* Remove from directory's name and index avls */
-		avltree_remove(&hdl->avl_n, &myself->avl_name);
-		avltree_remove(&hdl->avl_i, &myself->avl_index);
-		hdl->inavl = false;
-
-		error = ERR_FSAL_NO_ERROR;
+			     hdl->name, numlinks);
+		error = ERR_FSAL_NOTEMPTY;
+		goto unlock;
 	}
+
+	/* We need to update the numlinks. */
+	numlinks = atomic_dec_uint32_t(&myself->numlinks);
+	LogFullDebug(COMPONENT_FSAL,
+		     "%s numlinks %"PRIu32,
+		     myself->name, numlinks);
+
+	/* Remove from directory's name and index avls */
+	avltree_remove(&hdl->avl_n, &myself->avl_name);
+	avltree_remove(&hdl->avl_i, &myself->avl_index);
+	hdl->inavl = false;
+
+	error = ERR_FSAL_NO_ERROR;
 
 unlock:
 	PTHREAD_RWLOCK_unlock(&dir_hdl->lock);
@@ -696,8 +618,9 @@ static fsal_status_t handle_digest(const struct fsal_obj_handle *obj_hdl,
 	case FSAL_DIGEST_NFSV4:
 		if (fh_desc->len < V4_FH_OPAQUE_SIZE) {
 			LogMajor(COMPONENT_FSAL,
-				 "Space too small for handle.  need %lu, have %lu",
-				 V4_FH_OPAQUE_SIZE, fh_desc->len);
+				 "Space too small for handle.  need %lu, have %zu",
+				 ((unsigned long) V4_FH_OPAQUE_SIZE),
+				 fh_desc->len);
 			return fsalstat(ERR_FSAL_TOOSMALL, 0);
 		}
 
@@ -756,8 +679,8 @@ static void release(struct fsal_obj_handle *obj_hdl)
 	fsal_obj_handle_fini(obj_hdl);
 
 	LogDebug(COMPONENT_FSAL,
-		 "Releasing hdl=%p, name=%s",
-		 myself, myself->name);
+		 "Releasing obj_hdl=%p, myself=%p, name=%s",
+		 obj_hdl, myself, myself->name);
 
 	if (myself->name != NULL)
 		gsh_free(myself->name);
@@ -770,39 +693,11 @@ void pseudofs_handle_ops_init(struct fsal_obj_ops *ops)
 	ops->release = release;
 	ops->lookup = lookup;
 	ops->readdir = read_dirents;
-	ops->create = create;
 	ops->mkdir = makedir;
-	ops->mknode = makenode;
-	ops->symlink = makesymlink;
-	ops->readlink = readsymlink;
-	ops->test_access = fsal_test_access;
 	ops->getattrs = getattrs;
-	ops->setattrs = setattrs;
-	ops->link = linkfile;
-	ops->rename = renamefile;
 	ops->unlink = file_unlink;
-	ops->open = pseudofs_open;
-	ops->status = pseudofs_status;
-	ops->read = pseudofs_read;
-	ops->write = pseudofs_write;
-	ops->commit = pseudofs_commit;
-	ops->lock_op = pseudofs_lock_op;
-	ops->close = pseudofs_close;
-	ops->lru_cleanup = pseudofs_lru_cleanup;
 	ops->handle_digest = handle_digest;
 	ops->handle_to_key = handle_to_key;
-
-	/* xattr related functions */
-	ops->list_ext_attrs = pseudofs_list_ext_attrs;
-	ops->getextattr_id_by_name = pseudofs_getextattr_id_by_name;
-	ops->getextattr_value_by_name = pseudofs_getextattr_value_by_name;
-	ops->getextattr_value_by_id = pseudofs_getextattr_value_by_id;
-	ops->setextattr_value = pseudofs_setextattr_value;
-	ops->setextattr_value_by_id = pseudofs_setextattr_value_by_id;
-	ops->getextattr_attrs = pseudofs_getextattr_attrs;
-	ops->remove_extattr_by_id = pseudofs_remove_extattr_by_id;
-	ops->remove_extattr_by_name = pseudofs_remove_extattr_by_name;
-
 }
 
 /* export methods that create object handles
@@ -815,9 +710,11 @@ void pseudofs_handle_ops_init(struct fsal_obj_ops *ops)
 
 fsal_status_t pseudofs_lookup_path(struct fsal_export *exp_hdl,
 				 const char *path,
-				 struct fsal_obj_handle **handle)
+				 struct fsal_obj_handle **handle,
+				 struct attrlist *attrs_out)
 {
 	struct pseudofs_fsal_export *myself;
+	struct attrlist attrs;
 
 	myself = container_of(exp_hdl, struct pseudofs_fsal_export, export);
 
@@ -829,20 +726,22 @@ fsal_status_t pseudofs_lookup_path(struct fsal_export *exp_hdl,
 		return fsalstat(ERR_FSAL_NOENT, ENOENT);
 	}
 
+	attrs.valid_mask = ATTR_MODE;
+	attrs.mode = 0755;
+
 	if (myself->root_handle == NULL) {
 		myself->root_handle =
 			alloc_directory_handle(NULL,
 					       myself->export_path,
 					       exp_hdl,
-					       0755);
-
-		if (myself->root_handle == NULL) {
-			/* alloc handle failed. */
-			return fsalstat(ERR_FSAL_NOMEM, ENOMEM);
-		}
+					       &attrs);
 	}
 
 	*handle = &myself->root_handle->obj_handle;
+
+	if (attrs_out != NULL)
+		fsal_copy_attrs(attrs_out, &myself->root_handle->attributes,
+				false);
 
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
@@ -861,7 +760,8 @@ fsal_status_t pseudofs_lookup_path(struct fsal_export *exp_hdl,
 
 fsal_status_t pseudofs_create_handle(struct fsal_export *exp_hdl,
 				   struct gsh_buffdesc *hdl_desc,
-				   struct fsal_obj_handle **handle)
+				   struct fsal_obj_handle **handle,
+				   struct attrlist *attrs_out)
 {
 	struct glist_head *glist;
 	struct fsal_obj_handle *hdl;
@@ -871,9 +771,9 @@ fsal_status_t pseudofs_create_handle(struct fsal_export *exp_hdl,
 
 	if (hdl_desc->len != V4_FH_OPAQUE_SIZE) {
 		LogCrit(COMPONENT_FSAL,
-			"Invalid handle size %lu expected %lu",
-			(long unsigned) hdl_desc->len,
-			V4_FH_OPAQUE_SIZE);
+			"Invalid handle size %zu expected %lu",
+			hdl_desc->len,
+			((unsigned long) V4_FH_OPAQUE_SIZE));
 
 		return fsalstat(ERR_FSAL_BADHANDLE, 0);
 	}
@@ -897,6 +797,11 @@ fsal_status_t pseudofs_create_handle(struct fsal_export *exp_hdl,
 			*handle = hdl;
 
 			PTHREAD_RWLOCK_unlock(&exp_hdl->fsal->lock);
+
+			if (attrs_out != NULL) {
+				fsal_copy_attrs(attrs_out, &my_hdl->attributes,
+						false);
+			}
 
 			return fsalstat(ERR_FSAL_NO_ERROR, 0);
 		}

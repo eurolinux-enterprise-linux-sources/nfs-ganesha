@@ -47,7 +47,6 @@
 #include "nfs4.h"
 #include "mount.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_file_handle.h"
 #include "nfs_exports.h"
 #include "nfs_proto_functions.h"
@@ -67,6 +66,7 @@ static struct config_item_list protocols[] = {
 	CONFIG_LIST_TOK("v4", CORE_OPTION_NFSV4),
 	CONFIG_LIST_TOK("nfs4", CORE_OPTION_NFSV4),
 	CONFIG_LIST_TOK("nfsv4", CORE_OPTION_NFSV4),
+	CONFIG_LIST_TOK("nfsvsock", CORE_OPTION_NFS_VSOCK),
 	CONFIG_LIST_TOK("9p", CORE_OPTION_9P),
 	CONFIG_LIST_EOL
 };
@@ -142,10 +142,18 @@ static struct config_item core_params[] = {
 		       nfs_core_param, rpc.max_recv_buffer_size),
 	CONF_ITEM_UI32("RPC_Ioq_ThrdMax", 1, 1024*128, 200,
 		       nfs_core_param, rpc.ioq_thrd_max),
+	CONF_ITEM_UI32("RPC_GSS_Npart", 1, 1021, 13,
+		       nfs_core_param, rpc.gss.ctx_hash_partitions),
+	CONF_ITEM_UI32("RPC_GSS_Max_Ctx", 1, 1024*1024, 16384,
+		       nfs_core_param, rpc.gss.max_ctx),
+	CONF_ITEM_UI32("RPC_GSS_Max_GC", 1, 1024*1024, 200,
+		       nfs_core_param, rpc.gss.max_gc),
 	CONF_ITEM_I64("Decoder_Fridge_Expiration_Delay", 0, 7200, 600,
 		      nfs_core_param, decoder_fridge_expiration_delay),
 	CONF_ITEM_I64("Decoder_Fridge_Block_Timeout", 0, 7200, 600,
 		      nfs_core_param, decoder_fridge_block_timeout),
+	CONF_ITEM_I64("Blocked_Lock_Poller_Interval", 0, 180, 10,
+		      nfs_core_param, blocked_lock_poller_interval),
 	CONF_ITEM_LIST("NFS_Protocols", CORE_OPTION_ALL_VERS, protocols,
 		       nfs_core_param, core_options),
 	CONF_ITEM_LIST("Protocols", CORE_OPTION_ALL_VERS, protocols,
@@ -158,8 +166,12 @@ static struct config_item core_params[] = {
 		       nfs_core_param, enable_NLM),
 	CONF_ITEM_BOOL("Enable_RQUOTA", true,
 		       nfs_core_param, enable_RQUOTA),
+	CONF_ITEM_BOOL("Enable_TCP_keepalive", false,
+		       nfs_core_param, enable_tcp_keepalive),
 	CONF_ITEM_BOOL("Enable_Fast_Stats", false,
 		       nfs_core_param, enable_FASTSTATS),
+	CONF_ITEM_BOOL("Short_File_Handle", false,
+		       nfs_core_param, short_file_handle),
 	CONF_ITEM_I64("Manage_Gids_Expiration", 0, 7*24*60*60, 30*60,
 			nfs_core_param, manage_gids_expiration),
 	CONF_ITEM_PATH("Plugins_Dir", 1, MAXPATHLEN, FSAL_MODULE_LOC,
@@ -232,6 +244,8 @@ static struct config_item version4_params[] = {
 		       nfs_version4_parameter, use_getpwnam),
 	CONF_ITEM_BOOL("Allow_Numeric_Owners", true,
 		       nfs_version4_parameter, allow_numeric_owners),
+	CONF_ITEM_BOOL("Only_Numeric_Owners", false,
+		       nfs_version4_parameter, only_numeric_owners),
 	CONF_ITEM_BOOL("Delegations", false,
 		       nfs_version4_parameter, allow_delegations),
 	CONF_ITEM_UI32("Deleg_Recall_Retry_Delay", 0, 10,

@@ -71,31 +71,32 @@ static inline void glist_init(struct glist_head *head)
 
 /* Add the new element between left and right */
 static inline void __glist_add(struct glist_head *left,
-			       struct glist_head *right, struct glist_head *new)
+			       struct glist_head *right, struct glist_head *elt)
 {
-	new->prev = left;
-	new->next = right;
-	left->next = new;
-	right->prev = new;
+	elt->prev = left;
+	elt->next = right;
+	left->next = elt;
+	right->prev = elt;
 }
 
 static inline void glist_add_tail(struct glist_head *head,
-				  struct glist_head *new)
+				  struct glist_head *elt)
 {
 
-	__glist_add(head->prev, head, new);
+	__glist_add(head->prev, head, elt);
 }
 
 /* add after the specified entry*/
-static inline void glist_add(struct glist_head *head, struct glist_head *new)
+static inline void glist_add(struct glist_head *head, struct glist_head *elt)
 {
-	__glist_add(head, head->next, new);
+	__glist_add(head, head->next, elt);
 }
 
 static inline void glist_del(struct glist_head *node)
 {
 	struct glist_head *left = node->prev;
 	struct glist_head *right = node->next;
+
 	if (left != NULL)
 		left->next = right;
 	if (right != NULL)
@@ -125,12 +126,12 @@ static inline int glist_null(struct glist_head *head)
 }
 
 static inline void glist_add_list_tail(struct glist_head *list,
-				       struct glist_head *new)
+				       struct glist_head *elt)
 {
-	struct glist_head *first = new->next;
-	struct glist_head *last = new->prev;
+	struct glist_head *first = elt->next;
+	struct glist_head *last = elt->prev;
 
-	if (glist_empty(new)) {
+	if (glist_empty(elt)) {
 		/* nothing to add */
 		return;
 	}
@@ -157,6 +158,40 @@ static inline void glist_splice_tail(struct glist_head *tgt,
 	glist_init(src);
 }
 
+static inline void glist_swap_lists(struct glist_head *l1,
+				    struct glist_head *l2)
+{
+	struct glist_head temp;
+
+	if (glist_empty(l1)) {
+		/* l1 was empty, so splice tail will accomplish swap. */
+		glist_splice_tail(l1, l2);
+		return;
+	}
+
+	if (glist_empty(l2)) {
+		/* l2 was empty, so reverse splice tail will accomplish swap. */
+		glist_splice_tail(l2, l1);
+		return;
+	}
+
+	/* Both lists are non-empty */
+
+	/* First swap the list pointers. */
+	temp = *l1;
+	*l1 = *l2;
+	*l2 = temp;
+
+	/* Then fixup first entry in each list prev to point to it's new head */
+	l1->next->prev = l1;
+	l2->next->prev = l2;
+
+	/* And fixup the last entry in each list next to point to it's new head
+	 */
+	l1->prev->next = l1;
+	l2->prev->next = l2;
+}
+
 #define glist_for_each(node, head) \
 	for (node = (head)->next; node != head; node = node->next)
 
@@ -167,6 +202,7 @@ static inline size_t glist_length(struct glist_head *head)
 {
 	size_t length = 0;
 	struct glist_head *dummy = NULL;
+
 	glist_for_each(dummy, head) {
 		++length;
 	}
@@ -195,19 +231,21 @@ static inline size_t glist_length(struct glist_head *head)
 	     node = noden, noden = node->next)
 
 static inline void glist_insert_sorted(struct glist_head *head,
-				       struct glist_head *new,
+				       struct glist_head *elt,
 				       glist_compare compare)
 {
 	struct glist_head *next = NULL;
+
 	if (glist_empty(head)) {
-		glist_add_tail(head, new);
+		glist_add_tail(head, elt);
 		return;
 	}
 	glist_for_each(next, head) {
-		if (compare(next, new) >= 0)
+		if (compare(next, elt) >= 0)
 			break;
 	}
 
-	__glist_add(next->prev, next, new);
+	__glist_add(next->prev, next, elt);
 }
+
 #endif				/* _GANESHA_LIST_H */

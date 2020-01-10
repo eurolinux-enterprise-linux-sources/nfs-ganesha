@@ -218,7 +218,7 @@ nfsstat4 FSAL_encode_file_layout(XDR *xdrs,
 				 const struct pnfs_deviceid *deviceid,
 				 nfl_util4 util, const uint32_t first_idx,
 				 const offset4 ptrn_ofst,
-				 const uint16_t server_id,
+				 const uint16_t *ds_ids,
 				 const uint32_t num_fhs,
 				 const struct gsh_buffdesc *fhs);
 
@@ -239,7 +239,7 @@ struct fsal_pnfs_ds *pnfs_ds_get(uint16_t id_servers);
 
 static inline void pnfs_ds_get_ref(struct fsal_pnfs_ds *pds)
 {
-	atomic_inc_int32_t(&pds->refcount);
+	(void) atomic_inc_int32_t(&pds->refcount);
 }
 
 void pnfs_ds_put(struct fsal_pnfs_ds *pds);

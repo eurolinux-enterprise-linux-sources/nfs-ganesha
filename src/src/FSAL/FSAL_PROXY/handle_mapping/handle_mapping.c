@@ -65,10 +65,8 @@ static digest_pool_entry_t *digest_alloc()
 	digest_pool_entry_t *p_new;
 
 	PTHREAD_MUTEX_lock(&digest_pool_mutex);
-	p_new = pool_alloc(digest_pool, NULL);
+	p_new = pool_alloc(digest_pool);
 	PTHREAD_MUTEX_unlock(&digest_pool_mutex);
-
-	memset(p_new, 0, sizeof(digest_pool_entry_t));
 
 	return p_new;
 }
@@ -87,10 +85,8 @@ static handle_pool_entry_t *handle_alloc()
 	handle_pool_entry_t *p_new;
 
 	PTHREAD_MUTEX_lock(&handle_pool_mutex);
-	p_new = pool_alloc(handle_pool, NULL);
+	p_new = pool_alloc(handle_pool);
 	PTHREAD_MUTEX_unlock(&handle_pool_mutex);
-
-	memset(p_new, 0, sizeof(handle_pool_entry_t));
 
 	return p_new;
 }
@@ -272,12 +268,10 @@ int HandleMap_Init(const handle_map_param_t *p_param)
 	/* initialize memory pool of digests and handles */
 
 	digest_pool =
-	    pool_init(NULL, sizeof(digest_pool_entry_t), pool_basic_substrate,
-		      NULL, NULL, NULL);
+	    pool_basic_init("digest_pool", sizeof(digest_pool_entry_t));
 
 	handle_pool =
-	    pool_init(NULL, sizeof(handle_pool_entry_t), pool_basic_substrate,
-		      NULL, NULL, NULL);
+	    pool_basic_init("handle_pool", sizeof(handle_pool_entry_t));
 
 	/* create hash table */
 
@@ -334,6 +328,7 @@ int HandleMap_GetFH(const nfs23_map_handle_t *nfs23_digest,
 
 	if (rc == HASHTABLE_SUCCESS) {
 		handle_pool_entry_t *h = (handle_pool_entry_t *) buffval.addr;
+
 		if (h->fh_len < fsal_handle->len) {
 			fsal_handle->len = h->fh_len;
 			memcpy(fsal_handle->addr, h->fh_data, h->fh_len);
@@ -420,7 +415,7 @@ int HandleMap_DelFH(nfs23_map_handle_t *p_in_nfs23_digest)
 /**
  * Flush pending database operations (before stopping the server).
  */
-int HandleMap_Flush()
+int HandleMap_Flush(void)
 {
 	return handlemap_db_flush();
 }

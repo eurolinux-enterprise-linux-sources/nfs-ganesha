@@ -34,8 +34,6 @@
 #include "fsal.h"
 #include "rquota.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
-#include "cache_inode_lru.h"
 #include "nfs_file_handle.h"
 #include "nfs_exports.h"
 #include "nfs_ip_stats.h"
@@ -56,7 +54,9 @@
 #include <string.h>
 #include <signal.h>
 #include <math.h>
+#ifdef _USE_NLM
 #include "nlm_util.h"
+#endif /* _USE_NLM */
 #include "nsm.h"
 #include "sal_functions.h"
 #include "fridgethr.h"
@@ -68,7 +68,9 @@
 #include <sys/capability.h>	/* For capget/capset */
 #endif
 #include "uid2grp.h"
+#include "netgroup_cache.h"
 #include "pnfs_utils.h"
+#include "mdcache.h"
 
 
 /* global information exported to all layers (as extern vars) */
@@ -98,13 +100,75 @@ pthread_t _9p_dispatcher_thrid;
 pthread_t _9p_rdma_dispatcher_thrid;
 #endif
 
-#ifdef _USE_NFS_MSK
-pthread_t nfs_msk_dispatcher_thrid;
+#ifdef _USE_NFS_RDMA
+pthread_t nfs_rdma_dispatcher_thrid;
 #endif
 
 char *config_path = GANESHA_CONFIG_PATH;
 
 char *pidfile_path = GANESHA_PIDFILE_PATH;
+
+/**
+ * @brief Reread the configuration file to accomplish update of options.
+ *
+ * The following option blocks are currently supported for update:
+ *
+ * LOG {}
+ * LOG { COMPONENTS {} }
+ * LOG { FACILITY {} }
+ * LOG { FORMAT {} }
+ * EXPORT {}
+ * EXPORT { CLIENT {} }
+ *
+ */
+
+void reread_config(void)
+{
+	int status = 0;
+	int i;
+	config_file_t config_struct;
+	struct config_error_type err_type;
+
+	/* Clear out the flag indicating component was set from environment. */
+	for (i = COMPONENT_ALL; i < COMPONENT_COUNT; i++)
+		LogComponents[i].comp_env_set = false;
+
+	/* If no configuration file is given, then the caller must want to
+	 * reparse the configuration file from startup.
+	 */
+	if (config_path[0] == '\0') {
+		LogCrit(COMPONENT_CONFIG,
+			"No configuration file was specified for reloading log config.");
+		return;
+	}
+
+	/* Create a memstream for parser+processing error messages */
+	if (!init_error_type(&err_type))
+		return;
+	/* Attempt to parse the new configuration file */
+	config_struct = config_ParseFile(config_path, &err_type);
+	if (!config_error_no_error(&err_type)) {
+		config_Free(config_struct);
+		LogCrit(COMPONENT_CONFIG,
+			"Error while parsing new configuration file %s",
+			config_path);
+		report_config_errors(&err_type, NULL, config_errs_to_log);
+		return;
+	}
+
+	/* Update the logging configuration */
+	status = read_log_config(config_struct, &err_type);
+	if (status < 0)
+		LogCrit(COMPONENT_CONFIG, "Error while parsing LOG entries");
+
+	/* Update the export configuration */
+	status = reread_exports(config_struct, &err_type);
+	if (status < 0)
+		LogCrit(COMPONENT_CONFIG, "Error while parsing EXPORT entries");
+
+	report_config_errors(&err_type, NULL, config_errs_to_log);
+	config_Free(config_struct);
+}
 
 /**
  * @brief This thread is in charge of signal management
@@ -113,7 +177,7 @@ char *pidfile_path = GANESHA_PIDFILE_PATH;
  *
  * @return NULL.
  */
-void *sigmgr_thread(void *UnusedArg)
+static void *sigmgr_thread(void *UnusedArg)
 {
 	SetNameFunction("sigmgr");
 	int signal_caught = 0;
@@ -121,6 +185,7 @@ void *sigmgr_thread(void *UnusedArg)
 	/* Loop until we catch SIGTERM */
 	while (signal_caught != SIGTERM) {
 		sigset_t signals_to_catch;
+
 		sigemptyset(&signals_to_catch);
 		sigaddset(&signals_to_catch, SIGTERM);
 		sigaddset(&signals_to_catch, SIGHUP);
@@ -132,8 +197,7 @@ void *sigmgr_thread(void *UnusedArg)
 		if (signal_caught == SIGHUP) {
 			LogEvent(COMPONENT_MAIN,
 				 "SIGHUP_HANDLER: Received SIGHUP.... initiating export list reload");
-			admin_replace_exports();
-			reread_log_config();
+			reread_config();
 			svcauth_gss_release_cred();
 		}
 	}
@@ -167,7 +231,7 @@ void nfs_prereq_init(char *program_name, char *host_name, int debug_level,
 /**
  * @brief Print the nfs_parameter_structure
  */
-void nfs_print_param_config()
+void nfs_print_param_config(void)
 {
 	printf("NFS_Core_Param\n{\n");
 
@@ -195,12 +259,14 @@ void nfs_print_param_config()
 	printf("\tDRC_UDP_Checksum = %u ;\n",
 	       nfs_param.core_param.drc.udp.checksum);
 	printf("\tDecoder_Fridge_Expiration_Delay = %" PRIu64 " ;\n",
-	       nfs_param.core_param.decoder_fridge_expiration_delay);
+	       (uint64_t) nfs_param.core_param.decoder_fridge_expiration_delay);
 	printf("\tDecoder_Fridge_Block_Timeout = %" PRIu64 " ;\n",
-	       nfs_param.core_param.decoder_fridge_block_timeout);
+	       (uint64_t) nfs_param.core_param.decoder_fridge_block_timeout);
+	printf("\tBlocked_Lock_Poller_Interval = %" PRIu64 " ;\n",
+	       (uint64_t) nfs_param.core_param.blocked_lock_poller_interval);
 
 	printf("\tManage_Gids_Expiration = %" PRIu64 " ;\n",
-	       nfs_param.core_param.manage_gids_expiration);
+	       (uint64_t) nfs_param.core_param.manage_gids_expiration);
 
 	if (nfs_param.core_param.drop_io_errors)
 		printf("\tDrop_IO_Errors = true ;\n");
@@ -304,17 +370,8 @@ int nfs_set_param_from_conf(config_file_t parse_tree,
 	}
 #endif
 
-	/* Cache inode client parameters */
-	(void) load_config_from_parse(parse_tree,
-				      &cache_inode_param_blk,
-				      NULL,
-				      true,
-				      err_type);
-	if (!config_error_is_harmless(err_type)) {
-		LogCrit(COMPONENT_INIT,
-			"Error while parsing 9P specific configuration");
+	if (mdcache_set_param_from_conf(parse_tree, err_type) < 0)
 		return -1;
-	}
 
 	LogEvent(COMPONENT_INIT, "Configuration file successfully parsed");
 
@@ -323,18 +380,20 @@ int nfs_set_param_from_conf(config_file_t parse_tree,
 
 int init_server_pkgs(void)
 {
-	cache_inode_status_t cache_status;
+	fsal_status_t fsal_status;
 	state_status_t state_status;
 
 	/* init uid2grp cache */
 	uid2grp_cache_init();
 
-	/* Cache Inode Initialisation */
-	cache_status = cache_inode_init();
-	if (cache_status != CACHE_INODE_SUCCESS) {
+	ng_cache_init(); /* netgroup cache */
+
+	/* MDCACHE Initialisation */
+	fsal_status = mdcache_pkginit();
+	if (FSAL_IS_ERROR(fsal_status)) {
 		LogCrit(COMPONENT_INIT,
-			"Cache Inode Layer could not be initialized, status=%s",
-			cache_inode_err_str(cache_status));
+			"MDCACHE FSAL could not be initialized, status=%s",
+			fsal_err_txt(fsal_status));
 		return -1;
 	}
 
@@ -411,8 +470,7 @@ static void nfs_Start_threads(void)
 				    _9p_dispatcher_thread, NULL);
 		if (rc != 0) {
 			LogFatal(COMPONENT_THREAD,
-				 "Could not create  9P/TCP dispatcher,"
-				 " error = %d (%s)",
+				 "Could not create  9P/TCP dispatcher, error = %d (%s)",
 				 errno, strerror(errno));
 		}
 		LogEvent(COMPONENT_THREAD,
@@ -427,8 +485,7 @@ static void nfs_Start_threads(void)
 				    _9p_rdma_dispatcher_thread, NULL);
 		if (rc != 0) {
 			LogFatal(COMPONENT_THREAD,
-				 "Could not create  9P/RDMA dispatcher,"
-				 " error = %d (%s)",
+				 "Could not create  9P/RDMA dispatcher, error = %d (%s)",
 				 errno, strerror(errno));
 		}
 		LogEvent(COMPONENT_THREAD,
@@ -436,18 +493,18 @@ static void nfs_Start_threads(void)
 	}
 #endif
 
-#ifdef _USE_NFS_MSK
-	/* Starting the NFS/MSK dispatcher thread */
-	rc = pthread_create(&nfs_msk_dispatcher_thrid, &attr_thr,
-			    nfs_msk_dispatcher_thread, NULL);
+#ifdef _USE_NFS_RDMA
+	/* Starting the NFS/RDMA dispatcher thread */
+	rc = pthread_create(&nfs_rdma_dispatcher_thrid, &attr_thr,
+			    nfs_rdma_dispatcher_thread, NULL);
 
 	if (rc != 0) {
 		LogFatal(COMPONENT_THREAD,
-			 "Could not create NFS/MSK dispatcher, error = %d (%s)",
+			 "Could not create NFS/RDMA dispatcher, error = %d (%s)",
 			 errno, strerror(errno));
 	}
 	LogEvent(COMPONENT_THREAD,
-		 "NFS/MSK dispatcher thread was started successfully");
+		 "NFS/RDMA dispatcher thread was started successfully");
 #endif
 
 #ifdef USE_DBUS
@@ -498,7 +555,6 @@ static void nfs_Start_threads(void)
 
 static void nfs_Init(const nfs_start_info_t *p_start_info)
 {
-	int rc = 0;
 #ifdef _HAVE_GSSAPI
 	gss_buffer_desc gss_service_buf;
 	OM_uint32 maj_stat, min_stat;
@@ -512,14 +568,6 @@ static void nfs_Init(const nfs_start_info_t *p_start_info)
 	dbus_client_init();
 #endif
 
-	/* Cache Inode LRU (call this here, rather than as part of
-	   cache_inode_init() so the GC policy has been set */
-	rc = cache_inode_lru_pkginit();
-	if (rc != 0) {
-		LogFatal(COMPONENT_INIT,
-			 "Unable to initialize LRU subsystem: %d.", rc);
-	}
-
 	/* acls cache may be needed by exports_pkginit */
 	LogDebug(COMPONENT_INIT, "Now building NFSv4 ACL cache");
 	if (nfs4_acls_init() != 0)
@@ -531,36 +579,10 @@ static void nfs_Init(const nfs_start_info_t *p_start_info)
 	exports_pkginit();
 
 	nfs41_session_pool =
-	    pool_init("NFSv4.1 session pool", sizeof(nfs41_session_t),
-		      pool_basic_substrate, NULL, NULL, NULL);
-	if (!nfs41_session_pool)
-		LogFatal(COMPONENT_INIT,
-			 "Error while allocating NFSv4.1 session pool");
+	    pool_basic_init("NFSv4.1 session pool", sizeof(nfs41_session_t));
 
 	request_pool =
-	    pool_init("Request pool", sizeof(request_data_t),
-		      pool_basic_substrate, NULL,
-		      NULL /* FASTER constructor_request_data_t */ ,
-		      NULL);
-	if (!request_pool)
-		LogFatal(COMPONENT_INIT,
-			 "Error while allocating request pool");
-
-	request_data_pool =
-	    pool_init("Request Data Pool", sizeof(nfs_request_data_t),
-		      pool_basic_substrate, NULL,
-		      NULL /* FASTER constructor_nfs_request_data_t */ ,
-		      NULL);
-	if (!request_data_pool)
-		LogFatal(COMPONENT_INIT,
-			"Error while allocating request data pool");
-
-	dupreq_pool =
-	    pool_init("Duplicate Request Pool", sizeof(dupreq_entry_t),
-		      pool_basic_substrate, NULL, NULL, NULL);
-	if (!(dupreq_pool))
-		LogFatal(COMPONENT_INIT,
-			"Error while allocating duplicate request pool");
+	    pool_basic_init("Request pool", sizeof(request_data_t));
 
 	/* If rpcsec_gss is used, set the path to the keytab */
 #ifdef _HAVE_GSSAPI
@@ -663,6 +685,7 @@ static void nfs_Init(const nfs_start_info_t *p_start_info)
 	LogInfo(COMPONENT_INIT,
 		"NFSv4 Open Owner cache successfully initialized");
 
+#ifdef _USE_NLM
 	if (nfs_param.core_param.enable_NLM) {
 		/* Init The NLM Owner cache */
 		LogDebug(COMPONENT_INIT, "Now building NLM Owner cache");
@@ -672,8 +695,17 @@ static void nfs_Init(const nfs_start_info_t *p_start_info)
 		}
 		LogInfo(COMPONENT_INIT,
 			"NLM Owner cache successfully initialized");
+		/* Init The NLM Owner cache */
+		LogDebug(COMPONENT_INIT, "Now building NLM State cache");
+		if (Init_nlm_state_hash() != 0) {
+			LogFatal(COMPONENT_INIT,
+				 "Error while initializing NLM State cache");
+		}
+		LogInfo(COMPONENT_INIT,
+			"NLM State cache successfully initialized");
 		nlm_init();
 	}
+#endif /* _USE_NLM */
 #ifdef _USE_9P
 	/* Init the 9P lock owner cache */
 	LogDebug(COMPONENT_INIT, "Now building 9P Owner cache");
@@ -691,7 +723,6 @@ static void nfs_Init(const nfs_start_info_t *p_start_info)
 	}
 	LogInfo(COMPONENT_INIT,
 		"NFSv4 Session Id cache successfully initialized");
-
 
 #ifdef _USE_9P
 	LogDebug(COMPONENT_INIT, "Now building 9P resources");
@@ -842,14 +873,17 @@ void nfs_start(nfs_start_info_t *p_start_info)
 
 	/* Initialize all layers and service threads */
 	nfs_Init(p_start_info);
+	init_complete = true;
 
 	/* Spawns service threads */
 	nfs_Start_threads();
 
+#ifdef _USE_NLM
 	if (nfs_param.core_param.enable_NLM) {
 		/* NSM Unmonitor all */
 		nsm_unmonitor_all();
 	}
+#endif /* _USE_NLM */
 
 	LogEvent(COMPONENT_INIT,
 		 "-------------------------------------------------");

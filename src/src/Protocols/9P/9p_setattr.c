@@ -40,12 +40,10 @@
 #include "nfs_core.h"
 #include "nfs_exports.h"
 #include "log.h"
-#include "cache_inode.h"
 #include "fsal.h"
 #include "9p.h"
 
-int _9p_setattr(struct _9p_request_data *req9p, void *worker_data,
-		u32 *plenout, char *preply)
+int _9p_setattr(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 {
 	char *cursor = req9p->_9pmsg + _9P_HDR_SIZE + _9P_TYPE_SIZE;
 	u16 *msgtag = NULL;
@@ -63,7 +61,7 @@ int _9p_setattr(struct _9p_request_data *req9p, void *worker_data,
 	struct _9p_fid *pfid = NULL;
 
 	struct attrlist fsalattr;
-	cache_inode_status_t cache_status;
+	fsal_status_t fsal_status;
 
 	struct timeval t;
 
@@ -91,24 +89,21 @@ int _9p_setattr(struct _9p_request_data *req9p, void *worker_data,
 		 (unsigned long long)*mtime_nsec);
 
 	if (*fid >= _9P_FID_PER_CONN)
-		return _9p_rerror(req9p, worker_data, msgtag, ERANGE, plenout,
-				  preply);
+		return _9p_rerror(req9p, msgtag, ERANGE, plenout, preply);
 
 	pfid = req9p->pconn->fids[*fid];
 
 	/* Check that it is a valid fid */
 	if (pfid == NULL || pfid->pentry == NULL) {
 		LogDebug(COMPONENT_9P, "request on invalid fid=%u", *fid);
-		return _9p_rerror(req9p, worker_data, msgtag, EIO, plenout,
-				  preply);
+		return _9p_rerror(req9p, msgtag, EIO, plenout, preply);
 	}
 
-	if ((pfid->op_context.export_perms->options &
-				 EXPORT_OPTION_WRITE_ACCESS) == 0)
-		return _9p_rerror(req9p, worker_data, msgtag, EROFS, plenout,
-				  preply);
+	_9p_init_opctx(pfid, req9p);
 
-	op_ctx = &pfid->op_context;
+	if ((op_ctx->export_perms->options &
+				 EXPORT_OPTION_WRITE_ACCESS) == 0)
+		return _9p_rerror(req9p, msgtag, EROFS, plenout, preply);
 
 	/* If a "time" change is required, but not with the "_set" suffix,
 	 * use gettimeofday */
@@ -118,7 +113,7 @@ int _9p_setattr(struct _9p_request_data *req9p, void *worker_data,
 			LogMajor(COMPONENT_9P,
 				 "TSETATTR: tag=%u fid=%u ERROR !! gettimeofday returned -1 with errno=%u",
 				 (u32) *msgtag, *fid, errno);
-			return _9p_rerror(req9p, worker_data, msgtag, errno,
+			return _9p_rerror(req9p, msgtag, errno,
 					  plenout, preply);
 		}
 	}
@@ -127,65 +122,64 @@ int _9p_setattr(struct _9p_request_data *req9p, void *worker_data,
 	memset((char *)&fsalattr, 0, sizeof(fsalattr));
 
 	if (*valid & _9P_SETATTR_MODE) {
-		FSAL_SET_MASK(fsalattr.mask, ATTR_MODE);
+		fsalattr.valid_mask |= ATTR_MODE;
 		fsalattr.mode = *mode;
 	}
 
 	if (*valid & _9P_SETATTR_UID) {
-		FSAL_SET_MASK(fsalattr.mask, ATTR_OWNER);
+		fsalattr.valid_mask |= ATTR_OWNER;
 		fsalattr.owner = *uid;
 	}
 
 	if (*valid & _9P_SETATTR_GID) {
-		FSAL_SET_MASK(fsalattr.mask, ATTR_GROUP);
+		fsalattr.valid_mask |= ATTR_GROUP;
 		fsalattr.group = *gid;
 	}
 
 	if (*valid & _9P_SETATTR_SIZE) {
-		FSAL_SET_MASK(fsalattr.mask, ATTR_SIZE);
+		fsalattr.valid_mask |= ATTR_SIZE;
 		fsalattr.filesize = *size;
 	}
 
 	if (*valid & _9P_SETATTR_ATIME) {
-		FSAL_SET_MASK(fsalattr.mask, ATTR_ATIME);
+		fsalattr.valid_mask |= ATTR_ATIME;
 		fsalattr.atime.tv_sec = t.tv_sec;
 		fsalattr.atime.tv_nsec = t.tv_usec * 1000;
 	}
 
 	if (*valid & _9P_SETATTR_MTIME) {
-		FSAL_SET_MASK(fsalattr.mask, ATTR_MTIME);
+		fsalattr.valid_mask |= ATTR_MTIME;
 		fsalattr.mtime.tv_sec = t.tv_sec;
 		fsalattr.mtime.tv_nsec = t.tv_usec * 1000;
 	}
 
 	if (*valid & _9P_SETATTR_CTIME) {
-		FSAL_SET_MASK(fsalattr.mask, ATTR_CTIME);
+		fsalattr.valid_mask |= ATTR_CTIME;
 		fsalattr.ctime.tv_sec = t.tv_sec;
 		fsalattr.ctime.tv_nsec = t.tv_usec * 1000;
 	}
 
 	if (*valid & _9P_SETATTR_ATIME_SET) {
-		FSAL_SET_MASK(fsalattr.mask, ATTR_ATIME);
+		fsalattr.valid_mask |= ATTR_ATIME;
 		fsalattr.atime.tv_sec = *atime_sec;
 		fsalattr.atime.tv_nsec = *atime_nsec;
 	}
 
 	if (*valid & _9P_SETATTR_MTIME_SET) {
-		FSAL_SET_MASK(fsalattr.mask, ATTR_MTIME);
+		fsalattr.valid_mask |= ATTR_MTIME;
 		fsalattr.mtime.tv_sec = *mtime_sec;
 		fsalattr.mtime.tv_nsec = *mtime_nsec;
 	}
 
-	/* Set size if needed */
-	if (*valid & _9P_SETATTR_SIZE)
-		FSAL_SET_MASK(fsalattr.mask, ATTR_SIZE);
-
 	/* Now set the attr */
-	cache_status =
-	    cache_inode_setattr(pfid->pentry, &fsalattr, false);
-	if (cache_status != CACHE_INODE_SUCCESS)
-		return _9p_rerror(req9p, worker_data, msgtag,
-				  _9p_tools_errno(cache_status), plenout,
+	fsal_status = fsal_setattr(pfid->pentry, false, pfid->state, &fsalattr);
+
+	/* Release the attributes (may release an inherited ACL) */
+	fsal_release_attrs(&fsalattr);
+
+	if (FSAL_IS_ERROR(fsal_status))
+		return _9p_rerror(req9p, msgtag,
+				  _9p_tools_errno(fsal_status), plenout,
 				  preply);
 
 	/* Build the reply */

@@ -1,7 +1,3 @@
-include_directories(
-  ${LIBTIRPC_INCLUDE_DIR}
-)
-
 if(USE_DBUS)
   include_directories(
     ${DBUS_INCLUDE_DIRS}
@@ -34,6 +30,12 @@ set( uid2grp_SRCS
 )
 
 add_library( uid2grp STATIC ${uid2grp_SRCS} )
+
+# netgroup cache
+set(netgroup_cache_SRCS
+    netgroup_cache.c
+)
+add_library(netgroup_cache STATIC ${netgroup_cache_SRCS} )
 
 ########### next target ###############
 

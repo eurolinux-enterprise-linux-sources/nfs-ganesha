@@ -37,6 +37,9 @@
 #include <sys/socket.h>
 #include <netdb.h>
 
+#define get16bits(d) (*((const uint16_t *) (d)))
+#define MAX_DS_COUNT 100
+
 /**
  * @brief Get layout types supported by export
  *
@@ -150,7 +153,6 @@ static nfsstat4 pnfs_layout_get(struct fsal_obj_handle          *obj_pub,
 
 	struct glusterfs_handle *handle =
 		container_of(obj_pub, struct glusterfs_handle, handle);
-	int    p_flags = 0;
 	int    rc = 0;
 	/* Structure containing the storage parameters of the file within
 	   glusterfs. */
@@ -198,7 +200,7 @@ static nfsstat4 pnfs_layout_get(struct fsal_obj_handle          *obj_pub,
 		return NFS4ERR_INVAL;
 	}
 
-	/* TODO: When more than one client tries access the same layout
+	/** @todo: When more than one client tries access the same layout
 	 *       for the write operation, then last write will overwrite
 	 *       for the write operation, then last write will overwrite
 	 *       the previous ones, the MDS should intelligently deal
@@ -219,13 +221,12 @@ static nfsstat4 pnfs_layout_get(struct fsal_obj_handle          *obj_pub,
 		return posix2nfs4_error(-rc);
 	}
 
-	fsal2posix_openflags(handle->openflags, &p_flags);
-	ds_wire.flags    = p_flags;
 	ds_wire.layout   = file_layout;
 	ds_desc.addr     = &ds_wire;
 	ds_desc.len      = sizeof(struct glfs_ds_wire);
 	nfs_status = FSAL_encode_file_layout(loc_body, &deviceid, util, 0, 0,
-					     arg->export_id, 1, &ds_desc);
+					     &req_ctx->ctx_export->export_id, 1,
+					     &ds_desc);
 	if (nfs_status) {
 		LogMajor(COMPONENT_PNFS,
 			  "Failed to encode nfsv4_1_file_layout.");
@@ -313,11 +314,8 @@ static nfsstat4 pnfs_layout_commit(struct fsal_obj_handle *obj_pub,
 	}
 
 	/* Gets previous status of file in the MDS */
-	if (objhandle->openflags != FSAL_O_CLOSED)
-		rc = glfs_fstat(objhandle->glfd, &old_stat);
-	else
-		rc = glfs_h_stat(glfs_export->gl_fs,
-				 objhandle->glhandle, &old_stat);
+	rc = glfs_h_stat(glfs_export->gl_fs,
+			 objhandle->glhandle, &old_stat);
 
 	if (rc != 0) {
 		LogMajor(COMPONENT_PNFS,
@@ -413,8 +411,8 @@ nfsstat4 getdeviceinfo(struct fsal_module *fsal_hdl,
 
 	if (!inline_xdr_u_int32_t(da_addr_body, &num_ds)) {
 		LogMajor(COMPONENT_PNFS,
-			 "Failed to encode length of "
-			 "multipath_ds_list array: %u", num_ds);
+			 "Failed to encode length of multipath_ds_list array: %u",
+			 num_ds);
 		return NFS4ERR_SERVERFAULT;
 	}
 	memset(&host, 0, sizeof(fsal_multipath_member_t));
@@ -429,11 +427,11 @@ nfsstat4 getdeviceinfo(struct fsal_module *fsal_hdl,
 	return nfs_status;
 	}
 
-	/* TODO : Here information about Data-Server where file resides
+	/** @todo: Here information about Data-Server where file resides
 	 *        is only send from MDS.If that Data-Server is down then
 	 *        read or write will performed through MDS.
 	 *        Instead should we send the information about all
-	 *        the available data-servers , so that these fops will
+	 *        the available data-servers, so that these fops will
 	 *        always performed through Data-Servers.
 	 *        (Like in replicated volume contains more than ONE DS)
 	 */
@@ -455,7 +453,7 @@ nfsstat4 getdeviceinfo(struct fsal_module *fsal_hdl,
  */
 static nfsstat4 getdevicelist(struct fsal_export *export_pub, layouttype4 type,
 			      void *opaque,
-			      bool(*cb) (void *opaque, const uint64_t id),
+			      bool (*cb)(void *opaque, const uint64_t id),
 			      struct fsal_getdevicelist_res *res)
 {
 	res->eof = true;
@@ -485,34 +483,121 @@ void export_ops_pnfs(struct export_ops *ops)
 	ops->fs_loc_body_size           = fs_loc_body_size;
 }
 
+/* *
+ * Calculates  a hash value for a given string buffer
+ */
+uint32_t superfasthash(const unsigned char *data, uint32_t len)
+{
+	uint32_t hash = len, tmp;
+	int32_t rem;
+
+	rem = len & 3;
+	len >>= 2;
+
+	/* Main loop */
+	for (; len > 0; len--) {
+		hash  += get16bits(data);
+		tmp    = (get16bits(data+2) << 11) ^ hash;
+		hash   = (hash << 16) ^ tmp;
+		data  += 2*sizeof(uint16_t);
+		hash  += hash >> 11;
+	}
+
+	/* Handle end cases */
+	switch (rem) {
+	case 3:
+		hash += get16bits(data);
+		hash ^= hash << 16;
+		hash ^= data[sizeof(uint16_t)] << 18;
+		hash += hash >> 11;
+		break;
+	case 2:
+		hash += get16bits(data);
+		hash ^= hash << 11;
+		hash += hash >> 17;
+		break;
+	case 1:
+		hash += *data;
+		hash ^= hash << 10;
+		hash += hash >> 1;
+	}
+
+	/* Force "avalanching" of final 127 bits */
+	hash ^= hash << 3;
+	hash += hash >> 5;
+	hash ^= hash << 4;
+	hash += hash >> 17;
+	hash ^= hash << 25;
+	hash += hash >> 6;
+
+	return hash;
+}
 /**
  * It will extract hostname from pathinfo.PATH_INFO_KEYS gives
  * details about all the servers and path in that server where
  * file resides.
- * With the help of some basic string manipulations we can find
- * hostname from the pathinfo
+ * First it selects the DS based on distributed hashing, then
+ * with the help of some basic string manipulations, the hostname
+ * can be fetched from the pathinfo
  *
  * Returns zero and valid hostname on success
  */
 
 int
-get_pathinfo_host(char *pathinfo, char *hostname, size_t size)
+select_ds(struct glfs_object *object, char *pathinfo, char *hostname,
+	  size_t size)
 {
+	/* Represents starting of each server in the list*/
 	const char posix[10]    = "POSIX";
+	/* Array of pathinfo of available dses */
+	char	*ds_path_info[MAX_DS_COUNT];
+	/* Key for hashing */
+	unsigned char key[16];
 	/* Starting of first brick path in the pathinfo */
-	char *first_brick_path_beg    = NULL;
+	char	*tmp		= NULL;
 	/* Stores starting of hostname */
 	char    *start          = NULL;
 	/* Stores ending of hostname */
 	char    *end            = NULL;
 	int     ret             = -1;
 	int     i               = 0;
+	/* counts no of available ds */
+	int	no_of_ds	= 0;
 
 	if (!pathinfo || !size)
 		goto out;
 
-	first_brick_path_beg = strstr(pathinfo, posix);
-	start = strchr(first_brick_path_beg, ':');
+	tmp = pathinfo;
+	while ((tmp = strstr(tmp, posix))) {
+		ds_path_info[no_of_ds] = tmp;
+		tmp++;
+		no_of_ds++;
+		/* *
+		 * If no of dses reaches maxmium count, then
+		 * perform load balance on current list
+		 */
+		if (no_of_ds == MAX_DS_COUNT)
+			break;
+	}
+
+	if (no_of_ds == 0) {
+		LogCrit(COMPONENT_PNFS,
+			"Invalid pathinfo(%s) attribute found while selecting DS.",
+			pathinfo);
+		goto out;
+	}
+
+	ret = glfs_h_extract_handle(object, key, GFAPI_HANDLE_LENGTH);
+	if (ret < 0)
+		goto out;
+
+	/* Pick DS from the list */
+	if (no_of_ds == 1)
+		ret = 0;
+	else
+		ret = superfasthash(key, 16) % no_of_ds;
+
+	start = strchr(ds_path_info[ret], ':');
 	if (!start)
 		goto out;
 	end = start + 1;
@@ -525,9 +610,9 @@ get_pathinfo_host(char *pathinfo, char *hostname, size_t size)
 	while (++start != end)
 		hostname[i++] = *start;
 	ret = 0;
+	LogDebug(COMPONENT_PNFS, "hostname %s", hostname);
 
 out:
-	LogDebug(COMPONENT_PNFS, "hostname %s", hostname);
 	return ret;
 }
 
@@ -535,11 +620,11 @@ out:
  * The data server address will be send from here
  *
  * The information about the first server present
- * in the PATH_INFO_KEY will be returned , since
+ * in the PATH_INFO_KEY will be returned, since
  * entire file is consistent over the servers
  * (Striped volumes are not considered right now)
  *
- * On success , returns zero with ip address of
+ * On success, returns zero with ip address of
  * the server will be send
  */
 int
@@ -552,14 +637,13 @@ glfs_get_ds_addr(struct glfs *fs, struct glfs_object *object, uint32_t *ds_addr)
 	struct in_addr  addr                 = {0, };
 	const char      *pathinfokey         = "trusted.glusterfs.pathinfo";
 
-
 	ret = glfs_h_getxattrs(fs, object, pathinfokey, pathinfo, 1024);
 
-	LogDebug(COMPONENT_PNFS, "pathinfo %s" , pathinfo);
+	LogDebug(COMPONENT_PNFS, "pathinfo %s", pathinfo);
 
-	ret = get_pathinfo_host(pathinfo, hostname, sizeof(hostname));
+	ret = select_ds(object, pathinfo, hostname, sizeof(hostname));
 	if (ret) {
-		LogMajor(COMPONENT_PNFS , "cannot get hostname");
+		LogMajor(COMPONENT_PNFS, "No DS found");
 		goto out;
 	}
 
@@ -568,7 +652,7 @@ glfs_get_ds_addr(struct glfs *fs, struct glfs_object *object, uint32_t *ds_addr)
 	hints.ai_family = AF_INET;
 	ret = getaddrinfo(hostname, NULL, &hints, &res);
 	if (ret != 0) {
-		LogMajor(COMPONENT_PNFS , "error %d\n", ret);
+		LogMajor(COMPONENT_PNFS, "error %d\n", ret);
 		goto out;
 	}
 

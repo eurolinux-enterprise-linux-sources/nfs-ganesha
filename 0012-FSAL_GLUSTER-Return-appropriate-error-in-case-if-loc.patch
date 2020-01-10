@@ -1,0 +1,43 @@
+From 49e378ce55061391e78dfedc87bc061ba3b7e8de Mon Sep 17 00:00:00 2001
+From: Soumya Koduri <skoduri@redhat.com>
+Date: Thu, 5 Jan 2017 15:52:33 +0530
+Subject: [PATCH] FSAL_GLUSTER: Return appropriate error in case if lock
+ acquisition fails
+
+FSAL_GLUSTER seem to be returning success even in case if posix
+lock acquisition fails. Fixed the same.
+
+Change-Id: I061ca05b49ff32fac00b0cbe50b6926a4569e5b5
+Signed-off-by: Soumya Koduri <skoduri@redhat.com>
+---
+ src/FSAL/FSAL_GLUSTER/handle.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/src/FSAL/FSAL_GLUSTER/handle.c b/src/FSAL/FSAL_GLUSTER/handle.c
+index 36de300..c37e3de 100644
+--- a/src/FSAL/FSAL_GLUSTER/handle.c
++++ b/src/FSAL/FSAL_GLUSTER/handle.c
+@@ -2097,6 +2097,7 @@ static fsal_status_t glusterfs_lock_op2(struct fsal_obj_handle *obj_hdl,
+ 
+ 	if (retval /* && lock_op == FSAL_OP_LOCK */) {
+ 		retval = errno;
++		int rc = 0;
+ 
+ 		LogDebug(COMPONENT_FSAL,
+ 			 "fcntl returned %d %s",
+@@ -2104,10 +2105,10 @@ static fsal_status_t glusterfs_lock_op2(struct fsal_obj_handle *obj_hdl,
+ 
+ 		if (conflicting_lock != NULL) {
+ 			/* Get the conflicting lock */
+-			retval = glfs_posix_lock(my_fd.glfd, F_GETLK,
++			rc = glfs_posix_lock(my_fd.glfd, F_GETLK,
+ 						 &lock_args);
+ 
+-			if (retval) {
++			if (rc) {
+ 				retval = errno; /* we lose the initial error */
+ 				LogCrit(COMPONENT_FSAL,
+ 					"After failing a lock request, I couldn't even get the details of who owns the lock.");
+-- 
+2.5.0
+

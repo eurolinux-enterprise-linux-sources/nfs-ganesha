@@ -45,7 +45,6 @@
 #include "nfs4.h"
 #include "mount.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_exports.h"
 #include "nfs_proto_functions.h"
 #include "nfs_file_handle.h"
@@ -115,5 +114,5 @@ int nfs4_op_reclaim_complete(struct nfs_argop4 *op, compound_data_t *data,
  */
 void nfs4_op_reclaim_complete_Free(nfs_resop4 *resp)
 {
-	return;
-}				/* nfs41_op_reclaim_complete_Free */
+	/* Nothing to be done */
+}

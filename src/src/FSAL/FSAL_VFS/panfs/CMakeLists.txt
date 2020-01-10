@@ -12,8 +12,11 @@ SET(fsalpanfs_LIB_SRCS
    ../handle_syscalls.c
    ../file.c
    ../xattrs.c
+   ../state.c
    ../vfs_methods.h
    subfsal_panfs.c
+   attrs.c
+   handle.c
   )
 
 add_library(fsalpanfs SHARED ${fsalpanfs_LIB_SRCS})

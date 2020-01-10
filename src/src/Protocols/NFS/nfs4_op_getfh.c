@@ -32,7 +32,6 @@
 #include "gsh_rpc.h"
 #include "nfs4.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_exports.h"
 #include "nfs_proto_functions.h"
 #include "nfs_proto_tools.h"
@@ -61,7 +60,7 @@ int nfs4_op_getfh(struct nfs_argop4 *op, compound_data_t *data,
 	resp->resop = NFS4_OP_GETFH;
 	res_GETFH->status = NFS4_OK;
 
-	LogHandleNFS4("NFS4 GETFH BEFORE: %s", &data->currentFH);
+	LogHandleNFS4("NFS4 GETFH BEFORE: ", &data->currentFH);
 
 	/* Do basic checks on a filehandle */
 	res_GETFH->status = nfs4_sanity_check_FH(data, NO_FILE_TYPE, true);
@@ -70,11 +69,7 @@ int nfs4_op_getfh(struct nfs_argop4 *op, compound_data_t *data,
 		return res_GETFH->status;
 
 	/* Copy the filehandle to the reply structure */
-	res_GETFH->status =
-	    nfs4_AllocateFH(&res_GETFH->GETFH4res_u.resok4.object);
-
-	if (res_GETFH->status != NFS4_OK)
-		return res_GETFH->status;
+	nfs4_AllocateFH(&res_GETFH->GETFH4res_u.resok4.object);
 
 	/* Put the data in place */
 	res_GETFH->GETFH4res_u.resok4.object.nfs_fh4_len =
@@ -84,9 +79,10 @@ int nfs4_op_getfh(struct nfs_argop4 *op, compound_data_t *data,
 	       data->currentFH.nfs_fh4_val,
 	       data->currentFH.nfs_fh4_len);
 
-	LogHandleNFS4("NFS4 GETFH AFTER: %s",
+	LogHandleNFS4("NFS4 GETFH AFTER: ",
 		      &res_GETFH->GETFH4res_u.resok4.object);
 
+	res_GETFH->status = NFS4_OK;
 	return NFS4_OK;
 }				/* nfs4_op_getfh */
 

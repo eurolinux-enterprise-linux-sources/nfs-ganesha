@@ -40,18 +40,18 @@
 #include <sys/stat.h>
 #include "nfs_core.h"
 #include "log.h"
-#include "cache_inode.h"
 #include "export_mgr.h"
 #include "fsal.h"
 #include "9p.h"
 
-int _9p_getattr(struct _9p_request_data *req9p, void *worker_data,
-		u32 *plenout, char *preply)
+int _9p_getattr(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 {
 	char *cursor = req9p->_9pmsg + _9P_HDR_SIZE + _9P_TYPE_SIZE;
 	u16 *msgtag = NULL;
 	u32 *fid = NULL;
 	u64 *request_mask = NULL;
+	fsal_status_t fsal_status;
+	struct attrlist attrs;
 
 	struct _9p_fid *pfid = NULL;
 
@@ -84,15 +84,32 @@ int _9p_getattr(struct _9p_request_data *req9p, void *worker_data,
 		 (u32) *msgtag, *fid, (unsigned long long) *request_mask);
 
 	if (*fid >= _9P_FID_PER_CONN)
-		return _9p_rerror(req9p, worker_data, msgtag, ERANGE, plenout,
-				  preply);
+		return _9p_rerror(req9p, msgtag, ERANGE, plenout, preply);
 
 	pfid = req9p->pconn->fids[*fid];
 
 	/* Check that it is a valid fid */
 	if (pfid == NULL || pfid->pentry == NULL) {
 		LogDebug(COMPONENT_9P, "request on invalid fid=%u", *fid);
-		return _9p_rerror(req9p, worker_data, msgtag, EIO, plenout,
+		return _9p_rerror(req9p, msgtag, EIO, plenout, preply);
+	}
+
+	_9p_init_opctx(pfid, req9p);
+
+	fsal_prepare_attrs(&attrs, ATTRS_NFS3);
+
+	fsal_status = pfid->pentry->obj_ops.getattrs(pfid->pentry, &attrs);
+
+	if (FSAL_IS_ERROR(fsal_status)) {
+		LogDebug(COMPONENT_9P,
+			 "fsal_refresh_attrs failed %s",
+			 fsal_err_txt(fsal_status));
+
+		/* Done with the attrs */
+		fsal_release_attrs(&attrs);
+
+		return _9p_rerror(req9p, msgtag,
+				  _9p_tools_errno(fsal_status), plenout,
 				  preply);
 	}
 
@@ -101,20 +118,20 @@ int _9p_getattr(struct _9p_request_data *req9p, void *worker_data,
 	valid = _9P_GETATTR_BASIC;	/* FSAL covers all basic attributes */
 
 	if (*request_mask & _9P_GETATTR_RDEV) {
-		mode = (u32) pfid->pentry->obj_handle->attributes.mode;
-		if (pfid->pentry->obj_handle->attributes.type == DIRECTORY)
+		mode = (u32) attrs.mode;
+		if (attrs.type == DIRECTORY)
 			mode |= __S_IFDIR;
-		if (pfid->pentry->obj_handle->attributes.type == REGULAR_FILE)
+		if (attrs.type == REGULAR_FILE)
 			mode |= __S_IFREG;
-		if (pfid->pentry->obj_handle->attributes.type == SYMBOLIC_LINK)
+		if (attrs.type == SYMBOLIC_LINK)
 			mode |= __S_IFLNK;
-		if (pfid->pentry->obj_handle->attributes.type == SOCKET_FILE)
+		if (attrs.type == SOCKET_FILE)
 			mode |= __S_IFSOCK;
-		if (pfid->pentry->obj_handle->attributes.type == BLOCK_FILE)
+		if (attrs.type == BLOCK_FILE)
 			mode |= __S_IFBLK;
-		if (pfid->pentry->obj_handle->attributes.type == CHARACTER_FILE)
+		if (attrs.type == CHARACTER_FILE)
 			mode |= __S_IFCHR;
-		if (pfid->pentry->obj_handle->attributes.type == FIFO_FILE)
+		if (attrs.type == FIFO_FILE)
 			mode |= __S_IFIFO;
 	} else
 		mode = 0;
@@ -122,47 +139,46 @@ int _9p_getattr(struct _9p_request_data *req9p, void *worker_data,
 	/** @todo this is racy, use cache_inode_lock_trust_attrs */
 	uid =
 	    (*request_mask & _9P_GETATTR_UID) ?
-		(u32) pfid->pentry->obj_handle->attributes.owner :
+		(u32) attrs.owner :
 		0;
 	gid =
 	    (*request_mask & _9P_GETATTR_GID) ?
-		(u32) pfid->pentry->obj_handle->attributes.group :
+		(u32) attrs.group :
 		0;
 	nlink =
 	    (*request_mask & _9P_GETATTR_NLINK) ?
-		(u64) pfid->pentry->obj_handle->attributes.numlinks :
+		(u64) attrs.numlinks :
 		0LL;
 	/* rdev = (*request_mask & _9P_GETATTR_RDEV) ?
-	 *     (u64) pfid->pentry->obj_handle->attributes.rawdev.major :
+	 *     (u64) attrs.rawdev.major :
 	 *     0LL; */
 	rdev =
 	    (*request_mask & _9P_GETATTR_RDEV) ?
-		(u64) pfid->op_context.export->filesystem_id.major :
+		(u64) pfid->export->filesystem_id.major :
 		0LL;
 	size =
 	    (*request_mask & _9P_GETATTR_SIZE) ?
-		(u64) pfid->pentry->obj_handle->attributes.filesize :
+		(u64) attrs.filesize :
 		0LL;
 	blksize =
 	    (*request_mask & _9P_GETATTR_BLOCKS) ? (u64) _9P_BLK_SIZE : 0LL;
 	blocks =
-	    (*request_mask & _9P_GETATTR_BLOCKS) ? (u64) (pfid->pentry->
-							  obj_handle->
-							  attributes.filesize /
-							  DEV_BSIZE) : 0LL;
+	    (*request_mask & _9P_GETATTR_BLOCKS)
+	    ? (u64) (attrs.filesize / DEV_BSIZE)
+	    : 0LL;
 	atime_sec =
 	    (*request_mask & _9P_GETATTR_ATIME) ?
-		(u64) pfid->pentry->obj_handle->attributes.atime.tv_sec :
+		(u64) attrs.atime.tv_sec :
 		0LL;
 	atime_nsec = 0LL;
 	mtime_sec =
 	    (*request_mask & _9P_GETATTR_MTIME) ?
-		(u64) pfid->pentry->obj_handle->attributes.mtime.tv_sec :
+		(u64) attrs.mtime.tv_sec :
 		0LL;
 	mtime_nsec = 0LL;
 	ctime_sec =
 	    (*request_mask & _9P_GETATTR_CTIME) ?
-		(u64) pfid->pentry->obj_handle->attributes.ctime.tv_sec :
+		(u64) attrs.ctime.tv_sec :
 		0LL;
 	ctime_nsec = 0LL;
 
@@ -171,6 +187,9 @@ int _9p_getattr(struct _9p_request_data *req9p, void *worker_data,
 	btime_nsec = 0LL;
 	gen = 0LL;
 	data_version = 0LL;
+
+	/* Done with the attrs */
+	fsal_release_attrs(&attrs);
 
 	/* Build the reply */
 	_9p_setinitptr(cursor, preply, _9P_RGETATTR);
@@ -201,16 +220,18 @@ int _9p_getattr(struct _9p_request_data *req9p, void *worker_data,
 	_9p_checkbound(cursor, preply, plenout);
 
 	LogDebug(COMPONENT_9P,
-		 "RGETATTR: tag=%u valid=0x%"PRIx64" qid=(type=%u,version=%u,"
-		 "path=%"PRIu64") mode=0%o uid=%u gid=%u nlink=%"PRIu64
+		 "RGETATTR: tag=%u valid=0x%"PRIx64
+		 "qid=(type=%u,version=%u, path=%"
+		 PRIu64") mode=0%o uid=%u gid=%u nlink=%"PRIu64
 		 " rdev=%"PRIu64" size=%"PRIu64" blksize=%"PRIu64
 		 " blocks=%"PRIu64" atime=(%"PRIu64",%"PRIu64") mtime=(%"PRIu64
 		 ",%"PRIu64") ctime=(%"PRIu64",%"PRIu64") btime=(%"PRIu64
-		 ",%"PRIu64") gen=%"PRIu64", data_version=%"PRIu64, *msgtag,
-		 valid, pfid->qid.type, pfid->qid.version, pfid->qid.path, mode,
-		 uid, gid, nlink, rdev, size, blksize, blocks, atime_sec,
-		 atime_nsec, mtime_sec, mtime_nsec, ctime_sec, ctime_nsec,
-		 btime_sec, btime_nsec, gen, data_version);
+		 ",%"PRIu64") gen=%"PRIu64", data_version=%"PRIu64,
+		 *msgtag, valid, pfid->qid.type, pfid->qid.version,
+		 pfid->qid.path, mode, uid, gid, nlink, rdev, size, blksize,
+		 blocks, atime_sec, atime_nsec, mtime_sec, mtime_nsec,
+		 ctime_sec, ctime_nsec, btime_sec, btime_nsec, gen,
+		 data_version);
 
 	return 1;
 }

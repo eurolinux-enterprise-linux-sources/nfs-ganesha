@@ -10,11 +10,16 @@ SET(fsalxfs_LIB_SRCS
    handle_syscalls.c
    ../file.c
    ../xattrs.c
+   ../state.c
    ../vfs_methods.h
    subfsal_xfs.c
   )
 
 add_library(fsalxfs SHARED ${fsalxfs_LIB_SRCS})
+if(PATH_LIBHANDLE)
+add_library(handle SHARED IMPORTED)
+set_target_properties(handle PROPERTIES IMPORTED_LOCATION ${PATH_LIBHANDLE})
+endif(PATH_LIBHANDLE)
 
 target_link_libraries(fsalxfs
   gos

@@ -49,59 +49,47 @@
 
 #include "gsh_status.h"
 #include "fsal_api.h"
-#include "cache_inode.h"
+
+enum {
+	/* empty flags */
+	fsal_up_update_null = 0x0000,
+
+	/* Update the filesize only if the new size is greater
+	 * than that currently set */
+	fsal_up_update_filesize_inc = 0x0001,
+
+	/* Update the atime only if the new time is later than
+	 * the currently set time. */
+	fsal_up_update_atime_inc = 0x0002,
+
+	/* Update the creation time only if the new time is
+	 * later than the currently set time. */
+	fsal_up_update_creation_inc = 0x0004,
+
+	/* Update the ctime only if the new time is later
+	 * than that currently * set */
+	fsal_up_update_ctime_inc = 0x0008,
+
+	/* Update the mtime only if the new time is later
+	 * than that currently set. */
+	fsal_up_update_mtime_inc = 0x0010,
+
+	/* Update the chgtime only if the new time is later
+	 * than that currently set. */
+	fsal_up_update_chgtime_inc = 0x0020,
+
+	/* Update the spaceused only if the new size is greater
+	 * than that currently set. */
+	fsal_up_update_spaceused_inc = 0x0040,
+
+	/* The file link count is zero. */
+	fsal_up_nlink = 0x0080,
+};
 
 /**
- * Empty flags.
+ * Close any open file.
  */
-static const uint32_t fsal_up_update_null = 0x0000;
-
-/**
- * Update the filesize only if the new size is greater than that
- * currently set.
- */
-static const uint32_t fsal_up_update_filesize_inc = 0x0001;
-
-/**
- * Update the atime only if the new time is later than the currently
- * set time.
- */
-static const uint32_t fsal_up_update_atime_inc = 0x0002;
-
-/**
- * Update the creation time only if the new time is later than the
- * currently set time.
- */
-static const uint32_t fsal_up_update_creation_inc = 0x0004;
-
-/**
- * Update the ctime only if the new time is later than that currently
- * set.
- */
-static const uint32_t fsal_up_update_ctime_inc = 0x0008;
-
-/**
- * Update the mtime only if the new time is later than that currently
- * set.
- */
-static const uint32_t fsal_up_update_mtime_inc = 0x0010;
-
-/**
- * Update the chgtime only if the new time is later than that
- * currently set.
- */
-static const uint32_t fsal_up_update_chgtime_inc = 0x0020;
-
-/**
- * Update the spaceused only if the new size is greater than that
- * currently set.
- */
-static const uint32_t fsal_up_update_spaceused_inc = 0x0040;
-
-/**
- * The file link count is zero.
- */
-static const uint32_t fsal_up_nlink = 0x0080;
+static const uint32_t fsal_up_close = 0x0100;
 
 /**
  * @brief Optional stuff for layoutreturn
@@ -122,6 +110,17 @@ struct layoutrecall_spec {
 
 /** @} */
 
+static const uint32_t FSAL_UP_INVALIDATE_ATTRS = 0x01;
+static const uint32_t FSAL_UP_INVALIDATE_ACL = 0x02;
+static const uint32_t FSAL_UP_INVALIDATE_CONTENT = 0x04;
+static const uint32_t FSAL_UP_INVALIDATE_DIR_POPULATED = 0x08;
+static const uint32_t FSAL_UP_INVALIDATE_CLOSE = 0x100;
+#define FSAL_UP_INVALIDATE_CACHE ( \
+	FSAL_UP_INVALIDATE_ATTRS | \
+	FSAL_UP_INVALIDATE_ACL | \
+	FSAL_UP_INVALIDATE_CONTENT | \
+	FSAL_UP_INVALIDATE_DIR_POPULATED)
+
 /**
  * @brief Possible upcall functions
  *
@@ -140,85 +139,124 @@ struct layoutrecall_spec {
  */
 
 struct fsal_up_vector {
-	/** Invalidate some or all of a cache entry */
-	cache_inode_status_t(*invalidate)(
-		struct fsal_module *fsal,
-		struct gsh_buffdesc *obj,	/*< The file to invalidate */
-		uint32_t flags /*< Flags governing invalidation */
-		);
+	/** The export this vector lives in */
+	struct fsal_export *up_export;
 
-	/** Update cached attributes */
-	cache_inode_status_t(*update)(
-		struct fsal_module *fsal,
-		struct gsh_buffdesc *obj,	/*< The file to update */
-		struct attrlist *attr, /*< List of attributes to
-					   update.  Note that the @c
-					   type, @c fsid, @c fileid,
-					   @c rawdev, and @c generation
-					   fields must not be updated
-					   and the corresponding bits in the
-					   mask must not be set, nor may the
-					   ATTR_RDATA_ERR bit be set. */
-		uint32_t flags	/*< Flags requesting special update handling */
-		);
+	/** Invalidate some or all of a cache entry
+	 *
+	 * @param[in] export	FSAL export owning ops
+	 * @param[in] obj    The file to invalidate
+	 * @param[in] flags  FSAL_UP_INVALIDATE_*
+	 *
+	 * @return FSAL status
+	 *
+	 */
+	fsal_status_t (*invalidate)(struct fsal_export *exp,
+				    struct gsh_buffdesc *obj,
+				    uint32_t flags);
 
-	/** Grant a lock to a client */
-	state_status_t(*lock_grant)(
-		struct fsal_module *fsal,
-		struct gsh_buffdesc *file, /*< The file in question */
-		void *owner, /*< The lock owner */
-		fsal_lock_param_t *lock_param /*< A description of the lock */
-		);
+	/** Update cached attributes
+	 *
+	 * @param[in] export FSAL export owning ops
+	 * @param[in] obj    The file to update
+	 * @param[in] attr   List of attributes to update.  Note that the
+	 *                   @c type, @c fsid, @c fileid, @c rawdev, and
+	 *                   @c generation fields must not be updated and
+	 *                   the corresponding bits in the mask must not
+	 *                   be set, nor may the ATTR_RDATA_ERR bit be set.
+	 * @param[in] flags  Flags requesting special update handling
+	 *
+	 */
+	fsal_status_t (*update)(struct fsal_export *exp,
+				struct gsh_buffdesc *obj,
+				struct attrlist *attr,
+				uint32_t flags);
 
-	/** Signal lock availability */
-	state_status_t(*lock_avail)(
-		struct fsal_module *fsal,
-		struct gsh_buffdesc *file, /*< The file in question */
-		void *owner, /*< The lock owner */
-		fsal_lock_param_t *lock_param /*< A description of the lock */
-		);
+	/** Grant a lock to a client
+	 *
+	 * @param[in] export	FSAL export owning ops
+	 * @param[in] file         The file in question
+	 * @param[in] owner        The lock owner
+	 * @param[in] lock_param   A description of the lock
+	 *
+	 */
+	state_status_t (*lock_grant)(struct fsal_export *exp,
+				     struct gsh_buffdesc *file,
+				     void *owner,
+				     fsal_lock_param_t *lock_param);
 
-	/** Perform a layoutrecall on a single file */
-	state_status_t(*layoutrecall)(
-		struct fsal_module *fsal,
-		struct gsh_buffdesc *handle, /*< Handle on which the
-						       layout is held */
-		layouttype4 layout_type, /*< The type of layout to recall */
-		bool changed, /*< Whether the layout has changed and the
-				  client ought to finish writes through MDS */
-		const struct pnfs_segment *segment, /*< Segment to recall */
-		void *cookie, /*< A cookie returned with the return that
-				  completely satisfies a recall */
-		struct layoutrecall_spec *spec	/*< Lets us be fussy about what
-						    clients we send to. May be
-						    NULL. */
-		);
+	/** Signal lock availability
+	 *
+	 * @param[in] export	FSAL export owning ops
+	 * @param[in] file         The file in question
+	 * @param[in] owner        The lock owner
+	 * @param[in] lock_param   A description of the lock
+	 *
+	 */
+	state_status_t (*lock_avail)(struct fsal_export *exp,
+				     struct gsh_buffdesc *file,
+				     void *owner,
+				     fsal_lock_param_t *lock_param);
 
-	/** Remove or change a deviceid */
-	state_status_t(*notify_device)(
-		notify_deviceid_type4 notify_type, /*< Change or remove */
-		layouttype4 layout_type, /*< The layout type affected */
-		struct pnfs_deviceid devid, /*< The deviceid */
-		bool immediate /*< Whether the change is immediate
-				   (in the case of a change.) */
-		);
+	/** Perform a layoutrecall on a single file
+	 *
+	 * @param[in] export	FSAL export owning ops
+	 * @param[in] handle       Handle on which the layout is held
+	 * @param[in] layout_type  The type of layout to recall
+	 * @param[in] changed      Whether the layout has changed and the
+	 *                         client ought to finish writes through MDS
+	 * @param[in] segment      Segment to recall
+	 * @param[in] cookie       A cookie returned with the return that
+	 *                         completely satisfies a recall
+	 * @param[in] spec         Lets us be fussy about what clients we send
+	 *                         to. May beNULL.
+	 *
+	 */
+	state_status_t (*layoutrecall)(struct fsal_export *exp,
+				       struct gsh_buffdesc *handle,
+				       layouttype4 layout_type,
+				       bool changed,
+				       const struct pnfs_segment *segment,
+				       void *cookie,
+				       struct layoutrecall_spec *spec);
 
-	/** Recall a delegation */
-	state_status_t(*delegrecall)(
-		struct fsal_module *fsal,
-		struct gsh_buffdesc *handle /*< Handle on which the
-						    delegation is held */
-		);
+	/** Remove or change a deviceid
+	 *
+	 * @param[in] notify_type  Change or remove
+	 * @param[in] layout_type  The layout type affected
+	 * @param[in] devid        The deviceid
+	 * @param[in] immediate    Whether the change is immediate
+	 *
+	 */
+	state_status_t (*notify_device)(notify_deviceid_type4 notify_type,
+					layouttype4 layout_type,
+					struct pnfs_deviceid devid,
+					bool immediate);
 
-	/** Invalidate some or all of a cache entry and close if open */
-	cache_inode_status_t(*invalidate_close)(
-		struct fsal_module *fsal,
-		const struct fsal_up_vector *up_ops,
-		struct gsh_buffdesc *obj,	/*< The file to invalidate */
-		uint32_t flags /*< Flags governing invalidation */
-		);
+	/** Recall a delegation
+	 *
+	 * @param[in] export	FSAL export owning ops
+	 * @param[in] handle Handle on which the delegation is held
+	 */
+	state_status_t (*delegrecall)(struct fsal_export *exp,
+				      struct gsh_buffdesc *handle);
 
-
+	/** Invalidate some or all of a cache entry and close if open
+	 *
+	 * This version should NOT be used if an FSAL supports extended
+	 * operations, instead, the FSAL may directly close the file as
+	 * necessary.
+	 *
+	 * @param[in] export	FSAL export owning ops
+	 * @param[in] obj    The file to invalidate
+	 * @param[in] flags  Flags governing invalidation
+	 *
+	 * @return FSAL status
+	 *
+	 */
+	fsal_status_t (*invalidate_close)(struct fsal_export *exp,
+					  struct gsh_buffdesc *obj,
+					  uint32_t flags);
 };
 
 extern struct fsal_up_vector fsal_up_top;
@@ -228,64 +266,54 @@ extern struct fsal_up_vector fsal_up_top;
  * @brief Asynchronous upcall wrappers
  */
 
-int up_async_invalidate(struct fridgethr *fr,
-			const struct fsal_up_vector *up_ops,
-			struct fsal_module *fsal,
-			struct gsh_buffdesc *obj, uint32_t flags,
-			void (*cb) (void *, cache_inode_status_t),
-			void *cb_arg);
-int up_async_update(struct fridgethr *fr,
-		    const struct fsal_up_vector *up_ops,
-		    struct fsal_module *fsal,
-		    struct gsh_buffdesc *obj, struct attrlist *attr,
-		    uint32_t flags, void (*cb) (void *, cache_inode_status_t),
-		    void *cb_arg);
-int up_async_lock_grant(struct fridgethr *fr,
-			const struct fsal_up_vector *up_ops,
-			struct fsal_module *fsal,
-			struct gsh_buffdesc *file, void *owner,
-			fsal_lock_param_t *lock_param,
-			void (*cb)(void *, state_status_t),
-			void *cb_arg);
-int up_async_lock_avail(struct fridgethr *fr,
-			const struct fsal_up_vector *up_ops,
-			struct fsal_module *fsal,
-			struct gsh_buffdesc *file, void *owner,
-			fsal_lock_param_t *lock_param,
-			void (*cb) (void *, state_status_t),
-			void *cb_arg);
-int up_async_layoutrecall(struct fridgethr *fr,
-			  const struct fsal_up_vector *up_ops,
-			  struct fsal_module *fsal,
-			  struct gsh_buffdesc *handle,
-			  layouttype4 layout_type, bool changed,
-			  const struct pnfs_segment *segment, void *cookie,
-			  struct layoutrecall_spec *spec,
-			  void (*cb) (void *, state_status_t),
-			  void *cb_arg);
-int up_async_notify_device(struct fridgethr *fr,
-			   const struct fsal_up_vector *up_ops,
-			   notify_deviceid_type4 notify_type,
-			   layouttype4 layout_type,
-			   struct pnfs_deviceid *devid,
-			   bool immediate, void (*cb) (void *, state_status_t),
-			   void *cb_arg);
-int up_async_delegrecall(struct fridgethr *fr,
-			 const struct fsal_up_vector *up_ops,
-			 struct fsal_module *fsal,
-			 struct gsh_buffdesc *handle,
-			 void (*cb)(void *, state_status_t),
-			 void *cb_arg);
+fsal_status_t up_async_invalidate(struct fridgethr *fr,
+				  struct fsal_export *exp,
+				  struct gsh_buffdesc *obj, uint32_t flags,
+				  void (*cb)(void *, fsal_status_t),
+				  void *cb_arg);
+fsal_status_t up_async_update(struct fridgethr *fr,
+			      struct fsal_export *exp,
+			      struct gsh_buffdesc *obj, struct attrlist *attr,
+			      uint32_t flags,
+			      void (*cb)(void *, fsal_status_t),
+			      void *cb_arg);
+fsal_status_t up_async_lock_grant(struct fridgethr *fr,
+				  struct fsal_export *exp,
+				  struct gsh_buffdesc *file, void *owner,
+				  fsal_lock_param_t *lock_param,
+				  void (*cb)(void *, state_status_t),
+				  void *cb_arg);
+fsal_status_t up_async_lock_avail(struct fridgethr *fr,
+				  struct fsal_export *exp,
+				  struct gsh_buffdesc *file, void *owner,
+				  fsal_lock_param_t *lock_param,
+				  void (*cb)(void *, state_status_t),
+				  void *cb_arg);
+fsal_status_t up_async_layoutrecall(struct fridgethr *fr,
+				    struct fsal_export *exp,
+				    struct gsh_buffdesc *handle,
+				    layouttype4 layout_type, bool changed,
+				    const struct pnfs_segment *segment,
+				    void *cookie,
+				    struct layoutrecall_spec *spec,
+				    void (*cb)(void *, state_status_t),
+				    void *cb_arg);
+fsal_status_t up_async_notify_device(struct fridgethr *fr,
+				     struct fsal_export *exp,
+				     notify_deviceid_type4 notify_type,
+				     layouttype4 layout_type,
+				     struct pnfs_deviceid *devid,
+				     bool immediate,
+				     void (*cb)(void *, state_status_t),
+				     void *cb_arg);
+fsal_status_t up_async_delegrecall(struct fridgethr *fr,
+				   struct fsal_export *exp,
+				   struct gsh_buffdesc *handle,
+				   void (*cb)(void *, state_status_t),
+				   void *cb_arg);
 
 /** @} */
-int async_delegrecall(struct fridgethr *fr, cache_entry_t *entry);
-cache_inode_status_t fsal_invalidate(struct fsal_module *fsal,
-				     struct gsh_buffdesc *handle,
-				     uint32_t flags);
-
-cache_inode_status_t up_get(struct fsal_module *fsal,
-			    struct gsh_buffdesc *handle,
-			    cache_entry_t **entry);
+int async_delegrecall(struct fridgethr *fr, struct fsal_obj_handle *obj);
 
 #endif /* FSAL_UP_H */
 /** @} */

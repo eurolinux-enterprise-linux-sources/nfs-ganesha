@@ -41,7 +41,6 @@
 #include "gsh_rpc.h"
 #include "nfs4.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_exports.h"
 #include "nfs_proto_functions.h"
 #include "nfs_file_handle.h"
@@ -94,5 +93,4 @@ int nfs4_op_set_ssv(struct nfs_argop4 *op, compound_data_t *data,
 void nfs4_op_set_ssv_Free(nfs_resop4 *resp)
 {
 	/* Nothing to be done */
-	return;
-}				/* nfs4_op_set_ssv_Free */
+}

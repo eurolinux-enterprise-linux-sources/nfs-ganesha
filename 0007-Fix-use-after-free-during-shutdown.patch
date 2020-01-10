@@ -1,0 +1,197 @@
+From 5ffd761c905c0dbcd1e5925fd3549b79a927ebd2 Mon Sep 17 00:00:00 2001
+From: Daniel Gryniewicz <dang@redhat.com>
+Date: Tue, 20 Dec 2016 11:29:09 -0500
+Subject: [PATCH] Fix use-after-free during shutdown
+
+The root object for an export was having it's sentinal ref released by
+the export code; however, this code doesn't own that ref, the hash table
+in MDCACHE owns that ref, so when the objest is freed, the hash removes
+it from the table after it's freed.
+
+Instead, pass the root object into the FSAL's unexport() op, allowing
+MDCACHE to clean up it's state on that object before the last ref is
+dropped.
+
+Change-Id: I768306e22cfb3a9b6344c76d0e6a17d59ee29769
+Signed-off-by: Daniel Gryniewicz <dang@redhat.com>
+---
+ .../Stackable_FSALs/FSAL_MDCACHE/mdcache_export.c  | 12 +++++--
+ .../Stackable_FSALs/FSAL_MDCACHE/mdcache_hash.h    |  2 +-
+ src/FSAL/default_methods.c                         |  3 +-
+ src/include/fsal_api.h                             |  6 ++--
+ src/support/exports.c                              | 40 +++++++++++-----------
+ 5 files changed, 37 insertions(+), 26 deletions(-)
+
+diff --git a/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_export.c b/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_export.c
+index 41996f5..b88e4d6 100644
+--- a/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_export.c
++++ b/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_export.c
+@@ -48,6 +48,7 @@
+ #include "FSAL/fsal_commonlib.h"
+ #include "FSAL/fsal_config.h"
+ #include "mdcache_lru.h"
++#include "mdcache_hash.h"
+ #include "nfs_exports.h"
+ #include "export_mgr.h"
+ 
+@@ -82,18 +83,22 @@ static const char *mdcache_get_name(struct fsal_export *exp_hdl)
+  * Clean up all the cache entries on this export.
+  *
+  * @param[in] exp_hdl	Export to unexport
++ * @param[in] root_obj	Root object for export
+  */
+-static void mdcache_unexport(struct fsal_export *exp_hdl)
++static void mdcache_unexport(struct fsal_export *exp_hdl,
++			     struct fsal_obj_handle *root_obj)
+ {
+ 	struct mdcache_fsal_export *exp = mdc_export(exp_hdl);
+ 	struct fsal_export *sub_export = exp->export.sub_export;
++	mdcache_entry_t *root_entry = container_of(root_obj, mdcache_entry_t,
++						   obj_handle);
+ 	mdcache_entry_t *entry;
+ 	struct entry_export_map *expmap;
+ 	fsal_status_t status;
+ 
+ 	/* First unexport for the sub-FSAL */
+ 	subcall_raw(exp,
+-		sub_export->exp_ops.unexport(sub_export)
++		sub_export->exp_ops.unexport(sub_export, root_entry->sub_handle)
+ 	);
+ 
+ 	/* Next, clean up our cache entries on the export */
+@@ -151,6 +156,9 @@ static void mdcache_unexport(struct fsal_export *exp_hdl)
+ 		/* Release above ref */
+ 		mdcache_put(entry);
+ 	};
++
++	/* Unhash the root object */
++	assert(!cih_remove_checked(root_entry));
+ }
+ 
+ /**
+diff --git a/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_hash.h b/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_hash.h
+index ef275d3..8055d14 100644
+--- a/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_hash.h
++++ b/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_hash.h
+@@ -384,7 +384,7 @@ cih_set_latched(mdcache_entry_t *entry, cih_latch_t *latch,
+  * Remove cache entry with existence check.  The entry is assumed to
+  * be hashed.
+  *
+- * @param entry [in] Entry to be removed.0
++ * @param entry [in] Entry to be removed.
+  *
+  * @return (void)
+  */
+diff --git a/src/FSAL/default_methods.c b/src/FSAL/default_methods.c
+index 7d6aafe..eab7591 100644
+--- a/src/FSAL/default_methods.c
++++ b/src/FSAL/default_methods.c
+@@ -261,7 +261,8 @@ static const char *get_name(struct fsal_export *exp_hdl)
+  * Nothing to do in the default case
+  */
+ 
+-static void export_unexport(struct fsal_export *exp_hdl)
++static void export_unexport(struct fsal_export *exp_hdl,
++			    struct fsal_obj_handle *root_obj)
+ {
+ 	/* return */
+ }
+diff --git a/src/include/fsal_api.h b/src/include/fsal_api.h
+index a66352a..b17d225 100644
+--- a/src/include/fsal_api.h
++++ b/src/include/fsal_api.h
+@@ -670,9 +670,11 @@ struct export_ops {
+  * working data that is not necessary when unexported, but not free the export
+  * itself, as there are still references to it.
+  *
+- * @param[in] exp_hdl The export to unexport.
++ * @param[in] exp_hdl	The export to unexport.
++ * @param[in] root_obj	The root object of the export
+  */
+-	 void (*unexport)(struct fsal_export *exp_hdl);
++	 void (*unexport)(struct fsal_export *exp_hdl,
++			  struct fsal_obj_handle *root_obj);
+ 
+ /**
+  * @brief Finalize an export
+diff --git a/src/support/exports.c b/src/support/exports.c
+index 4ce1c5b..824e86f 100644
+--- a/src/support/exports.c
++++ b/src/support/exports.c
+@@ -2211,13 +2211,27 @@ out:
+ 	return my_status;
+ }
+ 
++static inline void clean_up_export(struct gsh_export *export,
++				   struct fsal_obj_handle *root_obj)
++{
++	/* Make export unreachable */
++	pseudo_unmount_export(export);
++	remove_gsh_export(export->export_id);
++
++	/* Release state belonging to this export */
++	state_release_export(export);
++
++	/* Flush FSAL-specific state */
++	export->fsal_export->exp_ops.unexport(export->fsal_export, root_obj);
++}
++
+ /**
+- * @brief Release the root cache inode for an export.
++ * @brief Release all the export state, including the root object
+  *
+  * @param exp [IN] the export
+  */
+ 
+-void release_export_root(struct gsh_export *export)
++static void release_export(struct gsh_export *export)
+ {
+ 	struct fsal_obj_handle *obj = NULL;
+ 	fsal_status_t fsal_status;
+@@ -2248,30 +2262,16 @@ void release_export_root(struct gsh_export *export)
+ 	PTHREAD_RWLOCK_unlock(&export->lock);
+ 	PTHREAD_RWLOCK_unlock(&obj->state_hdl->state_lock);
+ 
+-	/* Release sentinal ref */
+-	obj->obj_ops.put_ref(obj);
+-
+ 	LogDebug(COMPONENT_EXPORT,
+ 		 "Released root obj %p for path %s on export_id=%d",
+ 		 obj, export->fullpath, export->export_id);
+ 
++	clean_up_export(export, obj);
++
+ 	/* Release ref taken above */
+ 	obj->obj_ops.put_ref(obj);
+ }
+ 
+-static inline void clean_up_export(struct gsh_export *export)
+-{
+-	/* Make export unreachable */
+-	pseudo_unmount_export(export);
+-	remove_gsh_export(export->export_id);
+-
+-	/* Release state belonging to this export */
+-	state_release_export(export);
+-
+-	/* Flush FSAL-specific state */
+-	export->fsal_export->exp_ops.unexport(export->fsal_export);
+-}
+-
+ void unexport(struct gsh_export *export)
+ {
+ 	bool op_ctx_set = false;
+@@ -2289,8 +2289,8 @@ void unexport(struct gsh_export *export)
+ 		op_ctx_set = true;
+ 	}
+ 
+-	release_export_root(export);
+-	clean_up_export(export);
++	release_export(export);
++
+ 	if (op_ctx_set)
+ 		release_root_op_context();
+ }
+-- 
+1.8.3.1
+

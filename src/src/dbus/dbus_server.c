@@ -172,14 +172,9 @@ struct dbus_bcast_item *add_dbus_broadcast(
 					int count)
 {
 	struct dbus_bcast_item *new_bcast = NULL;
+
 	new_bcast = (struct dbus_bcast_item *)
 		gsh_malloc(sizeof(struct dbus_bcast_item));
-	if (!new_bcast) {
-		LogCrit(COMPONENT_DBUS,
-			"Failed to allocate broadcast entry: %s",
-			strerror(errno));
-		goto out;
-	}
 
 	now(&new_bcast->next_bcast_time);
 	new_bcast->bcast_interval = bcast_interval;
@@ -192,14 +187,14 @@ struct dbus_bcast_item *add_dbus_broadcast(
 			    &(new_bcast->dbus_bcast_q),
 			    &dbus_bcast_item_compare);
 	PTHREAD_MUTEX_unlock(&dbus_bcast_lock);
-out:
+
 	return new_bcast;
 }
 
 /*
  * @brief init_dbus_broadcast: Initializes broadcast list and mutex
  */
-void init_dbus_broadcast()
+void init_dbus_broadcast(void)
 {
 	PTHREAD_MUTEX_init(&dbus_bcast_lock, NULL);
 	glist_init(&dbus_broadcast_list);
@@ -243,7 +238,7 @@ void gsh_dbus_pkginit(void)
 	}
 	if (code != DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER) {
 		LogCrit(COMPONENT_DBUS,
-			"server failed becoming primary bus owner " "(%s, %d)",
+			"server failed becoming primary bus owner (%s, %d)",
 			regbuf, code);
 		goto out;
 	}
@@ -583,8 +578,7 @@ int32_t gsh_dbus_register_path(const char *name,
 
 	if (!thread_state.dbus_conn) {
 		LogCrit(COMPONENT_DBUS,
-			"dbus_connection_register_object_path "
-			"called with no DBUS connection");
+			"dbus_connection_register_object_path called with no DBUS connection");
 		gsh_free(handler);
 		goto out;
 	}
@@ -596,7 +590,7 @@ int32_t gsh_dbus_register_path(const char *name,
 						 (void *)interfaces);
 	if (!code) {
 		LogFatal(COMPONENT_DBUS,
-			 "dbus_connection_register_object_path " "failed");
+			 "dbus_connection_register_object_path failed");
 		gsh_free(handler);
 		goto out;
 	}
@@ -676,7 +670,7 @@ void *gsh_dbus_thread(void *arg)
 
 	if (!thread_state.initialized) {
 		LogCrit(COMPONENT_DBUS,
-			"DBUS not initialized, service thread " "exiting");
+			"DBUS not initialized, service thread exiting");
 		goto out;
 	}
 
@@ -709,13 +703,11 @@ void *gsh_dbus_thread(void *arg)
 			rc = bcast_item->bcast_callback(bcast_item->bcast_arg);
 			if (rc == BCAST_STATUS_WARN) {
 				LogWarn(COMPONENT_DBUS,
-					"Broadcast callback %p"
-					"returned BCAST_STATUS_WARN\n",
+					"Broadcast callback %p returned BCAST_STATUS_WARN",
 					bcast_item);
 			} else if (rc == BCAST_STATUS_FATAL) {
 				LogWarn(COMPONENT_DBUS,
-					"Broadcast callback %p"
-					"returned BCAST_STATUS_FATAL\n",
+					"Broadcast callback %p returned BCAST_STATUS_FATAL",
 					bcast_item);
 				glist_del(&bcast_item->dbus_bcast_q);
 				continue;
@@ -811,3 +803,38 @@ int gsh_dbus_broadcast(char *obj_name, char *int_name,
 
 	return rc;
 }
+
+#ifdef _USE_9P
+
+/* parse the 9P operation in args
+ */
+bool arg_9p_op(DBusMessageIter *args, u8 *opcode, char **errormsg)
+{
+	char *opname;
+	u8 opc;
+	bool success = true;
+
+	if (args == NULL) {
+		success = false;
+		*errormsg = "message is missing argument";
+	} else if (DBUS_TYPE_STRING != dbus_message_iter_get_arg_type(args)) {
+		success = false;
+		*errormsg = "arg not a string";
+	} else {
+		dbus_message_iter_get_basic(args, &opname);
+		for (opc = _9P_TSTATFS; opc <= _9P_TWSTAT; opc++) {
+			if (_9pfuncdesc[opc].funcname != NULL &&
+			    !strncmp(opname, _9pfuncdesc[opc].funcname, 16))
+				break;
+		}
+		if (opc > _9P_TWSTAT) {
+			success = false;
+			*errormsg = "arg not a known 9P operation";
+		} else {
+			*opcode = opc;
+		}
+	}
+	return success;
+}
+
+#endif

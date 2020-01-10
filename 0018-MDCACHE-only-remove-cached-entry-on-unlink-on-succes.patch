@@ -1,0 +1,52 @@
+From 9bf2cdee014ec5999ac0fe5ee69af409acc4fba5 Mon Sep 17 00:00:00 2001
+From: Dominique Martinet <dominique.martinet@cea.fr>
+Date: Thu, 2 Feb 2017 11:11:58 +0100
+Subject: [PATCH] MDCACHE: only remove cached entry on unlink on success
+
+If the unlink failed, we will end up with an incomplete parent directory
+in cache.
+
+This fixes this pattern for 9p:
+$ mkdir -p foo/bar/baz
+$ rmdir foo/bar
+rmdir: failed to remove 'foo/bar': Directory not empty
+$ ls -a foo
+. ..
+(note no bar)
+
+Change-Id: Ifc5d2d3806979010fc38a1b3d6c8447308c155d9
+Signed-off-by: Dominique Martinet <dominique.martinet@cea.fr>
+---
+ src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_handle.c | 9 ++++-----
+ 1 file changed, 4 insertions(+), 5 deletions(-)
+
+diff --git a/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_handle.c b/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_handle.c
+index ca50873..e03186a 100644
+--- a/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_handle.c
++++ b/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_handle.c
+@@ -1217,11 +1217,6 @@ static fsal_status_t mdcache_unlink(struct fsal_obj_handle *dir_hdl,
+ 		     "Unlink %p/%s (%p)",
+ 		     parent, name, entry);
+ 
+-	PTHREAD_RWLOCK_wrlock(&parent->content_lock);
+-	(void)mdcache_dirent_remove(parent, name);
+-	PTHREAD_RWLOCK_unlock(&parent->content_lock);
+-
+-
+ 	if (FSAL_IS_ERROR(status)) {
+ 		LogDebug(COMPONENT_CACHE_INODE,
+ 			 "unlink %s returned %s",
+@@ -1235,6 +1230,10 @@ static fsal_status_t mdcache_unlink(struct fsal_obj_handle *dir_hdl,
+ 			PTHREAD_RWLOCK_unlock(&entry->content_lock);
+ 		}
+ 	} else {
++		PTHREAD_RWLOCK_wrlock(&parent->content_lock);
++		(void)mdcache_dirent_remove(parent, name);
++		PTHREAD_RWLOCK_unlock(&parent->content_lock);
++
+ 		/* Invalidate attributes of parent and entry */
+ 		atomic_clear_uint32_t_bits(&parent->mde_flags,
+ 					   MDCACHE_TRUST_ATTRS);
+-- 
+2.5.0
+

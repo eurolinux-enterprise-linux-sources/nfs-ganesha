@@ -40,14 +40,12 @@
 #include "nfs_core.h"
 #include "nfs_exports.h"
 #include "log.h"
-#include "cache_inode.h"
 #include "fsal.h"
 #include "9p.h"
 #include "server_stats.h"
 #include "client_mgr.h"
 
-int _9p_write(struct _9p_request_data *req9p, void *worker_data,
-	      u32 *plenout, char *preply)
+int _9p_write(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 {
 	char *cursor = req9p->_9pmsg + _9P_HDR_SIZE + _9P_TYPE_SIZE;
 	u16 *msgtag = NULL;
@@ -62,7 +60,7 @@ int _9p_write(struct _9p_request_data *req9p, void *worker_data,
 	size_t size;
 	size_t written_size = 0;
 	bool eof_met;
-	cache_inode_status_t cache_status = CACHE_INODE_SUCCESS;
+	fsal_status_t fsal_status;
 	/* bool sync = true; */
 	bool sync = false;
 
@@ -82,29 +80,25 @@ int _9p_write(struct _9p_request_data *req9p, void *worker_data,
 		 (u32) *msgtag, *fid, (unsigned long long)*offset, *count);
 
 	if (*fid >= _9P_FID_PER_CONN)
-		return _9p_rerror(req9p, worker_data, msgtag, ERANGE, plenout,
-				  preply);
+		return _9p_rerror(req9p, msgtag, ERANGE, plenout, preply);
 
 	pfid = req9p->pconn->fids[*fid];
 
 	/* Make sure the requested amount of data respects negotiated msize */
 	if (*count + _9P_ROOM_TWRITE > req9p->pconn->msize)
-		return _9p_rerror(req9p, worker_data, msgtag, ERANGE, plenout,
-				  preply);
+		return _9p_rerror(req9p, msgtag, ERANGE, plenout, preply);
 
 	/* Check that it is a valid fid */
 	if (pfid == NULL || pfid->pentry == NULL) {
 		LogDebug(COMPONENT_9P, "request on invalid fid=%u", *fid);
-		return _9p_rerror(req9p, worker_data, msgtag, EIO, plenout,
-				  preply);
+		return _9p_rerror(req9p, msgtag, EIO, plenout, preply);
 	}
 
-	if ((pfid->op_context.export_perms->options &
-				 EXPORT_OPTION_WRITE_ACCESS) == 0)
-		return _9p_rerror(req9p, worker_data, msgtag, EROFS, plenout,
-				  preply);
+	_9p_init_opctx(pfid, req9p);
 
-	op_ctx = &pfid->op_context;
+	if ((op_ctx->export_perms->options &
+				 EXPORT_OPTION_WRITE_ACCESS) == 0)
+		return _9p_rerror(req9p, msgtag, EROFS, plenout, preply);
 
 	/* Do the job */
 	size = *count;
@@ -118,25 +112,43 @@ int _9p_write(struct _9p_request_data *req9p, void *worker_data,
 		/* ADD CODE TO DETECT GAP */
 #if 0
 		fsal_status =
-		    pfid->pentry->obj_handle->ops->setextattr_value_by_id(
-			pfid->pentry->obj_handle,
+		    pfid->pentry->ops->setextattr_value_by_id(
+			pfid->pentry,
 			&pfid->op_context,
 			pfid->specdata.xattr.xattr_id,
 			xattrval, size + 1);
 
 		if (FSAL_IS_ERROR(fsal_status))
-			return _9p_rerror(req9p, worker_data, msgtag,
-					  _9p_tools_errno
-					  (cache_inode_error_convert
-					   (fsal_status)), plenout, preply);
+			return _9p_rerror(req9p, msgtag,
+					  _9p_tools_errno(fsal_status), plenout,
+					  preply);
 #endif
 
 		outcount = *count;
 	} else {
-		cache_status =
-		    cache_inode_rdwr(pfid->pentry, CACHE_INODE_WRITE, *offset,
-				     size, &written_size, databuffer, &eof_met,
-				     &sync);
+		if (pfid->pentry->fsal->m_ops.support_ex(pfid->pentry)) {
+			/* Call the new fsal_write */
+			fsal_status = fsal_write2(pfid->pentry,
+						 false,
+						 pfid->state,
+						 *offset,
+						 size,
+						 &written_size,
+						 databuffer,
+						 &sync,
+						 NULL);
+		} else {
+			/* Call legacy fsal_rdwr */
+			fsal_status = fsal_rdwr(pfid->pentry,
+						FSAL_IO_WRITE,
+						*offset,
+						size,
+						&written_size,
+						databuffer,
+						&eof_met,
+						&sync,
+						NULL);
+		}
 
 		/* Get the handle, for stats */
 		struct gsh_client *client = req9p->pconn->client;
@@ -145,19 +157,17 @@ int _9p_write(struct _9p_request_data *req9p, void *worker_data,
 			LogDebug(COMPONENT_9P,
 				 "Cannot get client block for 9P request");
 		} else {
-			pfid->op_context.client = client;
+			op_ctx->client = client;
 
 			server_stats_io_done(size,
 					     written_size,
-					     (cache_status ==
-					      CACHE_INODE_SUCCESS) ?
-					      true : false,
+					     FSAL_IS_ERROR(fsal_status),
 					     true);
 		}
 
-		if (cache_status != CACHE_INODE_SUCCESS)
-			return _9p_rerror(req9p, worker_data, msgtag,
-					  _9p_tools_errno(cache_status),
+		if (FSAL_IS_ERROR(fsal_status))
+			return _9p_rerror(req9p, msgtag,
+					  _9p_tools_errno(fsal_status),
 					  plenout, preply);
 
 		outcount = (u32) written_size;

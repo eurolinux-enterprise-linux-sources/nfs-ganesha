@@ -3,16 +3,25 @@
 
 struct nullfs_fsal_obj_handle;
 
-struct nullfs_file_handle {
-	int nothing;
-};
-
 struct next_ops {
 	struct export_ops exp_ops;	/*< Vector of operations */
 	struct fsal_obj_ops obj_ops;	/*< Shared handle methods vector */
 	struct fsal_dsh_ops dsh_ops;	/*< Shared handle methods vector */
 	const struct fsal_up_vector *up_ops;	/*< Upcall operations */
 };
+
+/**
+ * Structure used to store data for read_dirents callback.
+ *
+ * Before executing the upper level callback (it might be another
+ * stackable fsal or the inode cache), the context has to be restored.
+ */
+struct nullfs_readdir_state {
+	fsal_readdir_cb cb; /*< Callback to the upper layer. */
+	struct nullfs_fsal_export *exp; /*< Export of the current nullfsal. */
+	void *dir_state; /*< State to be sent to the next callback. */
+};
+
 
 extern struct next_ops next_ops;
 extern struct fsal_up_vector fsal_up_top;
@@ -23,24 +32,24 @@ void nullfs_handle_ops_init(struct fsal_obj_ops *ops);
  */
 struct nullfs_fsal_export {
 	struct fsal_export export;
-	struct fsal_export *sub_export;
+	/* Other private export data goes here */
 };
 
 fsal_status_t nullfs_lookup_path(struct fsal_export *exp_hdl,
 				 const char *path,
-				 struct fsal_obj_handle **handle);
+				 struct fsal_obj_handle **handle,
+				 struct attrlist *attrs_out);
 
 fsal_status_t nullfs_create_handle(struct fsal_export *exp_hdl,
 				   struct gsh_buffdesc *hdl_desc,
-				   struct fsal_obj_handle **handle);
+				   struct fsal_obj_handle **handle,
+				   struct attrlist *attrs_out);
 
 /*
  * NULLFS internal object handle
- * handle is a pointer because
- *  a) the last element of file_handle is a char[] meaning variable len...
- *  b) we cannot depend on it *always* being last or being the only
- *     variable sized struct here...  a pointer is safer.
- * wrt locks, should this be a lock counter??
+ *
+ * It contains a pointer to the fsal_obj_handle used by the subfsal.
+ *
  * AF_UNIX sockets are strange ducks.  I personally cannot see why they
  * are here except for the ability of a client to see such an animal with
  * an 'ls' or get rid of one with an 'rm'.  You can't open them in the
@@ -49,22 +58,8 @@ fsal_status_t nullfs_create_handle(struct fsal_export *exp_hdl,
  */
 
 struct nullfs_fsal_obj_handle {
-	struct fsal_obj_handle obj_handle;
-	struct nullfs_file_handle *handle;
-	union {
-		struct {
-			int fd;
-			fsal_openflags_t openflags;
-		} file;
-		struct {
-			unsigned char *link_content;
-			int link_size;
-		} symlink;
-		struct {
-			struct nullfs_file_handle *dir;
-			char *name;
-		} unopenable;
-	} u;
+	struct fsal_obj_handle obj_handle; /*< Handle containing nullfs data.*/
+	struct fsal_obj_handle *sub_handle; /*< Handle of the sub fsal.*/
 };
 
 int nullfs_fsal_open(struct nullfs_fsal_obj_handle *, int, fsal_errors_t *);
@@ -102,8 +97,6 @@ fsal_status_t nullfs_lock_op(struct fsal_obj_handle *obj_hdl,
 fsal_status_t nullfs_share_op(struct fsal_obj_handle *obj_hdl, void *p_owner,
 			      fsal_share_param_t request_share);
 fsal_status_t nullfs_close(struct fsal_obj_handle *obj_hdl);
-fsal_status_t nullfs_lru_cleanup(struct fsal_obj_handle *obj_hdl,
-				 lru_actions_t requests);
 
 /* extended attributes management */
 fsal_status_t nullfs_list_ext_attrs(struct fsal_obj_handle *obj_hdl,
@@ -133,9 +126,6 @@ fsal_status_t nullfs_setextattr_value_by_id(struct fsal_obj_handle *obj_hdl,
 					    unsigned int xattr_id,
 					    caddr_t buffer_addr,
 					    size_t buffer_size);
-fsal_status_t nullfs_getextattr_attrs(struct fsal_obj_handle *obj_hdl,
-				      unsigned int xattr_id,
-				      struct attrlist *p_attrs);
 fsal_status_t nullfs_remove_extattr_by_id(struct fsal_obj_handle *obj_hdl,
 					  unsigned int xattr_id);
 fsal_status_t nullfs_remove_extattr_by_name(struct fsal_obj_handle *obj_hdl,

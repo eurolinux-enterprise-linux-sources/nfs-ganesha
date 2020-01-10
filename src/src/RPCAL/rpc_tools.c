@@ -31,6 +31,10 @@
 
 #include "config.h"
 #include <stdio.h>
+#include <sys/socket.h>
+#ifdef RPC_VSOCK
+#include <linux/vm_sockets.h>
+#endif /* VSOCK */
 #include <sys/types.h>
 #include <ctype.h> /* for having isalnum */
 #include <stdlib.h> /* for having atoi */
@@ -55,9 +59,13 @@
 #include "nfs_file_handle.h"
 #include "nfs_dupreq.h"
 
+/* XXX doesn't ntirpc have an equivalent for all of the following?
+ */
+
 const char *str_sock_type(int st)
 {
 	static char buf[16];
+
 	switch (st) {
 	case SOCK_STREAM:
 		return "SOCK_STREAM";
@@ -73,6 +81,7 @@ const char *str_sock_type(int st)
 const char *str_ip_proto(int p)
 {
 	static char buf[16];
+
 	switch (p) {
 	case IPPROTO_IP:
 		return "IPPROTO_IP ";
@@ -88,11 +97,16 @@ const char *str_ip_proto(int p)
 const char *str_af(int af)
 {
 	static char buf[16];
+
 	switch (af) {
 	case AF_INET:
 		return "AF_INET ";
 	case AF_INET6:
 		return "AF_INET6";
+#ifdef RPC_VSOCK
+	case AF_VSOCK:
+		return "AF_VSOCK";
+#endif /* VSOCK */
 	}
 	sprintf(buf, "%d", af);
 	return buf;
@@ -113,6 +127,10 @@ const char *xprt_type_to_str(xprt_type_t type)
 		return "sctp";
 	case XPRT_RDMA:
 		return "rdma";
+	case XPRT_VSOCK:
+		return "vsock";
+	case XPRT_VSOCK_RENDEZVOUS:
+		return "vsock rendezvous";
 	}
 	return "INVALID";
 }
@@ -130,6 +148,7 @@ const char *xprt_type_to_str(xprt_type_t type)
 bool copy_xprt_addr(sockaddr_t *addr, SVCXPRT *xprt)
 {
 	struct netbuf *phostaddr = svc_getcaller_netbuf(xprt);
+
 	if (phostaddr->len > sizeof(sockaddr_t) || phostaddr->buf == NULL)
 		return 0;
 	memcpy(addr, phostaddr->buf, phostaddr->len);
@@ -142,6 +161,8 @@ bool copy_xprt_addr(sockaddr_t *addr, SVCXPRT *xprt)
  * This creates a native pointer size (unsigned long int) hash value
  * from the sockaddr_t structure. It supports both IPv4 and IPv6,
  * other types can be added in time.
+ *
+ * XXX is this hash...good?
  *
  * @param[in] addr        sockaddr_t address to hash
  * @param[in] ignore_port Whether to ignore the port
@@ -158,6 +179,7 @@ uint64_t hash_sockaddr(sockaddr_t *addr, bool ignore_port)
 	case AF_INET:
 		{
 			struct sockaddr_in *paddr = (struct sockaddr_in *)addr;
+
 			addr_hash = paddr->sin_addr.s_addr;
 			if (!ignore_port) {
 				port = paddr->sin_port;
@@ -170,6 +192,7 @@ uint64_t hash_sockaddr(sockaddr_t *addr, bool ignore_port)
 			struct sockaddr_in6 *paddr =
 			    (struct sockaddr_in6 *)addr;
 			uint32_t *va;
+
 			va = (uint32_t *)&paddr->sin6_addr;
 			addr_hash = va[0] ^ va[1] ^ va[2] ^ va[3];
 			if (!ignore_port) {
@@ -178,6 +201,17 @@ uint64_t hash_sockaddr(sockaddr_t *addr, bool ignore_port)
 			}
 			break;
 		}
+#ifdef RPC_VSOCK
+	case AF_VSOCK:
+	{
+		struct sockaddr_vm *svm; /* XXX checkpatch horror */
+
+		svm = (struct sockaddr_vm *) addr;
+		addr_hash = svm->svm_cid;
+		if (!ignore_port)
+			addr_hash ^= svm->svm_port;
+	}
+#endif /* VSOCK */
 	default:
 		break;
 	}
@@ -189,7 +223,7 @@ int display_sockaddr(struct display_buffer *dspbuf, sockaddr_t *addr)
 {
 	const char *name = NULL;
 	char ipname[SOCK_NAME_MAX];
-	int port;
+	int port = 0;
 	int b_left = display_start(dspbuf);
 
 	if (b_left <= 0)
@@ -376,34 +410,14 @@ int get_port(sockaddr_t *addr)
 		return ntohs(((struct sockaddr_in *)addr)->sin_port);
 	case AF_INET6:
 		return ntohs(((struct sockaddr_in6 *)addr)->sin6_port);
+#ifdef RPC_VSOCK
+	case AF_VSOCK:
+		return ((struct sockaddr_vm *)addr)->svm_port;
+#endif /* VSOCK */
 	default:
 		return -1;
 	}
 }
-
-void socket_setoptions(int socketFd)
-{
-	unsigned int SbMax = (1 << 30);	/* 1GB */
-
-	while (SbMax > 1048576) {
-		if ((setsockopt
-		     (socketFd, SOL_SOCKET, SO_SNDBUF, (char *)&SbMax,
-		      sizeof(SbMax)) < 0)
-		    ||
-		    (setsockopt
-		     (socketFd, SOL_SOCKET, SO_RCVBUF, (char *)&SbMax,
-		      sizeof(SbMax)) < 0)) {
-			SbMax >>= 1;	/* SbMax = SbMax/2 */
-			continue;
-		}
-
-		break;
-	}
-
-	return;
-}				/* socket_setoptions_ctrl */
-
-#define SIZE_AI_ADDR sizeof(struct sockaddr)
 
 int ipstring_to_sockaddr(const char *str, sockaddr_t *addr)
 {
@@ -424,8 +438,8 @@ int ipstring_to_sockaddr(const char *str, sockaddr_t *addr)
 				sprint_sockip((sockaddr_t *) p->ai_addr,
 					      ipname, sizeof(ipname));
 				LogFullDebug(COMPONENT_RPC,
-					     "getaddrinfo %s returned %s family=%s socktype=%s "
-					     "protocol=%s", str, ipname,
+					     "getaddrinfo %s returned %s family=%s socktype=%s protocol=%s",
+					     str, ipname,
 					     str_af(p->ai_family),
 					     str_sock_type(p->ai_socktype),
 					     str_ip_proto(p->ai_protocol));
@@ -460,10 +474,12 @@ CLIENT *gsh_clnt_create(char *host, unsigned long prog, unsigned long vers,
 			char *proto)
 {
 	CLIENT *clnt;
+
 	PTHREAD_MUTEX_lock(&clnt_create_mutex);
 	clnt = clnt_create(host, prog, vers, proto);
 	if (clnt == NULL) {
 		const char *err = clnt_spcreateerror("clnt_create failed");
+
 		LogDebug(COMPONENT_RPC, "%s", err);
 	}
 	PTHREAD_MUTEX_unlock(&clnt_create_mutex);

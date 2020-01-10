@@ -39,12 +39,10 @@
 #include <pthread.h>
 #include "nfs_core.h"
 #include "log.h"
-#include "cache_inode.h"
 #include "fsal.h"
 #include "9p.h"
 
-int _9p_flush(struct _9p_request_data *req9p, void *worker_data,
-	      u32 *plenout, char *preply)
+int _9p_flush(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 {
 	char *cursor = req9p->_9pmsg + _9P_HDR_SIZE + _9P_TYPE_SIZE;
 	u16 *msgtag = NULL;

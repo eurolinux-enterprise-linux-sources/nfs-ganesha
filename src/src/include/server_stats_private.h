@@ -219,6 +219,23 @@ struct export_stats {
 	.direction = "out"			\
 }						\
 
+
+#define _9P_OP_ARG           \
+{                            \
+	.name = "_9p_opname",\
+	.type = "s",         \
+	.direction = "in"    \
+}
+
+
+#define OP_STATS_REPLY      \
+{                           \
+	.name = "op_stats", \
+	.type = "(tt)",     \
+	.direction = "out"  \
+}
+
+
 void server_stats_summary(DBusMessageIter *iter, struct gsh_stats *st);
 void server_dbus_v3_iostats(struct nfsv3_stats *v3p, DBusMessageIter *iter);
 void server_dbus_v40_iostats(struct nfsv40_stats *v40p, DBusMessageIter *iter);
@@ -233,12 +250,17 @@ void server_dbus_total_ops(struct export_stats *export_st,
 			   DBusMessageIter *iter);
 void global_dbus_total_ops(DBusMessageIter *iter);
 void server_dbus_fast_ops(DBusMessageIter *iter);
-void cache_inode_dbus_show(DBusMessageIter *iter);
+void mdcache_dbus_show(DBusMessageIter *iter);
 
+#ifdef _USE_9P
 void server_dbus_9p_iostats(struct _9p_stats *_9pp, DBusMessageIter *iter);
 void server_dbus_9p_transstats(struct _9p_stats *_9pp, DBusMessageIter *iter);
 void server_dbus_9p_tcpstats(struct _9p_stats *_9pp, DBusMessageIter *iter);
 void server_dbus_9p_rdmastats(struct _9p_stats *_9pp, DBusMessageIter *iter);
+void server_dbus_9p_opstats(struct _9p_stats *_9pp, u8 opcode,
+			    DBusMessageIter *iter);
+#endif
+
 #endif				/* USE_DBUS */
 
 void server_stats_free(struct gsh_stats *statsp);

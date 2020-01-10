@@ -31,12 +31,16 @@
 #include "nfs23.h"
 #include "nfs4.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_exports.h"
 #include "mount.h"
 #include "rquota.h"
 #include "nfs_proto_functions.h"
 #include "export_mgr.h"
+
+static int do_rquota_setquota(char *quota_path, int quota_type,
+			      int quota_id,
+			      sq_dqblk * quota_dqblk,
+			      setquota_rslt * qres);
 
 /**
  * @brief The Rquota setquota function, for all versions.
@@ -44,57 +48,79 @@
  * The RQUOTA setquota function, for all versions.
  *
  * @param[in]  arg     quota args
- * @param[in]  export  Ignored
- * @param[in]  worker  Ignored
- * @param[in]  req     Ignored
+ * @param[in]  req     contains quota version
  * @param[out] res     returned quota (modified)
  *
  */
-int rquota_setquota(nfs_arg_t *arg,
-		    nfs_worker_data_t *worker,
-		    struct svc_req *req, nfs_res_t *res)
+int rquota_setquota(nfs_arg_t *arg, struct svc_req *req, nfs_res_t *res)
 {
-	fsal_status_t fsal_status;
-	fsal_quota_t fsal_quota_in;
-	fsal_quota_t fsal_quota_out;
-	int quota_type = USRQUOTA;
-	struct gsh_export *exp;
 	char *quota_path;
-	setquota_args *qarg = &arg->arg_rquota_setquota;
+	int quota_id;
+	int quota_type = USRQUOTA;
+	struct sq_dqblk *quota_dqblk;
 	setquota_rslt *qres = &res->res_rquota_setquota;
 
 	LogFullDebug(COMPONENT_NFSPROTO,
 		     "REQUEST PROCESSING: Calling rquota_setquota");
 
-	if (req->rq_vers == EXT_RQUOTAVERS)
+	/* check rquota version and extract arguments */
+	if (req->rq_vers == EXT_RQUOTAVERS) {
+		quota_path = arg->arg_ext_rquota_setquota.sqa_pathp;
+		quota_id = arg->arg_ext_rquota_setquota.sqa_id;
 		quota_type = arg->arg_ext_rquota_setquota.sqa_type;
+		quota_dqblk = &arg->arg_ext_rquota_setquota.sqa_dqblk;
+	} else {
+		quota_path = arg->arg_rquota_setquota.sqa_pathp;
+		quota_id = arg->arg_rquota_setquota.sqa_id;
+		quota_dqblk = &arg->arg_rquota_setquota.sqa_dqblk;
+	}
+
+	return do_rquota_setquota(quota_path, quota_type,
+				  quota_id, quota_dqblk, qres);
+}                               /* rquota_setquota */
+
+static int do_rquota_setquota(char *quota_path, int quota_type,
+			      int quota_id,
+			      sq_dqblk *quota_dqblk,
+			      setquota_rslt *qres)
+{
+	fsal_status_t fsal_status;
+	fsal_quota_t fsal_quota_in;
+	fsal_quota_t fsal_quota_out;
+	struct gsh_export *exp;
+	char *qpath;
+	char path[MAXPATHLEN];
 
 	qres->status = Q_EPERM;
-	if (qarg->sqa_pathp[0] == '/') {
-		exp = get_gsh_export_by_path(qarg->sqa_pathp, false);
+
+	qpath = check_handle_lead_slash(quota_path, path,
+					MAXPATHLEN);
+	if (qpath == NULL)
+		goto out;
+
+	exp = get_gsh_export_by_path(qpath, false);
+	if (exp == NULL) {
+		exp =
+		    get_gsh_export_by_tag(quota_path);
 		if (exp == NULL)
 			goto out;
-		quota_path = qarg->sqa_pathp;
-	} else {
-		exp = get_gsh_export_by_tag(qarg->sqa_pathp);
-		if (exp == NULL)
-			goto out;
-		quota_path = exp->fullpath;
+		qpath = exp->fullpath;
 	}
 
 	memset(&fsal_quota_in, 0, sizeof(fsal_quota_t));
 	memset(&fsal_quota_out, 0, sizeof(fsal_quota_t));
 
-	fsal_quota_in.bhardlimit = qarg->sqa_dqblk.rq_bhardlimit;
-	fsal_quota_in.bsoftlimit = qarg->sqa_dqblk.rq_bsoftlimit;
-	fsal_quota_in.curblocks = qarg->sqa_dqblk.rq_curblocks;
-	fsal_quota_in.fhardlimit = qarg->sqa_dqblk.rq_fhardlimit;
-	fsal_quota_in.fsoftlimit = qarg->sqa_dqblk.rq_fsoftlimit;
-	fsal_quota_in.btimeleft = qarg->sqa_dqblk.rq_btimeleft;
-	fsal_quota_in.ftimeleft = qarg->sqa_dqblk.rq_ftimeleft;
+	fsal_quota_in.bhardlimit = quota_dqblk->rq_bhardlimit;
+	fsal_quota_in.bsoftlimit = quota_dqblk->rq_bsoftlimit;
+	fsal_quota_in.curblocks = quota_dqblk->rq_curblocks;
+	fsal_quota_in.fhardlimit = quota_dqblk->rq_fhardlimit;
+	fsal_quota_in.fsoftlimit = quota_dqblk->rq_fsoftlimit;
+	fsal_quota_in.btimeleft = quota_dqblk->rq_btimeleft;
+	fsal_quota_in.ftimeleft = quota_dqblk->rq_ftimeleft;
 
 	fsal_status = exp->fsal_export->exp_ops.set_quota(exp->fsal_export,
-						       quota_path, quota_type,
+						       qpath, quota_type,
+						       quota_id,
 						       &fsal_quota_in,
 						       &fsal_quota_out);
 	if (FSAL_IS_ERROR(fsal_status)) {
@@ -124,7 +150,7 @@ int rquota_setquota(nfs_arg_t *arg,
 
 out:
 	return NFS_REQ_OK;
-}				/* rquota_setquota */
+}				/* do_rquota_setquota */
 
 /**
  * @brief Frees the result structure allocated for rquota_setquota
@@ -134,5 +160,5 @@ out:
  */
 void rquota_setquota_Free(nfs_res_t *res)
 {
-	return;
+	/* Nothing to do */
 }

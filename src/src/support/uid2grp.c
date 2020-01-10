@@ -90,7 +90,7 @@ static bool my_getgrouplist_alloc(char *user,
 				  struct group_data *gdata)
 {
 	int ngroups = 0;
-	gid_t *groups, *groups2;
+	gid_t *groups = NULL;
 
 	/* We call getgrouplist() with 0 ngroups first. This should always
 	 * return -1, and ngroups should be set to the actual number of
@@ -107,11 +107,10 @@ static bool my_getgrouplist_alloc(char *user,
 	(void)getgrouplist(user, gid, NULL, &ngroups);
 
 	/* Allocate gdata->groups with the right size then call
-	 * getgrouplist() a second time to get the actual group list
+	 * getgrouplist() a second time to get the actual group list.
 	 */
-	groups = gsh_malloc(ngroups * sizeof(gid_t));
-	if (groups == NULL)
-		return false;
+	if (ngroups > 0)
+		groups = gsh_malloc(ngroups * sizeof(gid_t));
 
 	if (getgrouplist(user, gid, groups, &ngroups) == -1) {
 		LogEvent(COMPONENT_IDMAPPER,
@@ -121,22 +120,26 @@ static bool my_getgrouplist_alloc(char *user,
 
 		/* Try with the largest ngroups we support */
 		ngroups = 1000;
-		groups2 = gsh_malloc(ngroups * sizeof(gid_t));
-		if (groups2 == NULL)
-			return false;
+		groups = gsh_malloc(ngroups * sizeof(gid_t));
 
-		if (getgrouplist(user, gid, groups2, &ngroups) == -1) {
+		if (getgrouplist(user, gid, groups, &ngroups) == -1) {
 			LogWarn(COMPONENT_IDMAPPER,
 				"getgrouplist for user:%s failed, ngroups: %d",
 				user, ngroups);
-			gsh_free(groups2);
+			gsh_free(groups);
 			return false;
 		}
 
-		/* Resize the buffer */
-		groups = gsh_realloc(groups2, ngroups * sizeof(gid_t));
-		if (groups == NULL) /* Use the large buffer! */
-			groups = groups2;
+		if (ngroups != 0) {
+			/* Resize the buffer, if it fails, gsh_realloc will
+			 * abort.
+			 */
+			groups = gsh_realloc(groups, ngroups * sizeof(gid_t));
+		} else {
+			/* We need to free groups because later code may not. */
+			gsh_free(groups);
+			groups = NULL;
+		}
 	}
 
 	gdata->groups = groups;
@@ -155,6 +158,7 @@ static struct group_data *uid2grp_allocate_by_name(
 	struct group_data *gdata = NULL;
 	char *buff;
 	long buff_size;
+	int retval;
 
 	memcpy(namebuff, name->addr, name->len);
 	*(namebuff + name->len) = '\0';
@@ -166,17 +170,21 @@ static struct group_data *uid2grp_allocate_by_name(
 	}
 
 	buff = alloca(buff_size);
-	if ((getpwnam_r(namebuff, &p, buff, buff_size, &pp) != 0)
-	    || (pp == NULL)) {
-		LogEvent(COMPONENT_IDMAPPER, "getpwnam_r %s failed", namebuff);
+	retval = getpwnam_r(namebuff, &p, buff, buff_size, &pp);
+	if (retval != 0) {
+		LogEvent(COMPONENT_IDMAPPER,
+			 "getpwnam_r for %s failed, error %d",
+			 namebuff, retval);
+		return gdata;
+	}
+	if (pp == NULL) {
+		LogEvent(COMPONENT_IDMAPPER,
+			 "No matching password record found for name %s",
+			 namebuff);
 		return gdata;
 	}
 
 	gdata = gsh_malloc(sizeof(struct group_data) + strlen(p.pw_name));
-	if (gdata == NULL) {
-		LogEvent(COMPONENT_IDMAPPER, "failed to allocate group data");
-		return gdata;
-	}
 
 	gdata->uname.len = strlen(p.pw_name);
 	gdata->uname.addr = (char *)gdata + sizeof(struct group_data);
@@ -202,6 +210,7 @@ static struct group_data *uid2grp_allocate_by_uid(uid_t uid)
 	struct group_data *gdata = NULL;
 	char *buff;
 	long buff_size;
+	int retval;
 
 	buff_size = sysconf(_SC_GETPW_R_SIZE_MAX);
 	if (buff_size == -1) {
@@ -210,16 +219,19 @@ static struct group_data *uid2grp_allocate_by_uid(uid_t uid)
 	}
 
 	buff = alloca(buff_size);
-	if ((getpwuid_r(uid, &p, buff, buff_size, &pp) != 0) || (pp == NULL)) {
-		LogEvent(COMPONENT_IDMAPPER, "getpwuid_r %u failed", uid);
+	retval = getpwuid_r(uid, &p, buff, buff_size, &pp);
+	if (retval != 0) {
+		LogEvent(COMPONENT_IDMAPPER,
+			 "getpwuid_r for uid %u failed, error %d", uid, retval);
+		return gdata;
+	}
+	if (pp == NULL) {
+		LogEvent(COMPONENT_IDMAPPER,
+			 "No matching password record found for uid %u", uid);
 		return gdata;
 	}
 
 	gdata = gsh_malloc(sizeof(struct group_data) + strlen(p.pw_name));
-	if (gdata == NULL) {
-		LogEvent(COMPONENT_IDMAPPER, "failed to allocate group data");
-		return gdata;
-	}
 
 	gdata->uname.len = strlen(p.pw_name);
 	gdata->uname.addr = (char *)gdata + sizeof(struct group_data);

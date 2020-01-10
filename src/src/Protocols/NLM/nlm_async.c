@@ -45,24 +45,14 @@ int nlm_send_async_res_nlm4(state_nlm_client_t *host, state_async_func_t func,
 	state_nlm_async_data_t *nlm_arg;
 	state_status_t status;
 
-	if (arg != NULL) {
-		nlm_arg = &arg->state_async_data.state_nlm_async_data;
-		memset(arg, 0, sizeof(*arg));
-		arg->state_async_func = func;
-		nlm_arg->nlm_async_host = host;
-		nlm_arg->nlm_async_args.nlm_async_res = *pres;
-		if (!copy_netobj
-		    (&nlm_arg->nlm_async_args.nlm_async_res.res_nlm4.cookie,
-		     &pres->res_nlm4.cookie)) {
-			LogCrit(COMPONENT_NLM,
-				"Unable to copy async response file handle");
-			gsh_free(arg);
-			return NFS_REQ_DROP;
-		}
-	} else {
-		LogCrit(COMPONENT_NLM, "Unable to allocate async response");
-		return NFS_REQ_DROP;
-	}
+	nlm_arg = &arg->state_async_data.state_nlm_async_data;
+	memset(arg, 0, sizeof(*arg));
+	arg->state_async_func = func;
+	nlm_arg->nlm_async_host = host;
+	nlm_arg->nlm_async_args.nlm_async_res = *pres;
+
+	copy_netobj(&nlm_arg->nlm_async_args.nlm_async_res.res_nlm4.cookie,
+		    &pres->res_nlm4.cookie);
 
 	status = state_async_schedule(arg);
 
@@ -81,36 +71,21 @@ int nlm_send_async_res_nlm4test(state_nlm_client_t *host,
 	state_nlm_async_data_t *nlm_arg;
 	state_status_t status;
 
-	if (arg != NULL) {
-		nlm_arg = &arg->state_async_data.state_nlm_async_data;
-		memset(arg, 0, sizeof(*arg));
-		arg->state_async_func = func;
-		nlm_arg->nlm_async_host = host;
-		nlm_arg->nlm_async_args.nlm_async_res = *pres;
-		if (!copy_netobj(
-		     &nlm_arg->nlm_async_args.nlm_async_res.res_nlm4test.cookie,
-		     &pres->res_nlm4test.cookie)) {
-			LogCrit(COMPONENT_NLM,
-				"Unable to copy async response file handle");
-			gsh_free(arg);
-			return NFS_REQ_DROP;
-		} else if (pres->res_nlm4test.test_stat.stat == NLM4_DENIED) {
-			if (!copy_netobj(
-			     &nlm_arg->nlm_async_args.nlm_async_res.
-			      res_nlm4test.test_stat.nlm4_testrply_u.holder.oh,
-			     &pres->res_nlm4test.test_stat.nlm4_testrply_u.
-			      holder.oh)) {
-				LogCrit(COMPONENT_NLM,
-					"Unable to copy async response oh");
-				netobj_free(&nlm_arg->nlm_async_args.
-					    nlm_async_res.res_nlm4test.cookie);
-				gsh_free(arg);
-				return NFS_REQ_DROP;
-			}
-		}
-	} else {
-		LogCrit(COMPONENT_NLM, "Unable to allocate async response");
-		return NFS_REQ_DROP;
+	nlm_arg = &arg->state_async_data.state_nlm_async_data;
+	memset(arg, 0, sizeof(*arg));
+	arg->state_async_func = func;
+	nlm_arg->nlm_async_host = host;
+	nlm_arg->nlm_async_args.nlm_async_res = *pres;
+
+	copy_netobj(&nlm_arg->nlm_async_args.nlm_async_res.res_nlm4test.cookie,
+		    &pres->res_nlm4test.cookie);
+
+	if (pres->res_nlm4test.test_stat.stat == NLM4_DENIED) {
+		copy_netobj(
+		     &nlm_arg->nlm_async_args.nlm_async_res.
+		      res_nlm4test.test_stat.nlm4_testrply_u.holder.oh,
+		     &pres->res_nlm4test.test_stat.nlm4_testrply_u.
+		      holder.oh);
 	}
 
 	status = state_async_schedule(arg);
@@ -151,7 +126,7 @@ int nlm_send_async(int proc, state_nlm_client_t *host, void *inarg, void *key)
 	struct timeval start, now;
 	struct timespec timeout;
 
-	for (retry = 1; retry <= MAX_ASYNC_RETRY; retry++) {
+	for (retry = 0; retry < MAX_ASYNC_RETRY; retry++) {
 		if (host->slc_callback_clnt == NULL) {
 			LogFullDebug(COMPONENT_NLM,
 				     "gsh_clnt_create %s",
@@ -219,11 +194,32 @@ int nlm_send_async(int proc, state_nlm_client_t *host, void *inarg, void *key)
 				gsh_free(buf);
 
 				/* get the IPv4 mapped IPv6 address */
-				getaddrinfo(host->slc_nsm_client->
-					    ssc_nlm_caller_name,
-					    port_str,
-					    &hints,
-					    &result);
+				retval = getaddrinfo(host->slc_nsm_client->
+						     ssc_nlm_caller_name,
+						     port_str,
+						     &hints,
+						     &result);
+
+				/* retry for spurious EAI_NONAME errors */
+				if (retval == EAI_NONAME ||
+				    retval == EAI_AGAIN) {
+					LogEvent(COMPONENT_NLM,
+						 "failed to resolve %s to an address: %s",
+						 host->slc_nsm_client->
+						 ssc_nlm_caller_name,
+						 gai_strerror(retval));
+					/* getaddrinfo() failed, retry */
+					retval = RPC_UNKNOWNADDR;
+					usleep(1000);
+					continue;
+				} else if (retval != 0) {
+					LogMajor(COMPONENT_NLM,
+						 "failed to resolve %s to an address: %s",
+						 host->slc_nsm_client->
+						 ssc_nlm_caller_name,
+						 gai_strerror(retval));
+					return -1;
+				}
 
 				/* setup the netbuf with in6 address */
 				local_buf.buf = result->ai_addr;
@@ -287,16 +283,16 @@ int nlm_send_async(int proc, state_nlm_client_t *host, void *inarg, void *key)
 
 		gsh_clnt_destroy(host->slc_callback_clnt);
 		host->slc_callback_clnt = NULL;
+	}
 
-		if (retry == MAX_ASYNC_RETRY) {
-			LogMajor(COMPONENT_NLM,
-				 "NLM async Client exceeded retry count %d",
-				 MAX_ASYNC_RETRY);
-			PTHREAD_MUTEX_lock(&nlm_async_resp_mutex);
-			resp_key = NULL;
-			PTHREAD_MUTEX_unlock(&nlm_async_resp_mutex);
-			return retval;
-		}
+	if (retry == MAX_ASYNC_RETRY) {
+		LogMajor(COMPONENT_NLM,
+			 "NLM async Client exceeded retry count %d",
+			 MAX_ASYNC_RETRY);
+		PTHREAD_MUTEX_lock(&nlm_async_resp_mutex);
+		resp_key = NULL;
+		PTHREAD_MUTEX_unlock(&nlm_async_resp_mutex);
+		return retval;
 	}
 
 	PTHREAD_MUTEX_lock(&nlm_async_resp_mutex);
@@ -313,6 +309,7 @@ int nlm_send_async(int proc, state_nlm_client_t *host, void *inarg, void *key)
 
 		while (resp_key != NULL && now.tv_sec < (start.tv_sec + 5)) {
 			int rc;
+
 			rc = pthread_cond_timedwait(&nlm_async_resp_cond,
 						    &nlm_async_resp_mutex,
 						    &timeout);

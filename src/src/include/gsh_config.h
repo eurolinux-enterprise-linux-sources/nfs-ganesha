@@ -58,6 +58,7 @@ typedef enum protos {
 	P_MNT,			/*< Mount (for v3) */
 	P_NLM,			/*< NLM (for v3) */
 	P_RQUOTA,		/*< RQUOTA (for v3) */
+	P_NFS_VSOCK,		/*< NFS over vmware, qemu vmci sockets */
 	P_COUNT			/*< Number of protocols */
 } protos;
 
@@ -80,7 +81,7 @@ typedef enum protos {
 /**
  * @brief Default value for core_param.nb_worker
  */
-#define NB_WORKER_THREAD_DEFAULT 16
+#define NB_WORKER_THREAD_DEFAULT 256
 
 /**
  * @brief Default value for core_param.drc.tcp.npart
@@ -171,7 +172,12 @@ typedef enum protos {
 /**
  * @brief Support 9p
  */
-#define CORE_OPTION_9P 0x00000004	/*< NFSv4 operations are supported */
+#define CORE_OPTION_9P 0x00000004	/*< 9P operations are supported */
+
+/**
+ * @brief NFS AF_VSOCK
+ */
+#define CORE_OPTION_NFS_VSOCK 0x00000008 /*< AF_VSOCK NFS listener */
 
 /**
  * @brief Support NFSv3 and NFSv4.
@@ -181,8 +187,10 @@ typedef enum protos {
 /**
  * @brief Support all protocols
  */
-#define CORE_OPTION_ALL_VERS (CORE_OPTION_NFSV3 | CORE_OPTION_NFSV4 | \
-			      CORE_OPTION_9P)
+#define CORE_OPTION_ALL_VERS (CORE_OPTION_NFSV3 |			\
+				CORE_OPTION_NFSV4 |			\
+				CORE_OPTION_NFS_VSOCK |			\
+				CORE_OPTION_9P)
 
 typedef struct nfs_core_param {
 	/** An array of port numbers, one for each protocol.  Set by
@@ -318,6 +326,18 @@ typedef struct nfs_core_param {
 		/** TIRPC ioq max simultaneous io threads.  Defaults to
 		    200 and settable by RPC_Ioq_ThrdMax. */
 		uint32_t ioq_thrd_max;
+		struct {
+			/** Partitions in GSS ctx cache table (default 13). */
+			uint32_t ctx_hash_partitions;
+			/** Max GSS contexts in cache (i.e.,
+			 * max GSS clients, default 16K)
+			 */
+			uint32_t max_ctx;
+			/** Max entries to expire in one idle
+			 * check (default 200)
+			 */
+			uint32_t max_gc;
+		} gss;
 	} rpc;
 	/** How long (in seconds) to let unused decoder threads wait before
 	    exiting.  Settable with Decoder_Fridge_Expiration_Delay. */
@@ -326,6 +346,8 @@ typedef struct nfs_core_param {
 	    accept a task before erroring.  Settable with
 	    Decoder_Fridge_Block_Timeout. */
 	time_t decoder_fridge_block_timeout;
+	/** Polling interval for blocked lock polling thread. */
+	time_t blocked_lock_poller_interval;
 	/** Protocols to support.  Should probably be renamed.
 	    Defaults to CORE_OPTION_ALL_VERS and is settable with
 	    NFS_Protocols (as a comma-separated list of 3 and 4.) */
@@ -346,6 +368,13 @@ typedef struct nfs_core_param {
 	bool enable_RQUOTA;
 	/** Whether to use fast stats.  Defaults to false. */
 	bool enable_FASTSTATS;
+	/** Whether tcp sockets should use SO_KEEPALIVE */
+	bool enable_tcp_keepalive;
+	/** Whether to use short NFS file handle to accommodate VMware
+	    NFS client. Enable this if you have a VMware NFSv3 client.
+	    VMware NFSv3 client has a max limit of 56 byte file handles!
+	    Defaults to false. */
+	bool short_file_handle;
 	/** How long the server will trust information it got by
 	    calling getgroups() when "Manage_Gids = TRUE" is
 	    used in a export entry. */
@@ -416,6 +445,11 @@ typedef struct nfs_version4_parameter {
 	    group identifiers.  Defaults to true and is settable with
 	    Allow_Numeric_Owners. */
 	bool allow_numeric_owners;
+	/** Whether to ONLY use bare numeric IDs in NFSv4 owner and
+	    group identifiers.  Defaults to false and is settable with
+	    Only_Numeric_Owners. NB., this is permissible for a server
+	    implementation (RFC 5661). */
+	bool only_numeric_owners;
 	/** Whether to allow delegations. Defaults to false and settable
 	    with Delegations */
 	bool allow_delegations;

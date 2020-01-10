@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+<short>NLM</short>
+<description>Default ports for NLM service</description>
+<port protocol="tcp" port="32803"/>    <!--For NLM service -->
+<port protocol="udp" port="32803"/>    <!--For NLM service -->
+</service>

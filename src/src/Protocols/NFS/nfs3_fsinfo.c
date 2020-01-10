@@ -38,7 +38,6 @@
 #include "log.h"
 #include "fsal.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_exports.h"
 #include "export_mgr.h"
 #include "nfs_proto_functions.h"
@@ -53,7 +52,6 @@
  * retrieving information from the FSAL as it ought.
  *
  * @param[in]  arg     NFS arguments union
- * @param[in]  worker  Worker thread data
  * @param[in]  req     SVC request related to this call
  * @param[out] res     Structure to contain the result of the call
  *
@@ -62,15 +60,14 @@
  * @retval NFS_REQ_FAILED if failed and not retryable
  */
 
-int nfs3_fsinfo(nfs_arg_t *arg,
-		nfs_worker_data_t *worker,
-		struct svc_req *req, nfs_res_t *res)
+int nfs3_fsinfo(nfs_arg_t *arg, struct svc_req *req, nfs_res_t *res)
 {
-	cache_entry_t *entry = NULL;
+	struct fsal_obj_handle *obj = NULL;
 	int rc = NFS_REQ_OK;
 
 	if (isDebug(COMPONENT_NFSPROTO)) {
 		char str[LEN_FH_STR];
+
 		sprint_fhandle3(str, &(arg->arg_fsinfo3.fsroot));
 		LogDebug(COMPONENT_NFSPROTO,
 			 "REQUEST PROCESSING: Calling nfs3_fsinfo handle: %s",
@@ -81,11 +78,11 @@ int nfs3_fsinfo(nfs_arg_t *arg,
 	res->res_fsinfo3.FSINFO3res_u.resfail.obj_attributes.attributes_follow =
 	    FALSE;
 
-	entry = nfs3_FhandleToCache(&arg->arg_fsinfo3.fsroot,
+	obj = nfs3_FhandleToCache(&arg->arg_fsinfo3.fsroot,
 				    &res->res_fsinfo3.status,
 				    &rc);
 
-	if (entry == NULL) {
+	if (obj == NULL) {
 		/* Status and rc have been set by nfs3_FhandleToCache */
 		goto out;
 	}
@@ -96,18 +93,22 @@ int nfs3_fsinfo(nfs_arg_t *arg,
 	FSINFO3resok * const FSINFO_FIELD =
 		&res->res_fsinfo3.FSINFO3res_u.resok;
 
-	FSINFO_FIELD->rtmax = op_ctx->export->MaxRead;
-	FSINFO_FIELD->rtpref = op_ctx->export->PrefRead;
+	FSINFO_FIELD->rtmax =
+		atomic_fetch_uint64_t(&op_ctx->ctx_export->MaxRead);
+	FSINFO_FIELD->rtpref =
+		atomic_fetch_uint64_t(&op_ctx->ctx_export->PrefRead);
 	/* This field is generally unused, it will be removed in V4 */
 	FSINFO_FIELD->rtmult = DEV_BSIZE;
 
-	FSINFO_FIELD->wtmax = op_ctx->export->MaxWrite;
-	FSINFO_FIELD->wtpref = op_ctx->export->PrefWrite;
+	FSINFO_FIELD->wtmax =
+		atomic_fetch_uint64_t(&op_ctx->ctx_export->MaxWrite);
+	FSINFO_FIELD->wtpref =
+		atomic_fetch_uint64_t(&op_ctx->ctx_export->PrefWrite);
 	/* This field is generally unused, it will be removed in V4 */
 	FSINFO_FIELD->wtmult = DEV_BSIZE;
 
-	FSINFO_FIELD->dtpref = op_ctx->export->PrefReaddir;
-
+	FSINFO_FIELD->dtpref =
+		atomic_fetch_uint64_t(&op_ctx->ctx_export->PrefReaddir);
 	FSINFO_FIELD->maxfilesize =
 	    op_ctx->fsal_export->exp_ops.fs_maxfilesize(op_ctx->fsal_export);
 	FSINFO_FIELD->time_delta.tv_sec = 1;
@@ -129,15 +130,16 @@ int nfs3_fsinfo(nfs_arg_t *arg,
 	FSINFO_FIELD->properties =
 	    FSF3_LINK | FSF3_SYMLINK | FSF3_HOMOGENEOUS | FSF3_CANSETTIME;
 
-	nfs_SetPostOpAttr(entry,
-			  &(res->res_fsinfo3.FSINFO3res_u.resok.
-			    obj_attributes));
+	nfs_SetPostOpAttr(obj,
+			  &res->res_fsinfo3.FSINFO3res_u.resok.
+			    obj_attributes,
+			  NULL);
 	res->res_fsinfo3.status = NFS3_OK;
 
  out:
 
-	if (entry)
-		cache_inode_put(entry);
+	if (obj)
+		obj->obj_ops.put_ref(obj);
 
 	return rc;
 }				/* nfs3_fsinfo */
@@ -152,5 +154,5 @@ int nfs3_fsinfo(nfs_arg_t *arg,
  */
 void nfs3_fsinfo_free(nfs_res_t *res)
 {
-	return;
+	/* Nothing to do here */
 }

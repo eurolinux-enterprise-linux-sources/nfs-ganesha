@@ -192,7 +192,7 @@ filename3 *objp;
 	register long __attribute__ ((__unused__)) * buf;
 #endif
 
-	if (!xdr_string(xdrs, objp, ~0))
+	if (!xdr_string(xdrs, objp, XDR_STRING_MAXLEN))
 		return (false);
 	return (true);
 }
@@ -208,7 +208,7 @@ nfspath3 *objp;
 	register long __attribute__ ((__unused__)) * buf;
 #endif
 
-	if (!xdr_string(xdrs, objp, ~0))
+	if (!xdr_string(xdrs, objp, XDR_STRING_MAXLEN))
 		return (false);
 	return (true);
 }
@@ -443,7 +443,6 @@ bool xdr_nfs_fh3(xdrs, objp)
 register XDR *xdrs;
 nfs_fh3 *objp;
 {
-	file_handle_v3_t *fh;
 
 #if defined(_LP64) || defined(_KERNEL)
 	register int __attribute__ ((__unused__)) * buf;
@@ -451,19 +450,11 @@ nfs_fh3 *objp;
 	register long __attribute__ ((__unused__)) * buf;
 #endif
 
-	if (xdrs->x_op == XDR_ENCODE) {
-		fh = (file_handle_v3_t *)objp->data.data_val;
-		fh->exportid = htons(fh->exportid);
-	}
 	if (!xdr_bytes
 	    (xdrs, (char **)&objp->data.data_val,
 	     (u_int *) & objp->data.data_len, 64))
 		return (false);
 
-	if (xdrs->x_op == XDR_DECODE) {
-		fh = (file_handle_v3_t *)objp->data.data_val;
-		fh->exportid = ntohs(fh->exportid);
-	}
 	return (true);
 }
 
@@ -1275,7 +1266,7 @@ READ3resok *objp;
 		return (false);
 	if (!xdr_bytes
 	    (xdrs, (char **)&objp->data.data_val,
-	     (u_int *) & objp->data.data_len, ~0))
+	     &objp->data.data_len, XDR_BYTES_MAXLEN_IO))
 		return (false);
 	return (true);
 }
@@ -1361,7 +1352,7 @@ WRITE3args *objp;
 		return (false);
 	if (!xdr_bytes
 	    (xdrs, (char **)&objp->data.data_val,
-	     (u_int *) & objp->data.data_len, ~0))
+	     &objp->data.data_len, XDR_BYTES_MAXLEN_IO))
 		return (false);
 	lkhd->flags |= NFS_LOOKAHEAD_WRITE;
 	(lkhd->write)++;

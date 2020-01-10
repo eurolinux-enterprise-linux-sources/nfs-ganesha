@@ -37,22 +37,8 @@
 
 #include "log.h"
 #include "sal_data.h"
-#include "cache_inode.h"
 #include "export_mgr.h"
-#include "byteswap.h"
 #include "nfs_fh.h"
-
-/**
- * @brief A struct with the size of the largest v3 handle
- *
- * Used for allocations, sizeof, and memset only.  The pad space is
- * where the opaque handle expands into.  Pad is struct aligned.
- */
-
-struct alloc_file_handle_v3 {
-	struct file_handle_v3 handle;	/*< The real handle */
-	uint8_t pad[58];	/*< Pad to mandatory max 64 bytes */
-};
 
 /**
  * @brief Get the actual size of a v3 handle based on the sized fsopaque
@@ -62,34 +48,67 @@ struct alloc_file_handle_v3 {
 
 static inline size_t nfs3_sizeof_handle(struct file_handle_v3 *hdl)
 {
-	int padding = 0;
-	int hsize = 0;
+	int hsize;
+	int aligned_hsize;
 
 	hsize = offsetof(struct file_handle_v3, fsopaque) + hdl->fs_len;
 
 	/* correct packet's fh length so it's divisible by 4 to trick dNFS into
 	   working. This is essentially sending the padding. */
-	padding = (4 - (hsize % 4)) % 4;
-	if ((hsize + padding) <= sizeof(struct alloc_file_handle_v3))
-		hsize += padding;
+	aligned_hsize = roundup(hsize, 4);
+	if (aligned_hsize <= NFS3_FHSIZE)
+		hsize = aligned_hsize;
 
 	return hsize;
 }
 
 /**
- * @brief A struct with the size of the largest v4 handle
  *
- * Used for allocations, sizeof, and memset only.  The pad space is
- * where the opaque handle expands into.  Pad is struct aligned.
+ * @brief Allocates a buffer to be used for storing a NFSv4 filehandle.
+ *
+ * Allocates a buffer to be used for storing a NFSv3 filehandle.
+ *
+ * @param fh [INOUT] the filehandle to manage.
+ *
  */
+static inline
+void nfs3_AllocateFH(nfs_fh3 *fh)
+{
+	/* Allocating the filehandle in memory */
+	fh->data.data_len = NFS3_FHSIZE;
+	fh->data.data_val = gsh_calloc(1, NFS3_FHSIZE);
+}
 
-struct __attribute__ ((__packed__)) alloc_file_handle_v4 {
-	struct file_handle_v4 handle;	/*< The real handle */
-	uint8_t pad[123];	/*< Pad to mandatory max 128 bytes */
-};
+static inline void nfs3_freeFH(nfs_fh3 *fh)
+{
+	fh->data.data_len = 0;
+	gsh_free(fh->data.data_val);
+	fh->data.data_val = NULL;
+}
 
-int nfs3_AllocateFH(nfs_fh3 *);
-int nfs4_AllocateFH(nfs_fh4 *);
+/**
+ *
+ * @brief Allocates a buffer to be used for storing a NFSv4 filehandle.
+ *
+ * Allocates a buffer to be used for storing a NFSv4 filehandle.
+ *
+ * @param fh [INOUT] the filehandle to manage.
+ *
+ */
+static inline
+void nfs4_AllocateFH(nfs_fh4 *fh)
+{
+	/* Allocating the filehandle in memory */
+	fh->nfs_fh4_len = NFS4_FHSIZE;
+	fh->nfs_fh4_val = gsh_calloc(1, NFS4_FHSIZE);
+}
+
+static inline void nfs4_freeFH(nfs_fh4 *fh)
+{
+	fh->nfs_fh4_len = 0;
+	gsh_free(fh->nfs_fh4_val);
+	fh->nfs_fh4_val = NULL;
+}
 
 /**
  * @brief Get the actual size of a v4 handle based on the sized fsopaque
@@ -105,14 +124,17 @@ static inline size_t nfs4_sizeof_handle(struct file_handle_v4 *hdl)
 #define LEN_FH_STR 1024
 
 /* File handle translation utility */
-cache_entry_t *nfs3_FhandleToCache(nfs_fh3 *,
-				   nfsstat3 *, int *);
+#ifdef _USE_NFS3
+struct fsal_obj_handle *nfs3_FhandleToCache(nfs_fh3 *, nfsstat3 *, int *);
+#endif
 
-bool nfs4_FSALToFhandle(nfs_fh4 *fh4,
+bool nfs4_FSALToFhandle(bool allocate,
+			nfs_fh4 *fh4,
 			const struct fsal_obj_handle *fsalhandle,
 			struct gsh_export *exp);
 
-bool nfs3_FSALToFhandle(nfs_fh3 *fh3,
+bool nfs3_FSALToFhandle(bool allocate,
+			nfs_fh3 *fh3,
 			const struct fsal_obj_handle *fsalhandle,
 			struct gsh_export *exp);
 
@@ -130,7 +152,7 @@ int nfs3_Is_Fh_Invalid(nfs_fh3 *);
  * @return the export id.
  *
  */
-static inline short nfs3_FhandleToExportId(nfs_fh3 *pfh3)
+static inline int nfs3_FhandleToExportId(nfs_fh3 *pfh3)
 {
 	file_handle_v3_t *pfile_handle;
 
@@ -139,12 +161,14 @@ static inline short nfs3_FhandleToExportId(nfs_fh3 *pfh3)
 
 	pfile_handle = (file_handle_v3_t *) (pfh3->data.data_val);
 
-	return pfile_handle->exportid;
+	/*exportid is in network byte order in nfs_fh3*/
+	return ntohs(pfile_handle->exportid);
 }				/* nfs3_FhandleToExportId */
 
-static inline short nlm4_FhandleToExportId(netobj *pfh3)
+static inline int nlm4_FhandleToExportId(netobj *pfh3)
 {
 	nfs_fh3 fh3;
+
 	if (pfh3 == NULL)
 		return nfs3_FhandleToExportId(NULL);
 	fh3.data.data_val = pfh3->n_bytes;

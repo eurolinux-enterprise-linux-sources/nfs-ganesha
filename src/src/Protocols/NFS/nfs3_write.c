@@ -39,7 +39,6 @@
 #include "log.h"
 #include "fsal.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_exports.h"
 #include "nfs_proto_functions.h"
 #include "nfs_convert.h"
@@ -55,7 +54,6 @@
  * Implements the NFSPROC3_WRITE function.
  *
  * @param[in]  arg     NFS argument union
- * @param[in]  worker  Worker thread data
  * @param[in]  req     SVC request related to this call
  * @param[out] res     Structure to contain the result of the call
  *
@@ -65,15 +63,13 @@
  *
  */
 
-int nfs3_write(nfs_arg_t *arg,
-	       nfs_worker_data_t *worker,
-	       struct svc_req *req, nfs_res_t *res)
+int nfs3_write(nfs_arg_t *arg, struct svc_req *req, nfs_res_t *res)
 {
-	cache_entry_t *entry;
+	struct fsal_obj_handle *obj;
 	pre_op_attr pre_attr = {
 		.attributes_follow = false
 	};
-	cache_inode_status_t cache_status = CACHE_INODE_SUCCESS;
+	fsal_status_t fsal_status = {0, 0};
 	size_t size = 0;
 	size_t written_size = 0;
 	uint64_t offset = 0;
@@ -81,7 +77,10 @@ int nfs3_write(nfs_arg_t *arg,
 	bool eof_met = false;
 	bool sync = false;
 	int rc = NFS_REQ_OK;
-	fsal_status_t fsal_status;
+	uint64_t MaxWrite =
+		atomic_fetch_uint64_t(&op_ctx->ctx_export->MaxWrite);
+	uint64_t MaxOffsetWrite =
+		atomic_fetch_uint64_t(&op_ctx->ctx_export->MaxOffsetWrite);
 
 	offset = arg->arg_write3.offset;
 	size = arg->arg_write3.count;
@@ -111,9 +110,9 @@ int nfs3_write(nfs_arg_t *arg,
 				 str);
 
 		LogDebug(COMPONENT_NFSPROTO,
-			 "REQUEST PROCESSING: Calling nfs_Write handle: %s "
-			 "start: %" PRIx64 " len: %" PRIx64 " %s", str, offset,
-			 size, stables);
+			 "REQUEST PROCESSING: Calling nfs_Write handle: %s start: %"
+			 PRIx64 " len: %zx %s",
+			 str, offset, size, stables);
 	}
 
 	/* to avoid setting it on each error case */
@@ -122,34 +121,29 @@ int nfs3_write(nfs_arg_t *arg,
 	res->res_write3.WRITE3res_u.resfail.file_wcc.after.attributes_follow =
 	    false;
 
-	entry = nfs3_FhandleToCache(&arg->arg_write3.file,
+	obj = nfs3_FhandleToCache(&arg->arg_write3.file,
 				    &res->res_write3.status,
 				    &rc);
 
-	if (entry == NULL) {
+	if (obj == NULL) {
 		/* Status and rc have been set by nfs3_FhandleToCache */
+		return rc;
+	}
+
+	nfs_SetPreOpAttr(obj, &pre_attr);
+
+	fsal_status =
+	    obj->obj_ops.test_access(obj, FSAL_WRITE_ACCESS, NULL, NULL, true);
+
+	if (FSAL_IS_ERROR(fsal_status)) {
+		res->res_write3.status = nfs3_Errno_status(fsal_status);
+		rc = NFS_REQ_OK;
 		goto out;
 	}
 
-	nfs_SetPreOpAttr(entry, &pre_attr);
-
-	/** @todo this is racy, use cache_inode_lock_trust_attrs and
-	 *        cache_inode_access_no_mutex
-	 */
-	if (entry->obj_handle->attributes.owner != op_ctx->creds->caller_uid) {
-		cache_status = cache_inode_access(entry,
-						  FSAL_WRITE_ACCESS);
-
-		if (cache_status != CACHE_INODE_SUCCESS) {
-			res->res_write3.status = nfs3_Errno(cache_status);
-			rc = NFS_REQ_OK;
-			goto out;
-		}
-	}
-
 	/* Sanity check: write only a regular file */
-	if (entry->type != REGULAR_FILE) {
-		if (entry->type == DIRECTORY)
+	if (obj->type != REGULAR_FILE) {
+		if (obj->type == DIRECTORY)
 			res->res_write3.status = NFS3ERR_ISDIR;
 		else
 			res->res_write3.status = NFS3ERR_INVAL;
@@ -162,7 +156,7 @@ int nfs3_write(nfs_arg_t *arg,
 	   FSAL allows inode creation or not */
 	fsal_status =
 	    op_ctx->fsal_export->exp_ops.check_quota(op_ctx->fsal_export,
-						   op_ctx->export->fullpath,
+						   op_ctx->ctx_export->fullpath,
 						   FSAL_QUOTA_BLOCKS);
 
 	if (FSAL_IS_ERROR(fsal_status)) {
@@ -181,24 +175,22 @@ int nfs3_write(nfs_arg_t *arg,
 	data = arg->arg_write3.data.data_val;
 
 	/* Do not exceed maxium WRITE offset if set */
-	if (op_ctx->export->MaxOffsetWrite < UINT64_MAX) {
+	if (MaxOffsetWrite < UINT64_MAX) {
 		LogFullDebug(COMPONENT_NFSPROTO,
-			     "Write offset=%" PRIu64 " count=%" PRIu64
+			     "Write offset=%" PRIu64 " size=%zu"
 			     " MaxOffSet=%" PRIu64, offset, size,
-			     op_ctx->export->MaxOffsetWrite);
+			     MaxOffsetWrite);
 
-		if ((offset + size) > op_ctx->export->MaxOffsetWrite) {
+		if ((offset + size) > MaxOffsetWrite) {
 			LogEvent(COMPONENT_NFSPROTO,
-				 "A client tryed to violate max "
-				 "file size %" PRIu64 " for exportid #%hu",
-				 op_ctx->export->MaxOffsetWrite,
-				 op_ctx->export->export_id);
+				 "A client tryed to violate max file size %"
+				 PRIu64 " for exportid #%hu",
+				 MaxOffsetWrite,
+				 op_ctx->ctx_export->export_id);
 
-			res->res_write3.status = NFS3ERR_INVAL;
+			res->res_write3.status = NFS3ERR_FBIG;
 
-			res->res_write3.status = nfs3_Errno(cache_status);
-
-			nfs_SetWccData(NULL, entry,
+			nfs_SetWccData(NULL, obj,
 				       &res->res_write3.WRITE3res_u.resfail.
 				       file_wcc);
 
@@ -208,84 +200,105 @@ int nfs3_write(nfs_arg_t *arg,
 	}
 
 	/* We should take care not to exceed FSINFO wtmax field for the size */
-	if (size > op_ctx->export->MaxWrite) {
+	if (size > MaxWrite) {
 		/* The client asked for too much data, we must restrict him */
-		size = op_ctx->export->MaxWrite;
+		size = MaxWrite;
 	}
 
 	if (size == 0) {
-		cache_status = CACHE_INODE_SUCCESS;
+		fsal_status = fsalstat(ERR_FSAL_NO_ERROR, 0);
 		written_size = 0;
-	} else {
-		/* An actual write is to be made, prepare it */
-
-		res->res_write3.status = nfs3_Errno_state(
-				state_share_anonymous_io_start(
-					entry,
-					OPEN4_SHARE_ACCESS_WRITE,
-					SHARE_BYPASS_V3_WRITE));
-
-		if (res->res_write3.status != NFS3_OK) {
-			rc = NFS_REQ_OK;
-			goto out;
-		}
-
-		cache_status =
-		    cache_inode_rdwr(entry, CACHE_INODE_WRITE, offset, size,
-				     &written_size, data, &eof_met, &sync);
-
-		state_share_anonymous_io_done(entry, OPEN4_SHARE_ACCESS_WRITE);
-
-		if (cache_status == CACHE_INODE_SUCCESS) {
-			/* Build Weak Cache Coherency data */
-			nfs_SetWccData(NULL, entry,
-				       &res->res_write3.WRITE3res_u.resok.
-				       file_wcc);
-
-			/* Set the written size */
-			res->res_write3.WRITE3res_u.resok.count = written_size;
-
-			/* How do we commit data ? */
-			if (sync)
-				res->res_write3.WRITE3res_u.resok.committed =
-				    FILE_SYNC;
-			else
-				res->res_write3.WRITE3res_u.resok.committed =
-				    UNSTABLE;
-
-			/* Set the write verifier */
-			memcpy(res->res_write3.WRITE3res_u.resok.verf,
-			       NFS3_write_verifier,
-			       sizeof(writeverf3));
-
-			res->res_write3.status = NFS3_OK;
-
-			rc = NFS_REQ_OK;
-			goto out;
-		}
-	}
-
-	LogFullDebug(COMPONENT_NFSPROTO,
-		     "failed write: cache_status=%s",
-		     cache_inode_err_str(cache_status));
-
-	/* If we are here, there was an error */
-	if (nfs_RetryableError(cache_status)) {
-		rc = NFS_REQ_DROP;
+		res->res_write3.status = NFS3_OK;
+		nfs_SetWccData(NULL, obj,
+			       &res->res_write3.WRITE3res_u.resfail.file_wcc);
+		rc = NFS_REQ_OK;
 		goto out;
 	}
 
-	res->res_write3.status = nfs3_Errno(cache_status);
+	/* An actual write is to be made, prepare it */
 
-	nfs_SetWccData(NULL, entry,
-		       &res->res_write3.WRITE3res_u.resfail.file_wcc);
+	res->res_write3.status = nfs3_Errno_state(
+			state_share_anonymous_io_start(
+				obj,
+				OPEN4_SHARE_ACCESS_WRITE,
+				SHARE_BYPASS_V3_WRITE));
+
+	if (res->res_write3.status != NFS3_OK) {
+		rc = NFS_REQ_OK;
+		goto out;
+	}
+
+	if (obj->fsal->m_ops.support_ex(obj)) {
+		/* Call the new fsal_write */
+		/** @todo for now pass NULL state */
+		fsal_status = fsal_write2(obj,
+					  true,
+					  NULL,
+					  offset,
+					  size,
+					  &written_size,
+					  data,
+					  &sync,
+					  NULL);
+	} else {
+		/* Call legacy fsal_rdwr */
+		fsal_status = fsal_rdwr(obj,
+					FSAL_IO_WRITE,
+					offset,
+					size,
+					&written_size,
+					data,
+					&eof_met,
+					&sync,
+					NULL);
+	}
+
+	state_share_anonymous_io_done(obj, OPEN4_SHARE_ACCESS_WRITE);
+
+	if (FSAL_IS_ERROR(fsal_status)) {
+		/* If we are here, there was an error */
+		LogFullDebug(COMPONENT_NFSPROTO,
+			     "failed write: fsal_status=%s",
+			     fsal_err_txt(fsal_status));
+
+		if (nfs_RetryableError(fsal_status.major)) {
+			rc = NFS_REQ_DROP;
+			goto out;
+		}
+
+		res->res_write3.status = nfs3_Errno_status(fsal_status);
+
+		nfs_SetWccData(NULL, obj,
+			       &res->res_write3.WRITE3res_u.resfail.file_wcc);
+
+		rc = NFS_REQ_OK;
+	} else {
+		/* Build Weak Cache Coherency data */
+		nfs_SetWccData(NULL, obj,
+			       &res->res_write3.WRITE3res_u.resok.file_wcc);
+
+		/* Set the written size */
+		res->res_write3.WRITE3res_u.resok.count = written_size;
+
+		/* How do we commit data ? */
+		if (sync)
+			res->res_write3.WRITE3res_u.resok.committed = FILE_SYNC;
+		else
+			res->res_write3.WRITE3res_u.resok.committed = UNSTABLE;
+
+		/* Set the write verifier */
+		memcpy(res->res_write3.WRITE3res_u.resok.verf,
+		       NFS3_write_verifier,
+		       sizeof(writeverf3));
+
+		res->res_write3.status = NFS3_OK;
+	}
 
 	rc = NFS_REQ_OK;
 
  out:
 	/* return references */
-	if (entry)
-		cache_inode_put(entry);
+	obj->obj_ops.put_ref(obj);
 
 	server_stats_io_done(size, written_size,
 			     (rc == NFS_REQ_OK) ? true : false,
@@ -304,5 +317,5 @@ int nfs3_write(nfs_arg_t *arg,
  */
 void nfs3_write_free(nfs_res_t *res)
 {
-	return;
+	/* Nothing to do here */
 }

@@ -9,6 +9,9 @@
  */
 
 #include "config.h"
+#ifdef LINUX
+#include <sys/sysmacros.h>  /* for major(3), minor(3) */
+#endif
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <errno.h>
@@ -69,14 +72,13 @@ int posix2fsal_error(int posix_errorcode)
 		/* all shown as IO errors */
 		if (getrlimit(RLIMIT_NOFILE, &rlim) != 0) {
 			LogInfo(COMPONENT_FSAL,
-				"Mapping %d to ERR_FSAL_IO, open_fd_count=%ld getrlimit failed",
-				posix_errorcode,
-				(long) atomic_fetch_size_t(&open_fd_count));
+				"Mapping %d to ERR_FSAL_IO, getrlimit failed",
+				posix_errorcode);
 		} else {
 			LogInfo(COMPONENT_FSAL,
-				"Mapping %d to ERR_FSAL_IO, open_fd_count=%ld rlim_cur=%ld rlim_max=%ld",
+				"Mapping %d to ERR_FSAL_IO, rlim_cur=%"
+				PRId64 " rlim_max=%" PRId64,
 				+posix_errorcode,
-				(long) atomic_fetch_size_t(&open_fd_count),
 				rlim.rlim_cur,
 				rlim.rlim_max);
 		}
@@ -174,7 +176,9 @@ int posix2fsal_error(int posix_errorcode)
 		/* Error code that needs a retry */
 	case EAGAIN:
 	case EBUSY:
+#ifdef ETIME
 	case ETIME:
+#endif
 		LogInfo(COMPONENT_FSAL, "Mapping %d to ERR_FSAL_DELAY",
 			posix_errorcode);
 		return ERR_FSAL_DELAY;
@@ -190,6 +194,11 @@ int posix2fsal_error(int posix_errorcode)
 
 	case EINTR:
 		return ERR_FSAL_INTERRUPT;
+
+#ifdef ENODATA
+	case ENODATA:
+		return ERR_FSAL_NO_DATA;
+#endif
 
 	default:
 		LogCrit(COMPONENT_FSAL,
@@ -346,12 +355,12 @@ fsal_dev_t posix2fsal_devt(dev_t posix_devid)
  * @retval ERR_FSAL_INVAL, invalid or incompatible input flags.
  */
 
-int fsal2posix_openflags(fsal_openflags_t fsal_flags, int *p_posix_flags)
+void fsal2posix_openflags(fsal_openflags_t fsal_flags, int *p_posix_flags)
 {
-	/* check that all used flags exist */
-	if (fsal_flags &
-	    ~(FSAL_O_READ | FSAL_O_RDWR | FSAL_O_WRITE | FSAL_O_SYNC))
-		return ERR_FSAL_INVAL;
+	/* Ignore any flags that are not actually used, there are flags
+	 * that are passed to FSAL operations that don't convert to
+	 * POSIX open flags, which is fine.
+	 */
 
 	/* conversion */
 	*p_posix_flags = 0;
@@ -362,11 +371,14 @@ int fsal2posix_openflags(fsal_openflags_t fsal_flags, int *p_posix_flags)
 		*p_posix_flags |= O_RDONLY;
 	else if ((fsal_flags & FSAL_O_RDWR) == FSAL_O_WRITE)
 		*p_posix_flags |= O_WRONLY;
+	else if ((fsal_flags & FSAL_O_ANY) != 0)
+		*p_posix_flags |= O_RDONLY;
 
 	if (fsal_flags & FSAL_O_SYNC)
 		*p_posix_flags |= O_SYNC;
 
-	return ERR_FSAL_NO_ERROR;
+	if (fsal_flags & FSAL_O_TRUNC)
+		*p_posix_flags |= O_TRUNC;
 }
 
 /**
@@ -402,70 +414,50 @@ const char *object_file_type_to_str(object_file_type_t type)
 	return "unexpected type";
 }
 
-fsal_status_t posix2fsal_attributes(const struct stat *buffstat,
-				    struct attrlist *fsalattr)
+void posix2fsal_attributes(const struct stat *buffstat,
+			   struct attrlist *fsalattr)
 {
-	/* sanity checks */
-	if (!buffstat || !fsalattr)
-		return fsalstat(ERR_FSAL_FAULT, 0);
-
-	FSAL_CLEAR_MASK(fsalattr->mask);
+	/* Indicate which atrributes we have set without affecting the
+	 * other bits in the mask.
+	 */
+	fsalattr->valid_mask |= ATTRS_POSIX;
 
 	/* Fills the output struct */
 	fsalattr->type = posix2fsal_type(buffstat->st_mode);
-	FSAL_SET_MASK(fsalattr->mask, ATTR_TYPE);
 
 	fsalattr->filesize = buffstat->st_size;
-	FSAL_SET_MASK(fsalattr->mask, ATTR_SIZE);
 
 	fsalattr->fsid = posix2fsal_fsid(buffstat->st_dev);
-	FSAL_SET_MASK(fsalattr->mask, ATTR_FSID);
 
 	fsalattr->fileid = buffstat->st_ino;
-	FSAL_SET_MASK(fsalattr->mask, ATTR_FILEID);
 
 	fsalattr->mode = unix2fsal_mode(buffstat->st_mode);
-	FSAL_SET_MASK(fsalattr->mask, ATTR_MODE);
 
 	fsalattr->numlinks = buffstat->st_nlink;
-	FSAL_SET_MASK(fsalattr->mask, ATTR_NUMLINKS);
 
 	fsalattr->owner = buffstat->st_uid;
-	FSAL_SET_MASK(fsalattr->mask, ATTR_OWNER);
 
 	fsalattr->group = buffstat->st_gid;
-	FSAL_SET_MASK(fsalattr->mask, ATTR_GROUP);
 
 	/* Use full timer resolution */
-#ifdef LINUX
-	fsalattr->atime = buffstat->st_atim;
-	fsalattr->ctime = buffstat->st_ctim;
-	fsalattr->mtime = buffstat->st_mtim;
-	fsalattr->chgtime =
-	    (gsh_time_cmp(&buffstat->st_mtim, &buffstat->st_ctim) >
-	     0) ? fsalattr->mtime : fsalattr->ctime;
-#elif FREEBSD
+#ifdef FREEBSD
 	fsalattr->atime = buffstat->st_atimespec;
 	fsalattr->ctime = buffstat->st_ctimespec;
 	fsalattr->mtime = buffstat->st_mtimespec;
-	fsalattr->chgtime =
-	    (gsh_time_cmp(&buffstat->st_mtimespec, &buffstat->st_ctimespec) >
-	     0) ? fsalattr->mtime : fsalattr->ctime;
+#else
+	fsalattr->atime = buffstat->st_atim;
+	fsalattr->ctime = buffstat->st_ctim;
+	fsalattr->mtime = buffstat->st_mtim;
 #endif
-	FSAL_SET_MASK(fsalattr->mask, ATTR_ATIME);
-	FSAL_SET_MASK(fsalattr->mask, ATTR_CTIME);
-	FSAL_SET_MASK(fsalattr->mask, ATTR_MTIME);
+	fsalattr->chgtime =
+	    (gsh_time_cmp(&fsalattr->mtime, &fsalattr->ctime) > 0) ?
+		fsalattr->mtime : fsalattr->ctime;
 
 	fsalattr->change = timespec_to_nsecs(&fsalattr->chgtime);
-	FSAL_SET_MASK(fsalattr->mask, ATTR_CHGTIME);
 
 	fsalattr->spaceused = buffstat->st_blocks * S_BLKSIZE;
-	FSAL_SET_MASK(fsalattr->mask, ATTR_SPACEUSED);
 
 	fsalattr->rawdev = posix2fsal_devt(buffstat->st_rdev);
-	FSAL_SET_MASK(fsalattr->mask, ATTR_RAWDEV);
-
-	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
 
 /** @} */

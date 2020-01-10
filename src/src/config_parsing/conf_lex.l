@@ -97,7 +97,7 @@ DECNUM       (0|[1-9][0-9]*)
 NINEP        9[pP]
 
 INCLPATH     \/?([a-zA-Z0-9\-\.\_])+(\/[a-zA-Z0-9\-\.\_]+)*
-PATHNAME     (\/[a-zA-Z0-9\-\.\_]+)\/?
+PATHNAME     \/([a-zA-Z0-9\-\.\_]+\/?)?
 LONGPATH     (\/?[a-zA-Z0-9\-\.\_]+(\/[a-zA-Z0-9\-\.\_]+)+)\/?
 TOKEN_CHARS  [a-zA-Z_\?][a-zA-Z0-9\._\-]*
 
@@ -361,8 +361,7 @@ int ganeshun_yy_init_parser(char *srcfile, struct parser_state *st)
 	int rc = ENOMEM;
 
 	confroot = gsh_calloc(1, sizeof(struct config_root));
-	if (confroot == NULL)
-		goto nospc;
+
 	glist_init(&confroot->root.node);
 	glist_init(&confroot->root.u.nterm.sub_nodes);
 	confroot->root.type = TYPE_ROOT;
@@ -371,10 +370,6 @@ int ganeshun_yy_init_parser(char *srcfile, struct parser_state *st)
 	rc = new_file(srcfile, st);
 	if (rc == 0)
 		confroot->root.filename = gsh_strdup(srcfile);
-	return rc;
-
-nospc:
-	st->err_type->resource = true;
 	return rc;
 }
 
@@ -419,18 +414,13 @@ static int new_file(char *name_tok,
 		} else {
 			confroot->conf_dir = gsh_strdup(".");
 		}
-		if (confroot->conf_dir == NULL)
-			goto errout;
 	}
 	if (filename[0] == '/') {
 		fullpath = gsh_strdup(filename);
-		if (fullpath == NULL)
-			goto errout;
 	} else {
-		fullpath = gsh_calloc(1, (strlen(filename) +
-					  strlen(confroot->conf_dir) + 2));
-		if (fullpath == NULL)
-			goto errout;
+		fullpath = gsh_malloc(strlen(filename) +
+				      strlen(confroot->conf_dir) + 2);
+
 		sprintf(fullpath, "%s/%s", confroot->conf_dir, filename);
 	}
 	/* loop detection */
@@ -444,19 +434,15 @@ static int new_file(char *name_tok,
 		}
 	}
 	bs = gsh_calloc(1, sizeof(struct bufstack));
-	if (bs == NULL) {
-		goto errout;
-	}
+
 	flist = gsh_calloc(1, sizeof(struct file_list));
-	if (flist == NULL) {
-		goto errout;
-	}
+
 	in_file = fopen(fullpath, "r" );
 	if (in_file == NULL) {
 		rc = errno;
 		config_parse_error(yylloc, st,
 			"new file (%s) open error (%s), ignored",
-			strerror(rc));
+			fullpath, strerror(rc));
 		goto errout;
 	}
 	bs->bs = ganeshun_yy_create_buffer(in_file,
@@ -480,12 +466,11 @@ errout:
 		st->err_type->resource = true;
 	else
 		st->err_type->scan = true;
-	if (flist != NULL)
-		gsh_free(flist);
-	if (bs != NULL)
-		gsh_free(bs);
-	if (fullpath != NULL)
-		gsh_free(fullpath);
+
+	gsh_free(flist);
+	gsh_free(bs);
+	gsh_free(fullpath);
+
 	return rc;
 }
 

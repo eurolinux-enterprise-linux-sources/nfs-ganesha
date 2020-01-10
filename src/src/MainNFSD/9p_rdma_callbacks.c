@@ -45,7 +45,6 @@
 #include "abstract_atomic.h"
 #include "nfs_init.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_exports.h"
 #include "nfs_proto_functions.h"
 #include "nfs_dupreq.h"
@@ -116,8 +115,7 @@ void _9p_rdma_callback_disconnect(msk_trans_t *trans)
 	_9p_rdma_cleanup_conn(trans);
 }
 
-void _9p_rdma_process_request(struct _9p_request_data *req9p,
-			      nfs_worker_data_t *worker_data)
+void _9p_rdma_process_request(struct _9p_request_data *req9p)
 {
 	uint32_t msglen;
 	int rc = 0;
@@ -157,8 +155,7 @@ void _9p_rdma_process_request(struct _9p_request_data *req9p,
 			     "Received 9P/RDMA message of size %u",
 			     msglen);
 
-		rc = _9p_process_buffer(req9p, worker_data, dataout->data,
-					&dataout->size);
+		rc = _9p_process_buffer(req9p, dataout->data, &dataout->size);
 		if (rc != 1) {
 			LogMajor(COMPONENT_9P,
 				 "Could not process 9P buffer on trans %p",
@@ -200,7 +197,7 @@ void _9p_rdma_callback_recv(msk_trans_t *trans, msk_data_t *data, void *arg)
 	u16 tag = 0;
 	char *_9pmsg = NULL;
 
-	req = pool_alloc(request_pool, NULL);
+	req = pool_alloc(request_pool);
 
 	req->rtype = _9P_REQUEST;
 	req->r_u._9p._9pmsg = _9pmsg;

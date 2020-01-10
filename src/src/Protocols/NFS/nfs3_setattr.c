@@ -41,7 +41,6 @@
 #include "nfs4.h"
 #include "mount.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_exports.h"
 #include "nfs_creds.h"
 #include "nfs_proto_functions.h"
@@ -55,7 +54,6 @@
  * Implements the NFSPROC3_SETATTR function.
  *
  * @param[in]  arg     NFS arguments union
- * @param[in]  worker  Data for worker thread
  * @param[in]  req     SVC request related to this call
  * @param[out] res     Structure to contain the result of the call
  *
@@ -65,17 +63,17 @@
  *
  */
 
-int nfs3_setattr(nfs_arg_t *arg,
-		 nfs_worker_data_t *worker,
-		 struct svc_req *req, nfs_res_t *res)
+int nfs3_setattr(nfs_arg_t *arg, struct svc_req *req, nfs_res_t *res)
 {
 	struct attrlist setattr;
-	cache_entry_t *entry = NULL;
+	struct fsal_obj_handle *obj = NULL;
 	pre_op_attr pre_attr = {
 		.attributes_follow = false
 	};
-	cache_inode_status_t cache_status = CACHE_INODE_SUCCESS;
+	fsal_status_t fsal_status = {0, 0};
 	int rc = NFS_REQ_OK;
+
+	memset(&setattr, 0, sizeof(setattr));
 
 	if (isDebug(COMPONENT_NFSPROTO)) {
 		char str[LEN_FH_STR];
@@ -96,12 +94,14 @@ int nfs3_setattr(nfs_arg_t *arg,
 	res->res_setattr3.SETATTR3res_u.resfail.obj_wcc.after.
 	    attributes_follow = FALSE;
 
-	entry = nfs3_FhandleToCache(&arg->arg_setattr3.object,
+	obj = nfs3_FhandleToCache(&arg->arg_setattr3.object,
 				    &res->res_setattr3.status,
 				    &rc);
 
-	if (entry == NULL) {
+	if (obj == NULL) {
 		/* Status and rc have been set by nfs3_FhandleToCache */
+		LogFullDebug(COMPONENT_NFSPROTO,
+			     "nfs3_FhandleToCache failed");
 		goto out;
 	}
 
@@ -113,10 +113,12 @@ int nfs3_setattr(nfs_arg_t *arg,
 	if (nfs_in_grace()) {
 		res->res_setattr3.status = NFS3ERR_JUKEBOX;
 		rc = NFS_REQ_OK;
+		LogFullDebug(COMPONENT_NFSPROTO,
+			     "nfs_in_grace is true");
 		goto out;
 	}
 
-	nfs_SetPreOpAttr(entry, &pre_attr);
+	nfs_SetPreOpAttr(obj, &pre_attr);
 
 	if (arg->arg_setattr3.guard.check) {
 		/* This pack of lines implements the "guard check" setattr. This
@@ -138,6 +140,8 @@ int nfs3_setattr(nfs_arg_t *arg,
 
 			res->res_setattr3.status = NFS3ERR_NOT_SYNC;
 			rc = NFS_REQ_OK;
+			LogFullDebug(COMPONENT_NFSPROTO,
+				     "guard check failed");
 			goto out;
 		}
 	}
@@ -147,10 +151,12 @@ int nfs3_setattr(nfs_arg_t *arg,
 				    &arg->arg_setattr3.new_attributes)) {
 		res->res_setattr3.status = NFS3ERR_INVAL;
 		rc = NFS_REQ_OK;
+		LogFullDebug(COMPONENT_NFSPROTO,
+			     "nfs3_Sattr_To_FSALattr failed");
 		goto out;
 	}
 
-	if (setattr.mask != 0) {
+	if (setattr.valid_mask != 0) {
 		/* If owner or owner_group are set, and the credential was
 		 * squashed, then we must squash the set owner and owner_group.
 		 */
@@ -159,24 +165,31 @@ int nfs3_setattr(nfs_arg_t *arg,
 		if (arg->arg_setattr3.new_attributes.size.set_it) {
 			res->res_setattr3.status = nfs3_Errno_state(
 					state_share_anonymous_io_start(
-						entry,
+						obj,
 						OPEN4_SHARE_ACCESS_WRITE,
 						SHARE_BYPASS_V3_WRITE));
 
-			if (res->res_setattr3.status != NFS3_OK)
+			if (res->res_setattr3.status != NFS3_OK) {
+				LogFullDebug(COMPONENT_NFSPROTO,
+					     "state_share_anonymous_io_start failed");
 				goto out_fail;
+			}
 		}
 
-		cache_status = cache_inode_setattr(entry,
-						   &setattr,
-						   false);
+		/* For now we don't look for states, so indicate bypass so
+		 * we will get through an NLM_SHARE with deny.
+		 */
+		fsal_status = fsal_setattr(obj, true, NULL, &setattr);
 
 		if (arg->arg_setattr3.new_attributes.size.set_it)
-			state_share_anonymous_io_done(entry,
+			state_share_anonymous_io_done(obj,
 						      OPEN4_SHARE_ACCESS_WRITE);
 
-		if (cache_status != CACHE_INODE_SUCCESS) {
-			res->res_setattr3.status = nfs3_Errno(cache_status);
+		if (FSAL_IS_ERROR(fsal_status)) {
+			res->res_setattr3.status =
+				nfs3_Errno_status(fsal_status);
+			LogFullDebug(COMPONENT_NFSPROTO,
+				     "fsal_setattr failed");
 			goto out_fail;
 		}
 	}
@@ -185,40 +198,45 @@ int nfs3_setattr(nfs_arg_t *arg,
 	/* Build Weak Cache Coherency data */
 	res->res_setattr3.status = NFS3_OK;
 	if (arg->arg_setattr3.new_attributes.size.set_it
-	    && !(setattr.mask ^ (ATTR_SPACEUSED | ATTR_SIZE))) {
+	    && !(setattr.valid_mask ^ (ATTR_SPACEUSED | ATTR_SIZE))) {
 		res->res_setattr3.SETATTR3res_u.resfail.obj_wcc.before.
 		    attributes_follow = FALSE;
 		res->res_setattr3.SETATTR3res_u.resfail.obj_wcc.after.
 		    attributes_follow = FALSE;
 	} else {
-		nfs_SetWccData(&pre_attr, entry,
+		nfs_SetWccData(&pre_attr, obj,
 			       &res->res_setattr3.SETATTR3res_u.resok.obj_wcc);
 	}
 
 	rc = NFS_REQ_OK;
+
  out:
+
+	/* Release the attributes (may release an inherited ACL) */
+	fsal_release_attrs(&setattr);
+
 	/* return references */
-	if (entry)
-		cache_inode_put(entry);
+	if (obj)
+		obj->obj_ops.put_ref(obj);
+
+	LogDebug(COMPONENT_NFSPROTO,
+		 "Result %s%s",
+		 nfsstat3_to_str(res->res_setattr3.status),
+		 rc == NFS_REQ_DROP ? " Dropping response" : "");
 
 	return rc;
 
  out_fail:
-	LogFullDebug(COMPONENT_NFSPROTO, "nfs_Setattr: failed");
 
-	nfs_SetWccData(&pre_attr, entry,
+	nfs_SetWccData(&pre_attr, obj,
 		       &res->res_setattr3.SETATTR3res_u.resfail.obj_wcc);
 
-	if (nfs_RetryableError(cache_status)) {
+	if (nfs_RetryableError(fsal_status.major)) {
+		/* Drop retryable request. */
 		rc = NFS_REQ_DROP;
-		goto out;
 	}
 
-	/* return references */
-	if (entry)
-		cache_inode_put(entry);
-
-	return rc;
+	goto out;
 }				/* nfs3_setattr */
 
 /**
@@ -231,5 +249,5 @@ int nfs3_setattr(nfs_arg_t *arg,
 
 void nfs3_setattr_free(nfs_res_t *res)
 {
-	return;
+	/* Nothing to do here */
 }

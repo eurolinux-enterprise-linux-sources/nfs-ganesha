@@ -73,7 +73,6 @@ enum config_type {
 	CONFIG_PATH,
 	CONFIG_LIST,
 	CONFIG_ENUM,
-	CONFIG_ENUM_SET,
 	CONFIG_TOKEN,
 	CONFIG_BOOL,
 	CONFIG_BOOLBIT,
@@ -106,7 +105,7 @@ struct config_error_type {
 	bool parse:1;		/*< parser rules */
 	bool init:1;		/*< block initialization */
 	bool fsal:1;		/*< fsal load failure */
-	bool export:1;		/*< export create failure */
+	bool export_:1;		/*< export create failure */
 	bool resource:1;	/*< system resource */
 	bool unique:1;		/*< unique block/param */
 	bool invalid:1;		/*< invalid param value */
@@ -115,6 +114,8 @@ struct config_error_type {
 	bool exists:1;		/*< block already exists */
 	bool internal:1;        /*< internal error */
 	bool bogus:1;		/*< bogus (deprecated?) param */
+	bool dispose:1;		/*< Not actually an error, but we need to
+				    dispose of the config item anyway. */
 	uint32_t errors;	/*< cumulative error count for parse+proc */
 	char *diag_buf;		/*< buffer for scan+parse+processing msgs */
 	size_t diag_buf_size;	/*< size of diag buffer used by memstream */
@@ -141,7 +142,7 @@ static inline bool config_error_is_fatal(struct config_error_type *err_type)
 static inline bool config_error_is_crit(struct config_error_type *err_type)
 {
 	return config_error_is_fatal(err_type) || err_type->internal ||
-		err_type->invalid || err_type->export || err_type->missing;
+		err_type->invalid || err_type->export_ || err_type->missing;
 }
 
 /**
@@ -151,7 +152,7 @@ static inline bool config_error_is_crit(struct config_error_type *err_type)
 static inline bool config_error_is_harmless(struct config_error_type *err_type)
 {
 	return !(config_error_is_crit(err_type) ||
-		 err_type->unique || err_type->exists);
+		 err_type->unique || err_type->exists || err_type->dispose);
 }
 
 /**
@@ -331,7 +332,6 @@ struct config_item {
 			uint32_t def;
 			uint32_t mask;
 			struct config_item_list *tokens;
-			uint32_t bit;
 			size_t set_off;
 		} lst;
 		struct { /* CONFIG_BOOLBIT */
@@ -532,26 +532,10 @@ struct config_item {
 	  .off = offsetof(struct _struct_, _mem_)   \
 	}
 
-#define CONF_ITEM_ENUM(_name_, _def_, _tokens_, _struct_, _mem_) \
-	{ .name = _name_,			    \
-	  .type = CONFIG_ENUM,			    \
-	  .u.lst.def = _def_,			    \
-	  .u.lst.tokens = _tokens_,		    \
-	  .off = offsetof(struct _struct_, _mem_)   \
-	}
-
-#define CONF_ITEM_ENUM_SET(_name_, _def_, _tokens_, _struct_, _mem_, \
-			   _bit_, _set_)		   \
-	{ .name = _name_,			    \
-	  .type = CONFIG_ENUM_SET,		    \
-	  .flags = CONFIG_MARK_SET,			\
-	  .u.lst.def = _def_,			    \
-	  .u.lst.mask = UINT32_MAX,		    \
-	  .u.lst.tokens = _tokens_,		    \
-	  .u.lst.bit = _bit_,			    \
-	  .u.lst.set_off = offsetof(struct _struct_, _set_),   \
-	  .off = offsetof(struct _struct_, _mem_)   \
-	}
+/* Use CONF_ITEM_TOKEN for a variable that is set to a single enum
+ * value. The CONF_ITEM_ENUM_* macros are for setting one or more
+ * bits within a field (I know, a bit confusing...).
+ */
 
 #define CONF_ITEM_ENUM_BITS(_name_, _def_, _mask_, _tokens_, _struct_, _mem_) \
 	{ .name = _name_,			    \
@@ -570,15 +554,6 @@ struct config_item {
 	  .u.lst.def = _def_,			    \
 	  .u.lst.mask = _mask_,			    \
 	  .u.lst.set_off = offsetof(struct _struct_, _set_),   \
-	  .u.lst.tokens = _tokens_,		    \
-	  .off = offsetof(struct _struct_, _mem_)   \
-	}
-
-#define CONF_UNIQ_ENUM(_name_, _def_, _tokens_, _struct_, _mem_) \
-	{ .name = _name_,			    \
-	  .type = CONFIG_ENUM,		    \
-	  .flags = CONFIG_UNIQUE,		    \
-	  .u.lst.def = _def_,			    \
 	  .u.lst.tokens = _tokens_,		    \
 	  .off = offsetof(struct _struct_, _mem_)   \
 	}

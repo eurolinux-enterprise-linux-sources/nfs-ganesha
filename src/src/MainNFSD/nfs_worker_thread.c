@@ -48,7 +48,6 @@
 #include "fsal.h"
 #include "rquota.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_exports.h"
 #include "nfs_creds.h"
 #include "nfs_proto_functions.h"
@@ -66,8 +65,6 @@
 #endif
 
 pool_t *request_pool;
-pool_t *request_data_pool;
-pool_t *dupreq_pool;
 
 static struct fridgethr *worker_fridge;
 
@@ -80,6 +77,7 @@ const nfs_function_desc_t invalid_funcdesc = {
 	.dispatch_behaviour = NOTHING_SPECIAL
 };
 
+#ifdef _USE_NFS3
 const nfs_function_desc_t nfs3_func_desc[] = {
 	{
 	 .service_function = nfs_null,
@@ -265,6 +263,7 @@ const nfs_function_desc_t nfs3_func_desc[] = {
 	 (MAKES_WRITE | NEEDS_CRED | NEEDS_EXPORT | SUPPORTS_GSS)
 	 }
 };
+#endif /* _USE_NFS3 */
 
 /* Remeber that NFSv4 manages authentication though junction crossing, and
  * so does it for RO FS management (for each operation) */
@@ -378,6 +377,7 @@ const nfs_function_desc_t mnt3_func_desc[] = {
 #define nlm4_Unsupported nlm_Null
 #define nlm4_Unsupported_Free nlm_Null_Free
 
+#ifdef _USE_NLM
 const nfs_function_desc_t nlm4_func_desc[] = {
 	[NLMPROC4_NULL] = {
 			   .service_function = nlm_Null,
@@ -558,6 +558,7 @@ const nfs_function_desc_t nlm4_func_desc[] = {
 			       .funcname = "nlm4_Free_all",
 			       .dispatch_behaviour = NOTHING_SPECIAL},
 };
+#endif /* _USE_NLM */
 
 const nfs_function_desc_t rquota1_func_desc[] = {
 	[0] = {
@@ -670,26 +671,34 @@ const nfs_function_desc_t rquota2_func_desc[] = {
  *
  * @return Function vector for program.
  */
-const nfs_function_desc_t *nfs_rpc_get_funcdesc(nfs_request_data_t *reqnfs)
+const nfs_function_desc_t *nfs_rpc_get_funcdesc(nfs_request_t *reqnfs)
 {
-	struct svc_req *req = &reqnfs->req;
 	const nfs_function_desc_t *funcdesc = &invalid_funcdesc;
 
-	if (req->rq_prog == nfs_param.core_param.program[P_NFS]) {
-		funcdesc = (req->rq_vers == NFS_V3) ?
-			&nfs3_func_desc[req->rq_proc] :
-			&nfs4_func_desc[req->rq_proc];
-	} else if (req->rq_prog == nfs_param.core_param.program[P_NLM]) {
-		funcdesc = &nlm4_func_desc[req->rq_proc];
-	} else if (req->rq_prog == nfs_param.core_param.program[P_MNT]) {
+	if (reqnfs->svc.rq_prog
+	    == nfs_param.core_param.program[P_NFS]) {
+		funcdesc =
+#ifdef _USE_NFS3
+			(reqnfs->svc.rq_vers == NFS_V3) ?
+			&nfs3_func_desc[reqnfs->svc.rq_proc] :
+#endif /* _USE_NFS3 */
+			&nfs4_func_desc[reqnfs->svc.rq_proc];
+#ifdef _USE_NLM
+	} else if (reqnfs->svc.rq_prog
+		   == nfs_param.core_param.program[P_NLM]) {
+		funcdesc = &nlm4_func_desc[reqnfs->svc.rq_proc];
+#endif /* _USE_NLM */
+	} else if (reqnfs->svc.rq_prog
+		   == nfs_param.core_param.program[P_MNT]) {
 		reqnfs->lookahead.flags |= NFS_LOOKAHEAD_MOUNT;
-		funcdesc = (req->rq_vers == MOUNT_V1) ?
-			&mnt1_func_desc[req->rq_proc] :
-			&mnt3_func_desc[req->rq_proc];
-	} else if (req->rq_prog == nfs_param.core_param.program[P_RQUOTA]) {
-		funcdesc = (req->rq_vers == RQUOTAVERS) ?
-			&rquota1_func_desc[req->rq_proc] :
-			&rquota2_func_desc[req->rq_proc];
+		funcdesc = (reqnfs->svc.rq_vers == MOUNT_V1) ?
+			&mnt1_func_desc[reqnfs->svc.rq_proc] :
+			&mnt3_func_desc[reqnfs->svc.rq_proc];
+	} else if (reqnfs->svc.rq_prog
+		   == nfs_param.core_param.program[P_RQUOTA]) {
+		funcdesc = (reqnfs->svc.rq_vers == RQUOTAVERS) ?
+			&rquota1_func_desc[reqnfs->svc.rq_proc] :
+			&rquota2_func_desc[reqnfs->svc.rq_proc];
 	}
 	return funcdesc;
 }
@@ -697,49 +706,64 @@ const nfs_function_desc_t *nfs_rpc_get_funcdesc(nfs_request_data_t *reqnfs)
 /**
  * @brief Main RPC dispatcher routine
  *
- * @param[in,out] req         NFS request
- * @param[in,out] worker_data Worker thread context
+ * @param[in,out] reqdata	NFS request
  *
  */
-static void nfs_rpc_execute(request_data_t *req,
-			    nfs_worker_data_t *worker_data)
+void nfs_rpc_execute(request_data_t *reqdata)
 {
-	nfs_request_data_t *reqnfs = req->r_u.nfs;
-	nfs_arg_t *arg_nfs = &reqnfs->arg_nfs;
+	const char *client_ip = "<unknown client>";
+	const char *progname = "unknown";
+	const nfs_function_desc_t *reqdesc = reqdata->r_u.req.funcdesc;
+	nfs_arg_t *arg_nfs = &reqdata->r_u.req.arg_nfs;
+	SVCXPRT *xprt = reqdata->r_u.req.svc.rq_xprt;
 	nfs_res_t *res_nfs;
-	int exportid = -1;
-	struct svc_req *svcreq = &reqnfs->req;
-	SVCXPRT *xprt = reqnfs->xprt;
 	struct export_perms export_perms;
-	int protocol_options = 0;
 	struct user_cred user_credentials;
 	struct req_op_context req_ctx;
-	const char *client_ip = "<unknown client>";
 	dupreq_status_t dpq_status;
 	struct timespec timer_start;
-	int port, rc = NFS_REQ_OK;
 	enum auth_stat auth_rc;
+	int port;
+	int rc = NFS_REQ_OK;
+#ifdef _USE_NFS3
+	int exportid = -1;
+#endif /* _USE_NFS3 */
 	bool slocked = false;
-	const char *progname = "unknown";
 
 #ifdef USE_LTTNG
-	tracepoint(nfs_rpc, start, req);
+	tracepoint(nfs_rpc, start, reqdata);
 #endif
 
-	/* Initialize permissions to allow nothing */
-	export_perms.options = 0;
-	export_perms.anonymous_uid = (uid_t) ANON_UID;
-	export_perms.anonymous_gid = (gid_t) ANON_GID;
+#if defined(HAVE_BLKIN)
+	BLKIN_TIMESTAMP(
+		&reqdata->r_u.req.svc.bl_trace,
+		&reqdata->r_u.req.svc.rq_xprt->blkin.endp,
+		"rpc_execute-start");
+#endif
 
 	/* set up the request context
 	 */
-	memset(&req_ctx, 0, sizeof(struct req_op_context));
+	memset(&export_perms, 0, sizeof(export_perms));
+	memset(&req_ctx, 0, sizeof(req_ctx));
 	op_ctx = &req_ctx;
 	op_ctx->creds = &user_credentials;
-	op_ctx->caller_addr = &worker_data->hostaddr;
-	op_ctx->nfs_vers = svcreq->rq_vers;
-	op_ctx->req_type = req->rtype;
+	op_ctx->caller_addr = (sockaddr_t *)svc_getrpccaller(xprt);
+	op_ctx->nfs_vers = reqdata->r_u.req.svc.rq_vers;
+	op_ctx->req_type = reqdata->rtype;
 	op_ctx->export_perms = &export_perms;
+
+	/* Set up initial export permissions that don't allow anything. */
+	export_check_access();
+
+	/* start the processing clock
+	 * we measure all time stats as intervals (elapsed nsecs) from
+	 * server boot time.  This gets high precision with simple 64 bit math.
+	 */
+	now(&timer_start);
+	op_ctx->start_time = timespec_diff(&ServerBootTime, &timer_start);
+	op_ctx->queue_wait =
+	    op_ctx->start_time - timespec_diff(&ServerBootTime,
+					       &reqdata->time_queued);
 
 	/* Initialized user_credentials */
 	init_credentials();
@@ -753,100 +777,79 @@ static void nfs_rpc_execute(request_data_t *req,
 	 * this, we should sprint a buffer once, in when we're setting up
 	 * xprt private data. */
 
-/* can I change this to be call by ref instead of copy?
- * the xprt is valid for the lifetime here
- */
-	if (copy_xprt_addr(op_ctx->caller_addr, xprt) == 0) {
-		LogDebug(COMPONENT_DISPATCH,
-			 "copy_xprt_addr failed for Program %d, Version %d, "
-			 "Function %d", (int)svcreq->rq_prog,
-			 (int)svcreq->rq_vers, (int)svcreq->rq_proc);
-		/* XXX move lock wrapper into RPC API */
-		DISP_SLOCK(xprt);
-		svcerr_systemerr(xprt, svcreq);
-		DISP_SUNLOCK(xprt);
-		goto out;
-	}
-
 	port = get_port(op_ctx->caller_addr);
 	op_ctx->client = get_gsh_client(op_ctx->caller_addr, false);
 	if (op_ctx->client == NULL) {
 		LogDebug(COMPONENT_DISPATCH,
-			 "Cannot get client block for Program %d, Version %d, "
-			 "Function %d", (int)svcreq->rq_prog,
-			 (int)svcreq->rq_vers, (int)svcreq->rq_proc);
+			 "Cannot get client block for Program %d, Version %d, Function %d",
+			 (int)reqdata->r_u.req.svc.rq_prog,
+			 (int)reqdata->r_u.req.svc.rq_vers,
+			 (int)reqdata->r_u.req.svc.rq_proc);
 	} else {
 		/* Set the Client IP for this thread */
 		SetClientIP(op_ctx->client->hostaddr_str);
 		client_ip = op_ctx->client->hostaddr_str;
 		LogDebug(COMPONENT_DISPATCH,
-			 "Request from %s for Program %d, Version %d, Function %d "
-			 "has xid=%u", client_ip,
-			 (int)svcreq->rq_prog, (int)svcreq->rq_vers,
-			 (int)svcreq->rq_proc, svcreq->rq_xid);
+			 "Request from %s for Program %d, Version %d, Function %d has xid=%u",
+			 client_ip,
+			 (int)reqdata->r_u.req.svc.rq_prog,
+			 (int)reqdata->r_u.req.svc.rq_vers,
+			 (int)reqdata->r_u.req.svc.rq_proc,
+			 reqdata->r_u.req.svc.rq_xid);
 	}
 
-	/* start the processing clock
-	 * we measure all time stats as intervals (elapsed nsecs) from
-	 * server boot time.  This gets high precision with simple 64 bit math.
-	 */
-	now(&timer_start);
-	op_ctx->start_time = timespec_diff(&ServerBootTime, &timer_start);
-	op_ctx->queue_wait =
-	    op_ctx->start_time - timespec_diff(&ServerBootTime,
-					       &req->time_queued);
-
+#if defined(HAVE_BLKIN)
+	BLKIN_TIMESTAMP(
+		&reqdata->r_u.req.svc.bl_trace,
+		&reqdata->r_u.req.svc.rq_xprt->blkin.endp,
+		"rpc_execute-have-clientid");
+#endif
 	/* If req is uncacheable, or if req is v41+, nfs_dupreq_start will do
 	 * nothing but allocate a result object and mark the request (ie, the
 	 * path is short, lockless, and does no hash/search). */
-	dpq_status = nfs_dupreq_start(reqnfs, svcreq);
-	res_nfs = reqnfs->res_nfs;
+	dpq_status = nfs_dupreq_start(&reqdata->r_u.req, &reqdata->r_u.req.svc);
+	res_nfs = reqdata->r_u.req.res_nfs;
 	if (dpq_status == DUPREQ_SUCCESS) {
 		/* A new request, continue processing it. */
 		LogFullDebug(COMPONENT_DISPATCH,
-			     "Current request is not duplicate or "
-			     "not cacheable.");
+			     "Current request is not duplicate or not cacheable.");
 	} else {
 		switch (dpq_status) {
 		case DUPREQ_EXISTS:
 			/* Found the request in the dupreq cache.
 			 * Send cached reply. */
 			LogFullDebug(COMPONENT_DISPATCH,
-				     "DUP: DupReq Cache Hit: using previous "
-				     "reply, rpcxid=%u", svcreq->rq_xid);
+				     "DUP: DupReq Cache Hit: using previous reply, rpcxid=%u",
+				     reqdata->r_u.req.svc.rq_xid);
 
 			LogFullDebug(COMPONENT_DISPATCH,
 				     "Before svc_sendreply on socket %d (dup req)",
 				     xprt->xp_fd);
 
 			DISP_SLOCK(xprt);
-			if (svc_sendreply(
-				    xprt, svcreq,
-				    reqnfs->funcdesc->xdr_encode_func,
-			     (caddr_t) res_nfs) == false) {
+			if (!svc_sendreply(xprt, &reqdata->r_u.req.svc,
+					   reqdesc->xdr_encode_func,
+					   (caddr_t) res_nfs)) {
 				LogDebug(COMPONENT_DISPATCH,
-					 "NFS DISPATCHER: FAILURE: Error while calling "
-					 "svc_sendreply on a duplicate request. rpcxid=%u "
-					 "socket=%d function:%s client:%s program:%d "
-					 "nfs version:%d proc:%d xid:%u errno: %d",
-					 svcreq->rq_xid, xprt->xp_fd,
-					 reqnfs->funcdesc->funcname,
+					 "NFS DISPATCHER: FAILURE: Error while calling svc_sendreply on a duplicate request. rpcxid=%u socket=%d function:%s client:%s program:%d nfs version:%d proc:%d xid:%u errno: %d",
+					 reqdata->r_u.req.svc.rq_xid,
+					 xprt->xp_fd,
+					 reqdesc->funcname,
 					 client_ip,
-					 (int)svcreq->rq_prog,
-					 (int)svcreq->rq_vers,
-					 (int)svcreq->rq_proc,
-					 svcreq->rq_xid,
+					 (int)reqdata->r_u.req.svc.rq_prog,
+					 (int)reqdata->r_u.req.svc.rq_vers,
+					 (int)reqdata->r_u.req.svc.rq_proc,
+					 reqdata->r_u.req.svc.rq_xid,
 					 errno);
-				svcerr_systemerr(xprt, svcreq);
+				svcerr_systemerr(xprt, &reqdata->r_u.req.svc);
 			}
 			break;
 
 			/* Another thread owns the request */
 		case DUPREQ_BEING_PROCESSED:
 			LogFullDebug(COMPONENT_DISPATCH,
-				     "DUP: Request xid=%u is already being processed; the "
-				     "active thread will reply",
-				     svcreq->rq_xid);
+				     "DUP: Request xid=%u is already being processed; the active thread will reply",
+				     reqdata->r_u.req.svc.rq_xid);
 			/* Free the arguments */
 			DISP_SLOCK(xprt);
 			/* Ignore the request, send no error */
@@ -856,10 +859,9 @@ static void nfs_rpc_execute(request_data_t *req,
 			 * the duplicate request cache */
 		case DUPREQ_ERROR:
 			LogCrit(COMPONENT_DISPATCH,
-				"DUP: Did not find the request in the duplicate request cache "
-				"and couldn't add the request.");
+				"DUP: Did not find the request in the duplicate request cache and couldn't add the request.");
 			DISP_SLOCK(xprt);
-			svcerr_systemerr(xprt, svcreq);
+			svcerr_systemerr(xprt, &reqdata->r_u.req.svc);
 			break;
 
 			/* oom */
@@ -867,18 +869,17 @@ static void nfs_rpc_execute(request_data_t *req,
 			LogCrit(COMPONENT_DISPATCH,
 				"DUP: Cannot process request, not enough memory available!");
 			DISP_SLOCK(xprt);
-			svcerr_systemerr(xprt, svcreq);
+			svcerr_systemerr(xprt, &reqdata->r_u.req.svc);
 			break;
 
 		default:
 			LogCrit(COMPONENT_DISPATCH,
-				"DUP: Unknown duplicate request cache status. This should never "
-				"be reached!");
+				"DUP: Unknown duplicate request cache status. This should never be reached!");
 			DISP_SLOCK(xprt);
-			svcerr_systemerr(xprt, svcreq);
+			svcerr_systemerr(xprt, &reqdata->r_u.req.svc);
 			break;
 		}
-		server_stats_nfs_done(req, rc, true);
+		server_stats_nfs_done(reqdata, rc, true);
 		goto freeargs;
 	}
 
@@ -888,11 +889,12 @@ static void nfs_rpc_execute(request_data_t *req,
 	 * NFS v2 is set to invalid_funcdesc in nfs_rpc_get_funcdesc()
 	 */
 
-	if (reqnfs->funcdesc == &invalid_funcdesc
-	    || svcreq->rq_proc == NFSPROC_NULL)
+	if (reqdesc == &invalid_funcdesc
+	    || reqdata->r_u.req.svc.rq_proc == NFSPROC_NULL)
 		goto null_op;
 	/* Get the export entry */
-	if (svcreq->rq_prog == nfs_param.core_param.program[P_NFS]) {
+	if (reqdata->r_u.req.svc.rq_prog
+	    == nfs_param.core_param.program[P_NFS]) {
 		/* The NFSv3 functions' arguments always begin with the file
 		 * handle (but not the NULL function).  This hook is used to
 		 * get the fhandle with the arguments and so determine the
@@ -901,9 +903,10 @@ static void nfs_rpc_execute(request_data_t *req,
 		 */
 
 		progname = "NFS";
-		if (svcreq->rq_vers == NFS_V3) {
-			protocol_options |= EXPORT_OPTION_NFSV3;
+#ifdef _USE_NFS3
+		if (reqdata->r_u.req.svc.rq_vers == NFS_V3) {
 			exportid = nfs3_FhandleToExportId((nfs_fh3 *) arg_nfs);
+
 			if (exportid < 0) {
 				LogInfo(COMPONENT_DISPATCH,
 					"NFS3 Request from client %s has badly formed handle",
@@ -915,8 +918,10 @@ static void nfs_rpc_execute(request_data_t *req,
 				rc = NFS_REQ_OK;
 				goto req_error;
 			}
-			op_ctx->export = get_gsh_export(exportid);
-			if (op_ctx->export == NULL) {
+
+			op_ctx->ctx_export = get_gsh_export(exportid);
+
+			if (op_ctx->ctx_export == NULL) {
 				LogInfoAlt(COMPONENT_DISPATCH, COMPONENT_EXPORT,
 					"NFS3 Request from client %s has invalid export %d",
 					client_ip, exportid);
@@ -926,37 +931,25 @@ static void nfs_rpc_execute(request_data_t *req,
 				rc = NFS_REQ_OK;
 				goto req_error;
 			}
-			op_ctx->fsal_export = op_ctx->export->fsal_export;
-			if ((op_ctx->export->export_perms.
-			     options & EXPORT_OPTION_NFSV3) == 0)
-				goto handle_err;
-			/* privileged port only makes sense for V3.
-			 * V4 can go thru firewalls and so all bets are off
-			 */
-			if ((op_ctx->export->export_perms.
-			     options & EXPORT_OPTION_PRIVILEGED_PORT)
-			    && (port >= IPPORT_RESERVED)) {
-				LogInfoAlt(COMPONENT_DISPATCH, COMPONENT_EXPORT,
-					"Port %d is too high for this export entry, rejecting client",
-					port);
-				auth_rc = AUTH_TOOWEAK;
-				goto auth_failure;
-			}
+
+			op_ctx->fsal_export = op_ctx->ctx_export->fsal_export;
 
 			LogMidDebugAlt(COMPONENT_DISPATCH, COMPONENT_EXPORT,
 				    "Found export entry for path=%s as exportid=%d",
-				    op_ctx->export->fullpath,
-				    op_ctx->export->export_id);
-		} else {	/* NFS V4 gets its own export id from the ops
-				 * in the compound */
-			protocol_options |= EXPORT_OPTION_NFSV4;
+				    op_ctx->ctx_export->fullpath,
+				    op_ctx->ctx_export->export_id);
 		}
-	} else if (svcreq->rq_prog == nfs_param.core_param.program[P_NLM]) {
+#endif /* _USE_NFS3 */
+		/* NFS V4 gets its own export id from the ops
+		 * in the compound */
+#ifdef _USE_NLM
+	} else if (reqdata->r_u.req.svc.rq_prog
+		   == nfs_param.core_param.program[P_NLM]) {
 		netobj *pfh3 = NULL;
 
-		protocol_options |= EXPORT_OPTION_NFSV3;
 		progname = "NLM";
-		switch (svcreq->rq_proc) {
+
+		switch (reqdata->r_u.req.svc.rq_proc) {
 		case NLMPROC4_NULL:
 			/* caught above and short circuited */
 		case NLMPROC4_TEST_RES:
@@ -998,11 +991,12 @@ static void nfs_rpc_execute(request_data_t *req,
 		}
 		if (pfh3 != NULL) {
 			exportid = nlm4_FhandleToExportId(pfh3);
+
 			if (exportid < 0) {
 				LogInfo(COMPONENT_DISPATCH,
 					"NLM4 Request from client %s has badly formed handle",
 					client_ip);
-				op_ctx->export = NULL;
+				op_ctx->ctx_export = NULL;
 				op_ctx->fsal_export = NULL;
 
 				/* We need to send a NLM4_STALE_FH response
@@ -1013,8 +1007,9 @@ static void nfs_rpc_execute(request_data_t *req,
 				 * can respond to ASYNC calls.
 				 */
 			} else {
-				op_ctx->export = get_gsh_export(exportid);
-				if (op_ctx->export == NULL) {
+				op_ctx->ctx_export = get_gsh_export(exportid);
+
+				if (op_ctx->ctx_export == NULL) {
 					LogInfoAlt(COMPONENT_DISPATCH,
 						   COMPONENT_EXPORT,
 						   "NLM4 Request from client %s has invalid export %d",
@@ -1031,27 +1026,26 @@ static void nfs_rpc_execute(request_data_t *req,
 					 */
 					op_ctx->fsal_export = NULL;
 				} else {
-					if ((op_ctx->export->export_perms
-					     .options & EXPORT_OPTION_NFSV3)
-					    == 0)
-						goto handle_err;
 					op_ctx->fsal_export =
-					    op_ctx->export->fsal_export;
+					    op_ctx->ctx_export->fsal_export;
 
 					LogMidDebugAlt(COMPONENT_DISPATCH,
 						COMPONENT_EXPORT,
 						"Found export entry for dirname=%s as exportid=%d",
-						op_ctx->export->fullpath,
-						op_ctx->export->export_id);
+						op_ctx->ctx_export->fullpath,
+						op_ctx->ctx_export->export_id);
 				}
 			}
 		}
-	} else if (svcreq->rq_prog == nfs_param.core_param.program[P_MNT]) {
+#endif /* _USE_NLM */
+	} else if (reqdata->r_u.req.svc.rq_prog
+		   == nfs_param.core_param.program[P_MNT]) {
 		progname = "MNT";
 	}
 
 	/* Only do access check if we have an export. */
-	if (op_ctx->export != NULL) {
+	if (op_ctx->ctx_export != NULL) {
+		/* We ONLY get here for NFS v3 or NLM requests with a handle */
 		xprt_type_t xprt_type = svc_get_xprt_type(xprt);
 
 		LogMidDebugAlt(COMPONENT_DISPATCH, COMPONENT_EXPORT,
@@ -1060,33 +1054,25 @@ static void nfs_rpc_execute(request_data_t *req,
 
 		export_check_access();
 
-		if (export_perms.options == 0) {
+		if ((export_perms.options & EXPORT_OPTION_ACCESS_MASK) == 0) {
 			LogInfoAlt(COMPONENT_DISPATCH, COMPONENT_EXPORT,
 				"Client %s is not allowed to access Export_Id %d %s, vers=%d, proc=%d",
 				client_ip,
-				op_ctx->export->export_id,
-				op_ctx->export->fullpath,
-				(int)svcreq->rq_vers, (int)svcreq->rq_proc);
+				op_ctx->ctx_export->export_id,
+				op_ctx->ctx_export->fullpath,
+				(int)reqdata->r_u.req.svc.rq_vers,
+				(int)reqdata->r_u.req.svc.rq_proc);
 
 			auth_rc = AUTH_TOOWEAK;
 			goto auth_failure;
 		}
 
-		/* Check protocol version */
-		if ((protocol_options & EXPORT_OPTION_PROTOCOLS) == 0) {
-			LogCrit(COMPONENT_DISPATCH,
-				"Problem, request requires export but does not have a protocol version");
-
-			auth_rc = AUTH_FAILED;
-			goto auth_failure;
-		}
-
-		if ((protocol_options & export_perms.options) == 0) {
+		if ((EXPORT_OPTION_NFSV3 & export_perms.options) == 0) {
 			LogInfoAlt(COMPONENT_DISPATCH, COMPONENT_EXPORT,
 				"%s Version %d not allowed on Export_Id %d %s for client %s",
-				progname, svcreq->rq_vers,
-				op_ctx->export->export_id,
-				op_ctx->export->fullpath,
+				progname, reqdata->r_u.req.svc.rq_vers,
+				op_ctx->ctx_export->export_id,
+				op_ctx->ctx_export->fullpath,
 				client_ip);
 
 			auth_rc = AUTH_FAILED;
@@ -1100,10 +1086,10 @@ static void nfs_rpc_execute(request_data_t *req,
 			&& ((export_perms.options & EXPORT_OPTION_TCP) == 0))) {
 			LogInfoAlt(COMPONENT_DISPATCH, COMPONENT_EXPORT,
 				"%s Version %d over %s not allowed on Export_Id %d %s for client %s",
-				progname, svcreq->rq_vers,
+				progname, reqdata->r_u.req.svc.rq_vers,
 				xprt_type_to_str(xprt_type),
-				op_ctx->export->export_id,
-				op_ctx->export->fullpath,
+				op_ctx->ctx_export->export_id,
+				op_ctx->ctx_export->fullpath,
 				client_ip);
 
 			auth_rc = AUTH_FAILED;
@@ -1111,14 +1097,13 @@ static void nfs_rpc_execute(request_data_t *req,
 		}
 
 		/* Test if export allows the authentication provided */
-		if (((reqnfs->funcdesc->dispatch_behaviour & SUPPORTS_GSS)
-		      != 0) &&
-		    !export_check_security(svcreq)) {
+		if ((reqdesc->dispatch_behaviour & SUPPORTS_GSS)
+		 && !export_check_security(&reqdata->r_u.req.svc)) {
 			LogInfoAlt(COMPONENT_DISPATCH, COMPONENT_EXPORT,
 				"%s Version %d auth not allowed on Export_Id %d %s for client %s",
-				progname, svcreq->rq_vers,
-				op_ctx->export->export_id,
-				op_ctx->export->fullpath,
+				progname, reqdata->r_u.req.svc.rq_vers,
+				op_ctx->ctx_export->export_id,
+				op_ctx->ctx_export->fullpath,
 				client_ip);
 
 			auth_rc = AUTH_TOOWEAK;
@@ -1127,13 +1112,14 @@ static void nfs_rpc_execute(request_data_t *req,
 
 		/* Check if client is using a privileged port,
 		 * but only for NFS protocol */
-		if ((svcreq->rq_prog == nfs_param.core_param.program[P_NFS])
-		    && ((export_perms.options & EXPORT_OPTION_PRIVILEGED_PORT)
-			!= 0) && (port >= IPPORT_RESERVED)) {
+		if ((reqdata->r_u.req.svc.rq_prog
+		     == nfs_param.core_param.program[P_NFS])
+		 && (export_perms.options & EXPORT_OPTION_PRIVILEGED_PORT)
+		 && (port >= IPPORT_RESERVED)) {
 			LogInfoAlt(COMPONENT_DISPATCH, COMPONENT_EXPORT,
 				"Non-reserved Port %d is not allowed on Export_Id %d %s for client %s",
-				port, op_ctx->export->export_id,
-				op_ctx->export->fullpath,
+				port, op_ctx->ctx_export->export_id,
+				op_ctx->ctx_export->fullpath,
 				client_ip);
 
 			auth_rc = AUTH_TOOWEAK;
@@ -1145,17 +1131,19 @@ static void nfs_rpc_execute(request_data_t *req,
 	 * It is now time for checking if export list allows the machine
 	 * to perform the request
 	 */
-	if (op_ctx->export != NULL
-	    && (reqnfs->funcdesc->dispatch_behaviour & MAKES_IO) != 0
-	    && (export_perms.options & EXPORT_OPTION_RW_ACCESS) == 0) {
+	if (op_ctx->ctx_export != NULL
+	    && (reqdesc->dispatch_behaviour & MAKES_IO)
+	    && !(export_perms.options & EXPORT_OPTION_RW_ACCESS)) {
 		/* Request of type MDONLY_RO were rejected at the
 		 * nfs_rpc_dispatcher level.
 		 * This is done by replying EDQUOT
 		 * (this error is known for not disturbing
 		 * the client's requests cache)
 		 */
-		if (svcreq->rq_prog == nfs_param.core_param.program[P_NFS])
-			switch (svcreq->rq_vers) {
+		if (reqdata->r_u.req.svc.rq_prog
+		    == nfs_param.core_param.program[P_NFS])
+			switch (reqdata->r_u.req.svc.rq_vers) {
+#ifdef _USE_NFS3
 			case NFS_V3:
 				LogDebugAlt(COMPONENT_DISPATCH,
 					    COMPONENT_EXPORT,
@@ -1163,6 +1151,7 @@ static void nfs_rpc_execute(request_data_t *req,
 				res_nfs->res_getattr3.status = NFS3ERR_DQUOT;
 				rc = NFS_REQ_OK;
 				break;
+#endif /* _USE_NFS3 */
 
 			default:
 				LogDebugAlt(COMPONENT_DISPATCH,
@@ -1175,13 +1164,15 @@ static void nfs_rpc_execute(request_data_t *req,
 				 "Dropping IO request on an MD Only export");
 			rc = NFS_REQ_DROP;
 		}
-	} else if (op_ctx->export != NULL
-		   && (reqnfs->funcdesc->dispatch_behaviour & MAKES_WRITE) != 0
-		   && (export_perms.
-		       options & (EXPORT_OPTION_WRITE_ACCESS |
-				  EXPORT_OPTION_MD_WRITE_ACCESS)) == 0) {
-		if (svcreq->rq_prog == nfs_param.core_param.program[P_NFS])
-			switch (svcreq->rq_vers) {
+	} else if (op_ctx->ctx_export != NULL
+		   && (reqdesc->dispatch_behaviour & MAKES_WRITE)
+		   && (export_perms.options
+		       & (EXPORT_OPTION_WRITE_ACCESS
+			| EXPORT_OPTION_MD_WRITE_ACCESS)) == 0) {
+		if (reqdata->r_u.req.svc.rq_prog
+		    == nfs_param.core_param.program[P_NFS])
+			switch (reqdata->r_u.req.svc.rq_vers) {
+#ifdef _USE_NFS3
 			case NFS_V3:
 				LogDebugAlt(COMPONENT_DISPATCH,
 					    COMPONENT_EXPORT,
@@ -1189,6 +1180,7 @@ static void nfs_rpc_execute(request_data_t *req,
 				res_nfs->res_getattr3.status = NFS3ERR_ROFS;
 				rc = NFS_REQ_OK;
 				break;
+#endif /* _USE_NFS3 */
 
 			default:
 				LogDebugAlt(COMPONENT_DISPATCH,
@@ -1201,29 +1193,29 @@ static void nfs_rpc_execute(request_data_t *req,
 				 "Dropping request on a Read Only export");
 			rc = NFS_REQ_DROP;
 		}
-	} else if (op_ctx->export != NULL
-		   && (export_perms.
-		       options & (EXPORT_OPTION_READ_ACCESS |
-				  EXPORT_OPTION_MD_READ_ACCESS)) == 0) {
+	} else if (op_ctx->ctx_export != NULL
+		   && (export_perms.options
+		       & (EXPORT_OPTION_READ_ACCESS
+			 | EXPORT_OPTION_MD_READ_ACCESS)) == 0) {
 		LogInfoAlt(COMPONENT_DISPATCH, COMPONENT_EXPORT,
 			"Client %s is not allowed to access Export_Id %d %s, vers=%d, proc=%d",
-			client_ip, op_ctx->export->export_id,
-			op_ctx->export->fullpath, (int)svcreq->rq_vers,
-			(int)svcreq->rq_proc);
+			client_ip, op_ctx->ctx_export->export_id,
+			op_ctx->ctx_export->fullpath,
+			(int)reqdata->r_u.req.svc.rq_vers,
+			(int)reqdata->r_u.req.svc.rq_proc);
 		auth_rc = AUTH_TOOWEAK;
 		goto auth_failure;
 	} else {
 		/* Get user credentials */
-		if (reqnfs->funcdesc->dispatch_behaviour & NEEDS_CRED) {
-			if ((reqnfs->funcdesc->dispatch_behaviour &
-			     NEEDS_EXPORT) == 0) {
+		if (reqdesc->dispatch_behaviour & NEEDS_CRED) {
+			if (!(reqdesc->dispatch_behaviour & NEEDS_EXPORT)) {
 				/* If NEEDS_CRED and not NEEDS_EXPORT,
 				 * don't squash
 				 */
 				export_perms.options = EXPORT_OPTION_ROOT;
 			}
 
-			if (nfs_req_creds(svcreq) != NFS4_OK) {
+			if (nfs_req_creds(&reqdata->r_u.req.svc) != NFS4_OK) {
 				LogInfoAlt(COMPONENT_DISPATCH, COMPONENT_EXPORT,
 					"could not get uid and gid, rejecting client %s",
 					client_ip);
@@ -1234,7 +1226,7 @@ static void nfs_rpc_execute(request_data_t *req,
 		}
 
 		/* processing
-		 * At this point, op_ctx->export has one of the following
+		 * At this point, op_ctx->ctx_export has one of the following
 		 * conditions:
 		 * non-NULL - valid handle for NFS v3 or NLM functions
 		 *            that take handles
@@ -1260,42 +1252,73 @@ static void nfs_rpc_execute(request_data_t *req,
  null_op:
 
 #ifdef USE_LTTNG
-		tracepoint(nfs_rpc, op_start, req,
-			   reqnfs->funcdesc->funcname,
-			   (op_ctx->export != NULL
-			    ? op_ctx->export->export_id : -1));
+		tracepoint(nfs_rpc, op_start, reqdata,
+			   reqdesc->funcname,
+			   (op_ctx->ctx_export != NULL
+			    ? op_ctx->ctx_export->export_id : -1));
 #endif
-		rc = reqnfs->funcdesc->service_function(arg_nfs,
-							worker_data, svcreq,
-							res_nfs);
+
+#if defined(HAVE_BLKIN)
+		BLKIN_TIMESTAMP(
+			&reqdata->r_u.req.svc.bl_trace,
+			&reqdata->r_u.req.svc.rq_xprt->blkin.endp,
+			"rpc_execute-pre-service");
+
+		BLKIN_KEYVAL_STRING(
+			&reqdata->r_u.req.svc.bl_trace,
+			&reqdata->r_u.req.svc.rq_xprt->blkin.endp,
+			"op-name",
+			reqdesc->funcname
+			);
+
+		BLKIN_KEYVAL_INTEGER(
+			&reqdata->r_u.req.svc.bl_trace,
+			&reqdata->r_u.req.svc.rq_xprt->blkin.endp,
+			"export-id",
+			(op_ctx->export != NULL)
+			? op_ctx->export->export_id : -1);
+#endif
+		rc = reqdesc->service_function(arg_nfs, &reqdata->r_u.req.svc,
+					res_nfs);
 
 #ifdef USE_LTTNG
-		tracepoint(nfs_rpc, op_end, req);
+	tracepoint(nfs_rpc, op_end, reqdata);
 #endif
 
+#if defined(HAVE_BLKIN)
+		BLKIN_TIMESTAMP(
+			&reqdata->r_u.req.svc.bl_trace,
+			&reqdata->r_u.req.svc.rq_xprt->blkin.endp,
+			"rpc_execute-post-service");
+#endif
 	}
 
+#ifdef _USE_NFS3
  req_error:
+#endif /* _USE_NFS3 */
 
 /* NFSv4 stats are handled in nfs4_compound()
  */
-	if (svcreq->rq_prog != nfs_param.core_param.program[P_NFS]
-	    || svcreq->rq_vers != NFS_V4)
-		server_stats_nfs_done(req, rc, false);
+	if (reqdata->r_u.req.svc.rq_prog != nfs_param.core_param.program[P_NFS]
+	    || reqdata->r_u.req.svc.rq_vers != NFS_V4)
+		server_stats_nfs_done(reqdata, rc, false);
 
 	/* If request is dropped, no return to the client */
 	if (rc == NFS_REQ_DROP) {
 		/* The request was dropped */
 		LogDebug(COMPONENT_DISPATCH,
 			 "Drop request rpc_xid=%u, program %u, version %u, function %u",
-			 svcreq->rq_xid, (int)svcreq->rq_prog,
-			 (int)svcreq->rq_vers, (int)svcreq->rq_proc);
+			 reqdata->r_u.req.svc.rq_xid,
+			 (int)reqdata->r_u.req.svc.rq_prog,
+			 (int)reqdata->r_u.req.svc.rq_vers,
+			 (int)reqdata->r_u.req.svc.rq_proc);
 
 		/* If the request is not normally cached, then the entry
 		 * will be removed later.  We only remove a reply that is
 		 * normally cached that has been dropped.
 		 */
-		if (nfs_dupreq_delete(svcreq) != DUPREQ_SUCCESS) {
+		if (nfs_dupreq_delete(&reqdata->r_u.req.svc)
+		    != DUPREQ_SUCCESS) {
 			LogCrit(COMPONENT_DISPATCH,
 				"Attempt to delete duplicate request failed on line %d",
 				__LINE__);
@@ -1308,19 +1331,18 @@ static void nfs_rpc_execute(request_data_t *req,
 		DISP_SLOCK(xprt);
 
 		/* encoding the result on xdr output */
-		if (svc_sendreply(
-			    xprt, svcreq, reqnfs->funcdesc->xdr_encode_func,
-		     (caddr_t) res_nfs) == false) {
+		if (!svc_sendreply(xprt, &reqdata->r_u.req.svc,
+				   reqdesc->xdr_encode_func,
+				   (caddr_t) res_nfs)) {
 			LogDebug(COMPONENT_DISPATCH,
-				 "NFS DISPATCHER: FAILURE: Error while calling "
-				 "svc_sendreply on a new request. rpcxid=%u "
-				 "socket=%d function:%s client:%s program:%d "
-				 "nfs version:%d proc:%d xid:%u errno: %d",
-				 svcreq->rq_xid, xprt->xp_fd,
-				 reqnfs->funcdesc->funcname,
+				 "NFS DISPATCHER: FAILURE: Error while calling svc_sendreply on a new request. rpcxid=%u socket=%d function:%s client:%s program:%d nfs version:%d proc:%d xid:%u errno: %d",
+				 reqdata->r_u.req.svc.rq_xid, xprt->xp_fd,
+				 reqdesc->funcname,
 				 client_ip,
-				 (int)svcreq->rq_prog, (int)svcreq->rq_vers,
-				 (int)svcreq->rq_proc, svcreq->rq_xid, errno);
+				 (int)reqdata->r_u.req.svc.rq_prog,
+				 (int)reqdata->r_u.req.svc.rq_vers,
+				 (int)reqdata->r_u.req.svc.rq_proc,
+				 reqdata->r_u.req.svc.rq_xid, errno);
 			if (xprt->xp_type != XPRT_UDP)
 				svc_destroy(xprt);
 			goto freeargs;
@@ -1333,67 +1355,70 @@ static void nfs_rpc_execute(request_data_t *req,
 
 	/* Finish any request not already deleted */
 	if (dpq_status == DUPREQ_SUCCESS)
-		dpq_status = nfs_dupreq_finish(svcreq, res_nfs);
+		dpq_status = nfs_dupreq_finish(&reqdata->r_u.req.svc, res_nfs);
 	goto freeargs;
 
- handle_err:
 	/* Reject the request for authentication reason (incompatible
 	 * file handle) */
 	if (isInfo(COMPONENT_DISPATCH) || isInfo(COMPONENT_EXPORT)) {
 		char dumpfh[1024];
+
 		sprint_fhandle3(dumpfh, (nfs_fh3 *) arg_nfs);
 		LogInfo(COMPONENT_DISPATCH,
 			"%s Request from host %s V3 not allowed on this export, proc=%d, FH=%s",
 			progname, client_ip,
-			(int)svcreq->rq_proc, dumpfh);
+			(int)reqdata->r_u.req.svc.rq_proc, dumpfh);
 	}
 	auth_rc = AUTH_FAILED;
 
  auth_failure:
 	DISP_SLOCK(xprt);
-	svcerr_auth(xprt, svcreq, auth_rc);
+	svcerr_auth(xprt, &reqdata->r_u.req.svc, auth_rc);
 	/* nb, a no-op when req is uncacheable */
-	if (nfs_dupreq_delete(svcreq) != DUPREQ_SUCCESS) {
+	if (nfs_dupreq_delete(&reqdata->r_u.req.svc) != DUPREQ_SUCCESS) {
 		LogCrit(COMPONENT_DISPATCH,
-			"Attempt to delete duplicate request failed on "
-			"line %d", __LINE__);
+			"Attempt to delete duplicate request failed on line %d",
+			__LINE__);
 	}
 
  freeargs:
-	clean_credentials();
+
 	/* XXX no need for xprt slock across SVC_FREEARGS */
 	DISP_SUNLOCK(xprt);
 
 	/* Free the allocated resources once the work is done */
 	/* Free the arguments */
-	if ((reqnfs->req.rq_vers == 2) || (reqnfs->req.rq_vers == 3)
-	    || (reqnfs->req.rq_vers == 4)) {
-		if (!SVC_FREEARGS
-		    (xprt, reqnfs->funcdesc->xdr_decode_func,
-		     (caddr_t) arg_nfs)) {
+	if ((reqdata->r_u.req.svc.rq_vers == 2)
+	 || (reqdata->r_u.req.svc.rq_vers == 3)
+	 || (reqdata->r_u.req.svc.rq_vers == 4)) {
+		if (!SVC_FREEARGS(xprt, &reqdata->r_u.req.svc,
+				  reqdesc->xdr_decode_func,
+				  (caddr_t) arg_nfs)) {
 			LogCrit(COMPONENT_DISPATCH,
 				"NFS DISPATCHER: FAILURE: Bad SVC_FREEARGS for %s",
-				reqnfs->funcdesc->funcname);
+				reqdesc->funcname);
 		}
 	}
 
 	/* Finalize the request. */
 	if (res_nfs)
-		nfs_dupreq_rele(svcreq, reqnfs->funcdesc);
+		nfs_dupreq_rele(&reqdata->r_u.req.svc, reqdesc);
 
-out:
 	SetClientIP(NULL);
-	if (op_ctx->client != NULL)
+	if (op_ctx->client != NULL) {
 		put_gsh_client(op_ctx->client);
-	if (op_ctx->export != NULL)
-		put_gsh_export(op_ctx->export);
+		op_ctx->client = NULL;
+	}
+	if (op_ctx->ctx_export != NULL) {
+		put_gsh_export(op_ctx->ctx_export);
+		op_ctx->ctx_export = NULL;
+	}
+	clean_credentials();
 	op_ctx = NULL;
 
 #ifdef USE_LTTNG
-	tracepoint(nfs_rpc, end, req);
+	tracepoint(nfs_rpc, end, reqdata);
 #endif
-
-	return;
 }
 
 #ifdef _USE_9P
@@ -1401,28 +1426,27 @@ out:
  * @brief Execute a 9p request
  *
  * @param[in,out] req9p       9p request
- * @param[in,out] worker_data Worker's specific data
  */
-static void _9p_execute(request_data_t *req, nfs_worker_data_t *worker_data)
+static void _9p_execute(request_data_t *reqdata)
 {
-	struct _9p_request_data *req9p = &req->r_u._9p;
+	struct _9p_request_data *req9p = &reqdata->r_u._9p;
 	struct req_op_context req_ctx;
 	struct export_perms export_perms;
 
 	memset(&req_ctx, 0, sizeof(struct req_op_context));
+	memset(&export_perms, 0, sizeof(struct export_perms));
 	op_ctx = &req_ctx;
-	op_ctx->caller_addr = &worker_data->hostaddr;
-	op_ctx->req_type = req->rtype;
+	op_ctx->caller_addr = (sockaddr_t *)&reqdata->r_u._9p.pconn->addrpeer;
+	op_ctx->req_type = reqdata->rtype;
 	op_ctx->export_perms = &export_perms;
 
 	if (req9p->pconn->trans_type == _9P_TCP)
-		_9p_tcp_process_request(req9p, worker_data);
+		_9p_tcp_process_request(req9p);
 #ifdef _USE_9P_RDMA
 	else if (req9p->pconn->trans_type == _9P_RDMA)
-		_9p_rdma_process_request(req9p, worker_data);
+		_9p_rdma_process_request(req9p);
 #endif
-
-	return;
+	op_ctx = NULL;
 }				/* _9p_execute */
 
 /**
@@ -1438,12 +1462,9 @@ static void _9p_free_reqdata(struct _9p_request_data *req9p)
 		gsh_free(req9p->_9pmsg);
 
 	/* decrease connection refcount */
-	atomic_dec_uint32_t(&req9p->pconn->refcount);
+	(void) atomic_dec_uint32_t(&req9p->pconn->refcount);
 }
 #endif
-
-/* XXX include dependency issue prevented declaring in nfs_req_queue.h */
-request_data_t *nfs_rpc_dequeue_req(nfs_worker_data_t *worker);
 
 static uint32_t worker_indexer;
 
@@ -1455,8 +1476,7 @@ static uint32_t worker_indexer;
 
 static void worker_thread_initializer(struct fridgethr_context *ctx)
 {
-	struct nfs_worker_data *wd =
-	    gsh_calloc(sizeof(struct nfs_worker_data), 1);
+	struct nfs_worker_data *wd = &ctx->wd;
 	char thr_name[32];
 
 	wd->worker_index = atomic_inc_uint32_t(&worker_indexer);
@@ -1465,8 +1485,6 @@ static void worker_thread_initializer(struct fridgethr_context *ctx)
 
 	/* Initalize thr waitq */
 	init_wait_q_entry(&wd->wqe);
-	wd->ctx = ctx;
-	ctx->thread_info = wd;
 }
 
 /**
@@ -1477,7 +1495,6 @@ static void worker_thread_initializer(struct fridgethr_context *ctx)
 
 static void worker_thread_finalizer(struct fridgethr_context *ctx)
 {
-	gsh_free(ctx->thread_info);
 	ctx->thread_info = NULL;
 }
 
@@ -1494,55 +1511,51 @@ static void worker_thread_finalizer(struct fridgethr_context *ctx)
 
 static void worker_run(struct fridgethr_context *ctx)
 {
-	struct nfs_worker_data *worker_data = ctx->thread_info;
-	request_data_t *nfsreq;
-	gsh_xprt_private_t *xu = NULL;
-	uint32_t reqcnt;
+	struct nfs_worker_data *worker_data = &ctx->wd;
+	request_data_t *reqdata;
 
 	/* Worker's loop */
 	while (!fridgethr_you_should_break(ctx)) {
-		nfsreq = nfs_rpc_dequeue_req(worker_data);
+		reqdata = nfs_rpc_dequeue_req(worker_data);
 
-		if (!nfsreq)
+		if (!reqdata)
 			continue;
 
 /* need to do a getpeername(2) on the socket fd before we dive into the
  * rpc_execute.  9p is messy but we do have the fd....
  */
 
-		switch (nfsreq->rtype) {
+		switch (reqdata->rtype) {
 		case UNKNOWN_REQUEST:
 			LogCrit(COMPONENT_DISPATCH,
 				"Unexpected unknown request");
 			break;
 		case NFS_REQUEST:
 			/* check for destroyed xprts */
-			xu = (gsh_xprt_private_t *) nfsreq->r_u.nfs->xprt->
-			    xp_u1;
-			PTHREAD_MUTEX_lock(&nfsreq->r_u.nfs->xprt->xp_lock);
-			if (nfsreq->r_u.nfs->xprt->
+			if (reqdata->r_u.req.svc.rq_xprt->
 			    xp_flags & SVC_XPRT_FLAG_DESTROYED) {
-				PTHREAD_MUTEX_unlock(&nfsreq->r_u.nfs->xprt->
-						     xp_lock);
+				/* Idempotent: once set, the DESTROYED flag
+				 * is never cleared. No lock needed.
+				 */
 				goto finalize_req;
 			}
-			reqcnt = xu->req_cnt;
-			PTHREAD_MUTEX_unlock(&nfsreq->r_u.nfs->xprt->xp_lock);
-			/* execute */
+
 			LogDebug(COMPONENT_DISPATCH,
-				 "NFS protocol request, nfsreq=%p xprt=%p req_cnt=%d",
-				 nfsreq, nfsreq->r_u.nfs->xprt, reqcnt);
-			nfs_rpc_execute(nfsreq, worker_data);
+				 "NFS protocol request, reqdata=%p xprt=%p requests=%d",
+				 reqdata,
+				 reqdata->r_u.req.svc.rq_xprt,
+				 reqdata->r_u.req.svc.rq_xprt->xp_requests);
+			nfs_rpc_execute(reqdata);
 			break;
 
 		case NFS_CALL:
 			/* NFSv4 rpc call (callback) */
-			nfs_rpc_dispatch_call(nfsreq->r_u.call, 0);
+			nfs_rpc_dispatch_call(&reqdata->r_u.call, 0);
 			break;
 
 #ifdef _USE_9P
 		case _9P_REQUEST:
-			_9p_execute(nfsreq, worker_data);
+			_9p_execute(reqdata);
 			break;
 #endif
 		}
@@ -1552,19 +1565,18 @@ static void worker_run(struct fridgethr_context *ctx)
 		LogFullDebug(COMPONENT_DISPATCH,
 			     "Signaling completion of request");
 
-		switch (nfsreq->rtype) {
+		switch (reqdata->rtype) {
 		case NFS_REQUEST:
-			/* adjust req_cnt and return xprt ref */
-			gsh_xprt_unref(nfsreq->r_u.nfs->xprt,
+			/* adjust request count and return xprt ref */
+			gsh_xprt_unref(reqdata->r_u.req.svc.rq_xprt,
 				       XPRT_PRIVATE_FLAG_DECREQ, __func__,
 				       __LINE__);
-			pool_free(request_data_pool, nfsreq->r_u.nfs);
 			break;
 		case NFS_CALL:
 			break;
 #ifdef _USE_9P
 		case _9P_REQUEST:
-			_9p_free_reqdata(&nfsreq->r_u._9p);
+			_9p_free_reqdata(&reqdata->r_u._9p);
 			break;
 #endif
 		default:
@@ -1575,7 +1587,7 @@ static void worker_run(struct fridgethr_context *ctx)
 		LogFullDebug(COMPONENT_DISPATCH,
 			     "Invalidating processed entry");
 
-		pool_free(request_pool, nfsreq);
+		pool_free(request_pool, reqdata);
 	}
 }
 

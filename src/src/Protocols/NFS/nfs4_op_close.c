@@ -43,10 +43,22 @@
 /* Tag passed to state functions */
 static const char *close_tag = "CLOSE";
 
+/**
+ * @brief Clean up the current layouts
+ *
+ * @note state_lock MUST be held for write
+ *
+ * @param[in] data	Current compound data
+ */
 void cleanup_layouts(compound_data_t *data)
 {
 	struct glist_head *glist = NULL;
 	struct glist_head *glistn = NULL;
+	struct state_hdl *ostate;
+
+	ostate = data->current_obj->state_hdl;
+	if (!ostate)
+		return;
 
 	/* We can't simply grab a pointer to a layout state
 	 * and free it later, since a client could have
@@ -55,7 +67,7 @@ void cleanup_layouts(compound_data_t *data)
 	 * return_on_close.
 	 */
 
-	glist_for_each(glist, &data->current_entry->list_of_states) {
+	glist_for_each(glist, &ostate->file.list_of_states) {
 		state_t *state = glist_entry(glist, state_t,
 					     state_list);
 		state_owner_t *owner = get_state_owner_ref(state);
@@ -78,7 +90,7 @@ void cleanup_layouts(compound_data_t *data)
 
 	glist_for_each_safe(glist,
 			    glistn,
-			    &data->current_entry->list_of_states) {
+			    &ostate->file.list_of_states) {
 		state_t *state = glist_entry(glist, state_t,
 					     state_list);
 		bool deleted = false;
@@ -98,7 +110,7 @@ void cleanup_layouts(compound_data_t *data)
 		    (owner->so_owner.so_nfs4_owner.so_clientrec
 		      == data->session->clientid_record) &&
 		    state->state_data.layout.state_return_on_close) {
-			nfs4_return_one_state(data->current_entry,
+			nfs4_return_one_state(data->current_obj,
 					      LAYOUTRETURN4_FILE,
 					      circumstance_roc,
 					      state,
@@ -141,8 +153,8 @@ int nfs4_op_close(struct nfs_argop4 *op, compound_data_t *data,
 	nfsstat4 nfs_status = NFS4_OK;
 	/* The state for the open to be closed */
 	state_t *state_found = NULL;
-	/* Status for Cache inode operations */
-	cache_inode_status_t cache_status = CACHE_INODE_SUCCESS;
+	/* Status for FSAL operations */
+	fsal_status_t fsal_status = { 0, 0 };
 	/* Status for state operations */
 	state_status_t state_status = STATE_SUCCESS;
 	/* The open owner of the open state being closed */
@@ -167,7 +179,7 @@ int nfs4_op_close(struct nfs_argop4 *op, compound_data_t *data,
 
 	/* Check stateid correctness and get pointer to state */
 	nfs_status = nfs4_Check_Stateid(&arg_CLOSE4->open_stateid,
-					data->current_entry,
+					data->current_obj,
 					&state_found,
 					data,
 					data->minorversion == 0 ?
@@ -197,8 +209,7 @@ int nfs4_op_close(struct nfs_argop4 *op, compound_data_t *data,
 			res_CLOSE4->CLOSE4res_u.open_stateid.seqid = 1;
 
 		LogDebug(COMPONENT_STATE,
-			 "CLOSE failed nfs4_Check_Stateid must have already been closed."
-			 " But treating it as replayed close and returning NFS4_OK");
+			 "CLOSE failed nfs4_Check_Stateid must have already been closed. But treating it as replayed close and returning NFS4_OK");
 
 		return res_CLOSE4->status;
 	}
@@ -218,7 +229,7 @@ int nfs4_op_close(struct nfs_argop4 *op, compound_data_t *data,
 		if (!Check_nfs4_seqid(open_owner,
 				      arg_CLOSE4->seqid,
 				      op,
-				      data->current_entry,
+				      data->current_obj,
 				      resp,
 				      close_tag)) {
 			/* Response is all setup for us and LogDebug
@@ -231,7 +242,7 @@ int nfs4_op_close(struct nfs_argop4 *op, compound_data_t *data,
 
 	PTHREAD_MUTEX_unlock(&open_owner->so_mutex);
 
-	PTHREAD_RWLOCK_wrlock(&data->current_entry->state_lock);
+	PTHREAD_RWLOCK_wrlock(&data->current_obj->state_hdl->state_lock);
 
 	/* Check is held locks remain */
 	glist_for_each(glist, &state_found->state_data.share.share_lockstates) {
@@ -248,7 +259,8 @@ int nfs4_op_close(struct nfs_argop4 *op, compound_data_t *data,
 			 */
 			res_CLOSE4->status = NFS4ERR_LOCKS_HELD;
 
-			PTHREAD_RWLOCK_unlock(&data->current_entry->state_lock);
+			PTHREAD_RWLOCK_unlock(
+				&data->current_obj->state_hdl->state_lock);
 			LogDebug(COMPONENT_STATE,
 				 "NFS4 Close with existing locks");
 			goto out;
@@ -268,23 +280,33 @@ int nfs4_op_close(struct nfs_argop4 *op, compound_data_t *data,
 						  state_data.lock.
 						  state_sharelist);
 
+		/* If the FSAL supports extended ops, this will result in
+		 * closing any open files the FSAL has for this lock state.
+		 */
 		state_del_locked(lock_state);
 	}
 
 	/* File is closed, release the share state */
-	if (state_found->state_type == STATE_TYPE_SHARE) {
-		state_status = state_share_remove(data->current_entry,
+	if (state_found->state_type == STATE_TYPE_SHARE &&
+	    !data->current_obj->fsal->m_ops.support_ex(data->current_obj)) {
+		/* Only need to call state_share_remove if extended ops support
+		 * is not enabled for the FSAL.
+		 */
+		state_status = state_share_remove(data->current_obj,
 						  open_owner,
 						  state_found);
 
 		if (state_status != STATE_SUCCESS) {
 			LogEvent(COMPONENT_STATE,
-				 "CLOSE failed to release share state "
-				 "error: %s", state_err_str(state_status));
+				 "CLOSE failed to release share state error: %s",
+				 state_err_str(state_status));
 		}
 	}
 
-	/* File is closed, release the corresponding state */
+	/* File is closed, release the corresponding state. If the FSAL
+	 * supports extended ops, this will result in closing any open files
+	 * the FSAL has for this state.
+	 */
 	state_del_locked(state_found);
 
 	/* Poison the current stateid */
@@ -300,19 +322,25 @@ int nfs4_op_close(struct nfs_argop4 *op, compound_data_t *data,
 	}
 
 	/* Close the file in FSAL through the cache inode */
-	cache_status = cache_inode_close(data->current_entry,
-					 CACHE_INODE_FLAG_REALLYCLOSE);
-
-	if (cache_status != CACHE_INODE_SUCCESS) {
-		res_CLOSE4->status = nfs4_Errno(cache_status);
-		PTHREAD_RWLOCK_unlock(&data->current_entry->state_lock);
-		goto out;
+	if (!data->current_obj->fsal->m_ops.support_ex(data->current_obj)) {
+		/* Only need to call cache_inode_close if extended ops support
+		 * is not enabled for the FSAL.
+		 */
+		/* Close the file in FSAL */
+		fsal_status = fsal_close(data->current_obj);
+		if (FSAL_IS_ERROR(fsal_status)
+		    && (fsal_status.major != ERR_FSAL_NOT_OPENED)) {
+			res_CLOSE4->status = nfs4_Errno_status(fsal_status);
+			PTHREAD_RWLOCK_unlock(
+				&data->current_obj->state_hdl->state_lock);
+			goto out;
+		}
 	}
 
 	if (data->minorversion == 0)
 		op_ctx->clientid = NULL;
 
-	PTHREAD_RWLOCK_unlock(&data->current_entry->state_lock);
+	PTHREAD_RWLOCK_unlock(&data->current_obj->state_hdl->state_lock);
 	res_CLOSE4->status = NFS4_OK;
 
 	if (isFullDebug(COMPONENT_STATE) && isFullDebug(COMPONENT_MEMLEAKS)) {
@@ -325,7 +353,7 @@ int nfs4_op_close(struct nfs_argop4 *op, compound_data_t *data,
 	/* Save the response in the open owner */
 	if (data->minorversion == 0) {
 		Copy_nfs4_state_req(open_owner, arg_CLOSE4->seqid, op,
-				    data->current_entry, resp, close_tag);
+				    data->current_obj, resp, close_tag);
 	}
 
  out2:
@@ -350,11 +378,9 @@ int nfs4_op_close(struct nfs_argop4 *op, compound_data_t *data,
 void nfs4_op_close_Free(nfs_resop4 *resp)
 {
 	/* Nothing to be done */
-	return;
-}				/* nfs4_op_close_Free */
+}
 
 void nfs4_op_close_CopyRes(CLOSE4res *res_dst, CLOSE4res *res_src)
 {
-	/* Nothing to be done */
-	return;
-}				/* nfs4_op_close_CopyRes */
+	/* Nothing to deep copy */
+}

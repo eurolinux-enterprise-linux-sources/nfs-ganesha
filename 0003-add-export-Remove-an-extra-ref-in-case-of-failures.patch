@@ -1,0 +1,57 @@
+From e0ab0ab48f6ab5e34229cee832cd7577c9950a23 Mon Sep 17 00:00:00 2001
+From: Soumya Koduri <skoduri@redhat.com>
+Date: Mon, 21 Nov 2016 14:55:09 +0530
+Subject: [PATCH] add-export: Remove an extra ref in case of failures
+
+insert_gsh_export() takes two references - one for sentinal
+ref and another for use throughout export_commit. That means
+in case of any failures at later point, we need to unref twice.
+But that wasn't the case in the current code. Fixed the same.
+
+Change-Id: I62efc43a24d536fe40ccf058d320e3517b521026
+Signed-off-by: Soumya Koduri <skoduri@redhat.com>
+---
+ src/support/exports.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/src/support/exports.c b/src/support/exports.c
+index 8cfec2f..4ce1c5b 100644
+--- a/src/support/exports.c
++++ b/src/support/exports.c
+@@ -1277,14 +1277,14 @@ static int export_commit_common(void *node, void *link_mem, void *self_struct,
+ 				err_type->resource = true;
+ 			}
+ 
+-			return errcnt;
++			goto out;
+ 		}
+ 
+ 		if (!mount_gsh_export(export)) {
+ 			export_revert(export);
+ 			err_type->internal = true;
+ 			errcnt++;
+-			return errcnt;
++			goto out;
+ 		}
+ 	}
+ 
+@@ -1305,6 +1305,7 @@ success:
+ 		"Export %d has %zd defined clients", export->export_id,
+ 		glist_length(&export->clients));
+ 
++out:
+ 	if (commit_type != update_export) {
+ 		/* For initial or add export, insert_gsh_export gave out
+ 		 * two references, a sentinel reference for the export's
+@@ -1318,7 +1319,7 @@ success:
+ 		put_gsh_export(export);
+ 	}
+ 
+-	return 0;
++	return errcnt;
+ }
+ 
+ static int export_commit(void *node, void *link_mem, void *self_struct,
+-- 
+2.5.5
+

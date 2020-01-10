@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+<short>Rquota</short>
+<description>Default ports for Rquota service</description>
+<port protocol="tcp" port="875"/>      <!--For Rquota service -->
+<port protocol="udp" port="875"/>      <!--For Rquota service -->
+</service>

@@ -1,0 +1,40 @@
+From 53c553d49e808a46ba8605e141eddf5e26dcf458 Mon Sep 17 00:00:00 2001
+From: Daniel Gryniewicz <dang@redhat.com>
+Date: Mon, 16 Jan 2017 10:24:15 -0500
+Subject: [PATCH 2/2] Don't do work in assert()
+
+Standard assert() is a no-op on release builds, and only runs code on
+debug builds.  Don't do any actual work in assert().  In this case, it
+leaks refs on unexport, causing issues on shutdown or re-export.
+
+Change-Id: I6a3279095427aa54a3093dd018bb6724f8427201
+Signed-off-by: Daniel Gryniewicz <dang@redhat.com>
+---
+ src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_export.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_export.c b/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_export.c
+index 9e15ef3..ecd6683 100644
+--- a/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_export.c
++++ b/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_export.c
+@@ -95,6 +95,7 @@ static void mdcache_unexport(struct fsal_export *exp_hdl,
+ 	mdcache_entry_t *entry;
+ 	struct entry_export_map *expmap;
+ 	fsal_status_t status;
++	bool rc;
+ 
+ 	/* First unexport for the sub-FSAL */
+ 	subcall_raw(exp,
+@@ -158,7 +159,8 @@ static void mdcache_unexport(struct fsal_export *exp_hdl,
+ 	};
+ 
+ 	/* Unhash the root object */
+-	assert(!cih_remove_checked(root_entry));
++	rc = cih_remove_checked(root_entry);
++	assert(!rc);
+ }
+ 
+ /**
+-- 
+2.5.0
+

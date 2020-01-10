@@ -40,12 +40,10 @@
 #include "nfs_core.h"
 #include "nfs_exports.h"
 #include "log.h"
-#include "cache_inode.h"
 #include "fsal.h"
 #include "9p.h"
 
-int _9p_mknod(struct _9p_request_data *req9p, void *worker_data,
-	      u32 *plenout, char *preply)
+int _9p_mknod(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 {
 	char *cursor = req9p->_9pmsg + _9P_HDR_SIZE + _9P_TYPE_SIZE;
 	u16 *msgtag = NULL;
@@ -60,14 +58,12 @@ int _9p_mknod(struct _9p_request_data *req9p, void *worker_data,
 	struct _9p_fid *pfid = NULL;
 	struct _9p_qid qid_newobj;
 
-	cache_entry_t *pentry_newobj = NULL;
+	struct fsal_obj_handle *pentry_newobj = NULL;
 	char obj_name[MAXNAMLEN];
 	uint64_t fileid = 0LL;
-	cache_inode_status_t cache_status;
+	fsal_status_t fsal_status;
 	object_file_type_t nodetype;
-	cache_inode_create_arg_t create_arg;
-
-	memset(&create_arg, 0, sizeof(create_arg));
+	struct attrlist object_attributes;
 
 	/* Get data */
 	_9p_getptr(cursor, msgtag, u16);
@@ -85,24 +81,22 @@ int _9p_mknod(struct _9p_request_data *req9p, void *worker_data,
 		 *minor, *gid);
 
 	if (*fid >= _9P_FID_PER_CONN)
-		return _9p_rerror(req9p, worker_data, msgtag, ERANGE, plenout,
-				  preply);
+		return _9p_rerror(req9p, msgtag, ERANGE, plenout, preply);
 
 	pfid = req9p->pconn->fids[*fid];
 
 	/* Check that it is a valid fid */
 	if (pfid == NULL || pfid->pentry == NULL) {
 		LogDebug(COMPONENT_9P, "request on invalid fid=%u", *fid);
-		return _9p_rerror(req9p, worker_data, msgtag, EIO, plenout,
-				  preply);
+		return _9p_rerror(req9p, msgtag, EIO, plenout, preply);
 	}
 
-	if ((pfid->op_context.export_perms->options &
-				 EXPORT_OPTION_WRITE_ACCESS) == 0)
-		return _9p_rerror(req9p, worker_data, msgtag, EROFS, plenout,
-				  preply);
+	_9p_init_opctx(pfid, req9p);
 
-	op_ctx = &pfid->op_context;
+	if ((op_ctx->export_perms->options &
+				 EXPORT_OPTION_WRITE_ACCESS) == 0)
+		return _9p_rerror(req9p, msgtag, EROFS, plenout, preply);
+
 	snprintf(obj_name, MAXNAMLEN, "%.*s", *name_len, name_str);
 
 	/* Set the nodetype */
@@ -115,24 +109,29 @@ int _9p_mknod(struct _9p_request_data *req9p, void *worker_data,
 	else if (S_ISSOCK(*mode))
 		nodetype = SOCKET_FILE;
 	else			/* bad type */
-		return _9p_rerror(req9p, worker_data, msgtag, EINVAL, plenout,
-				  preply);
+		return _9p_rerror(req9p, msgtag, EINVAL, plenout, preply);
 
-	create_arg.dev_spec.major = *major;
-	create_arg.dev_spec.minor = *minor;
+	fsal_prepare_attrs(&object_attributes, ATTR_RAWDEV | ATTR_MODE);
+
+	object_attributes.rawdev.major = *major;
+	object_attributes.rawdev.minor = *minor;
+	object_attributes.mode = *mode;
 
 	/* Create the directory */
-   /**  @todo  BUGAZOMEU the gid parameter is not used yet */
-	cache_status =
-	    cache_inode_create(pfid->pentry, obj_name, nodetype, *mode,
-			       &create_arg, &pentry_newobj);
-	if (pentry_newobj == NULL)
-		return _9p_rerror(req9p, worker_data, msgtag,
-				  _9p_tools_errno(cache_status), plenout,
-				  preply);
+	/**  @todo  BUGAZOMEU the gid parameter is not used yet */
+	fsal_status = fsal_create(pfid->pentry, obj_name, nodetype,
+				  &object_attributes, NULL, &pentry_newobj,
+				  NULL);
+
+	/* Release the attributes (may release an inherited ACL) */
+	fsal_release_attrs(&object_attributes);
+
+	if (FSAL_IS_ERROR(fsal_status))
+		return _9p_rerror(req9p, msgtag, _9p_tools_errno(fsal_status),
+				  plenout, preply);
 
 	/* we don't keep a reference to the entry */
-	cache_inode_put(pentry_newobj);
+	pentry_newobj->obj_ops.put_ref(pentry_newobj);
 
 	/* Build the qid */
 	qid_newobj.type = _9P_QTTMP;

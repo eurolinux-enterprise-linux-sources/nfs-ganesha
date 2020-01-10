@@ -328,8 +328,7 @@ static int init_db_thread_info(db_thread_info_t *p_thr_info,
 		return HANDLEMAP_SYSTEM_ERROR;
 
 	p_thr_info->dbop_pool =
-	    pool_init(NULL, sizeof(db_op_item_t), pool_basic_substrate, NULL,
-		      NULL, NULL);
+	    pool_basic_init("drop_pool", sizeof(db_op_item_t));
 
 	return HANDLEMAP_SUCCESS;
 }
@@ -385,9 +384,9 @@ static int init_database_access(db_thread_info_t *p_thr_info)
 		rc = sqlite3_exec(p_thr_info->db_conn,
 				  "CREATE TABLE " MAP_TABLE " ( " OBJID_FIELD
 				  "   BIGINT NOT NULL, " HASH_FIELD
-				  "    INT NOT NULL, " HANDLE_FIELD "  TEXT, "
-				  "PRIMARY KEY(" OBJID_FIELD ", " HASH_FIELD
-				  ") )", NULL, NULL, &errmsg);
+				  "    INT NOT NULL, " HANDLE_FIELD
+				  "  TEXT, PRIMARY KEY(" OBJID_FIELD ", "
+				  HASH_FIELD ") )", NULL, NULL, &errmsg);
 
 		CheckCommand(p_thr_info->db_conn, rc, errmsg);
 
@@ -405,8 +404,8 @@ static int init_database_access(db_thread_info_t *p_thr_info)
 
 	rc = sqlite3_prepare_v2(p_thr_info->db_conn,
 				"INSERT INTO " MAP_TABLE "(" OBJID_FIELD ","
-				HASH_FIELD "," HANDLE_FIELD ") "
-				"VALUES (?1, ?2, ?3 )", -1,
+				HASH_FIELD "," HANDLE_FIELD
+				") VALUES (?1, ?2, ?3 )", -1,
 				&(p_thr_info->prep_stmt[INSERT_STATEMENT]),
 				&unparsed);
 
@@ -918,12 +917,9 @@ int handlemap_db_reaload_all(hash_table_t *target_hash)
 		/* get a new db operation  */
 		PTHREAD_MUTEX_lock(&db_thread[i].pool_mutex);
 
-		new_task = pool_alloc(db_thread[i].dbop_pool, NULL);
+		new_task = pool_alloc(db_thread[i].dbop_pool);
 
 		PTHREAD_MUTEX_unlock(&db_thread[i].pool_mutex);
-
-		if (!new_task)
-			return HANDLEMAP_SYSTEM_ERROR;
 
 		/* can you fill it ? */
 		new_task->op_type = LOAD;
@@ -963,12 +959,9 @@ int handlemap_db_insert(nfs23_map_handle_t *p_in_nfs23_digest,
 		/* get a new db operation  */
 		PTHREAD_MUTEX_lock(&db_thread[i].pool_mutex);
 
-		new_task = pool_alloc(db_thread[i].dbop_pool, NULL);
+		new_task = pool_alloc(db_thread[i].dbop_pool);
 
 		PTHREAD_MUTEX_unlock(&db_thread[i].pool_mutex);
-
-		if (!new_task)
-			return HANDLEMAP_SYSTEM_ERROR;
 
 		/* fill the task info */
 		new_task->op_type = INSERT;
@@ -1005,12 +998,9 @@ int handlemap_db_delete(nfs23_map_handle_t *p_in_nfs23_digest)
 	/* get a new db operation  */
 	PTHREAD_MUTEX_lock(&db_thread[i].pool_mutex);
 
-	new_task = pool_alloc(db_thread[i].dbop_pool, NULL);
+	new_task = pool_alloc(db_thread[i].dbop_pool);
 
 	PTHREAD_MUTEX_unlock(&db_thread[i].pool_mutex);
-
-	if (!new_task)
-		return HANDLEMAP_SYSTEM_ERROR;
 
 	/* fill the task info */
 	new_task->op_type = DELETE;
@@ -1029,7 +1019,7 @@ int handlemap_db_delete(nfs23_map_handle_t *p_in_nfs23_digest)
  * Wait for all queues to be empty
  * and all current DB request to be done.
  */
-int handlemap_db_flush()
+int handlemap_db_flush(void)
 {
 	unsigned int i;
 	struct timeval t1;

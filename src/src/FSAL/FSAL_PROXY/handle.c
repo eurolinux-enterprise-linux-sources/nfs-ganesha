@@ -127,7 +127,8 @@ struct pxy_obj_handle {
 
 static struct pxy_obj_handle *pxy_alloc_handle(struct fsal_export *exp,
 					       const nfs_fh4 *fh,
-					       const struct attrlist *attr);
+					       fattr4 *obj_attributes,
+					       struct attrlist *attrs_out);
 
 static fsal_status_t nfsstat4_to_fsal(nfsstat4 nfsstatus)
 {
@@ -201,6 +202,8 @@ static fsal_status_t nfsstat4_to_fsal(nfsstat4 nfsstatus)
 		return fsalstat(ERR_FSAL_SYMLINK, (int)nfsstatus);
 	case NFS4ERR_ATTRNOTSUPP:
 		return fsalstat(ERR_FSAL_ATTRNOTSUPP, (int)nfsstatus);
+	case NFS4ERR_BADNAME:
+		return fsalstat(ERR_FSAL_BADNAME, (int)nfsstatus);
 	case NFS4ERR_INVAL:
 	case NFS4ERR_CLID_INUSE:
 	case NFS4ERR_MOVED:
@@ -218,7 +221,6 @@ static fsal_status_t nfsstat4_to_fsal(nfsstat4 nfsstatus)
 	case NFS4ERR_RECLAIM_CONFLICT:
 	case NFS4ERR_BADXDR:
 	case NFS4ERR_BADCHAR:
-	case NFS4ERR_BADNAME:
 	case NFS4ERR_BAD_RANGE:
 	case NFS4ERR_BADOWNER:
 	case NFS4ERR_OP_ILLEGAL:
@@ -248,13 +250,6 @@ static struct bitmap4 pxy_bitmap_getattr = {
 	     PXY_ATTR_BIT2(FATTR4_TIME_METADATA) |
 	     PXY_ATTR_BIT2(FATTR4_TIME_MODIFY) | PXY_ATTR_BIT2(FATTR4_RAWDEV)),
 	.bitmap4_len = 2
-};
-
-/* Until readdir callback can take more information do not ask for more then
- * just type */
-static struct bitmap4 pxy_bitmap_readdir = {
-	.map[0] = PXY_ATTR_BIT(FATTR4_TYPE),
-	.bitmap4_len = 1
 };
 
 static struct bitmap4 pxy_bitmap_fsinfo = {
@@ -306,7 +301,7 @@ static int pxy_fsalattr_to_fattr4(const struct attrlist *attrs, fattr4 *data)
 	struct xdr_attrs_args args;
 
 	for (i = 0; i < ARRAY_SIZE(fsal_mask2bit); i++) {
-		if (FSAL_TEST_MASK(attrs->mask, fsal_mask2bit[i].mask)) {
+		if (FSAL_TEST_MASK(attrs->valid_mask, fsal_mask2bit[i].mask)) {
 			if (fsal_mask2bit[i].fattr_bit > 31) {
 				bmap.map[1] |=
 				    1U << (fsal_mask2bit[i].fattr_bit - 32);
@@ -321,7 +316,6 @@ static int pxy_fsalattr_to_fattr4(const struct attrlist *attrs, fattr4 *data)
 	memset(&args, 0, sizeof(args));
 	args.attrs = (struct attrlist *)attrs;
 	args.data = NULL;
-	args.mounted_on_fileid = attrs->fileid;
 
 	return nfs4_FSALattr_To_Fattr(&args, &bmap, data);
 }
@@ -390,6 +384,7 @@ static int pxy_rpc_read_reply(int sock)
 
 	while (cnt < 8) {
 		int bc = read(sock, buf + cnt, 8 - cnt);
+
 		if (bc < 0)
 			return -errno;
 		cnt += bc;
@@ -458,8 +453,10 @@ static int pxy_connect(struct pxy_client_params *info,
 		       struct sockaddr_in *dest)
 {
 	int sock;
+
 	if (info->use_privileged_client_port) {
 		int priv_port = 0;
+
 		sock = rresvport(&priv_port);
 		if (sock < 0)
 			LogCrit(COMPONENT_FSAL,
@@ -504,6 +501,7 @@ static void *pxy_rpc_recv(void *arg)
 
 	for (;;) {
 		int nsleeps = 0;
+
 		PTHREAD_MUTEX_lock(&listlock);
 		do {
 			rpc_sock = pxy_connect(info, &addr_rpc);
@@ -522,8 +520,7 @@ static void *pxy_rpc_recv(void *arg)
 				PTHREAD_MUTEX_lock(&listlock);
 			} else {
 				LogDebug(COMPONENT_FSAL,
-					 "Connected after %d sleeps, "
-					 "resending outstanding calls",
+					 "Connected after %d sleeps, resending outstanding calls",
 					 nsleeps);
 			}
 		} while (rpc_sock < 0);
@@ -545,8 +542,7 @@ static void *pxy_rpc_recv(void *arg)
 			default:
 				if (pfd.revents & POLLRDHUP) {
 					LogEvent(COMPONENT_FSAL,
-						 "Other end has closed "
-						 "connection, reconnecting...");
+						 "Other end has closed connection, reconnecting...");
 				} else if (pfd.revents & POLLNVAL) {
 					LogEvent(COMPONENT_FSAL,
 						 "Socket is closed");
@@ -579,6 +575,7 @@ static enum clnt_stat pxy_process_reply(struct pxy_rpc_io_context *ctx,
 
 	while (!ctx->iodone) {
 		int w = pthread_cond_timedwait(&ctx->iowait, &ctx->iolock, &ts);
+
 		if (w == ETIMEDOUT) {
 			PTHREAD_MUTEX_unlock(&ctx->iolock);
 			return RPC_TIMEDOUT;
@@ -721,12 +718,14 @@ static int pxy_compoundv4_call(struct pxy_rpc_io_context *pcontext,
 		do {
 			int bc = 0;
 			char *buf = pcontext->sendbuf;
+
 			LogDebug(COMPONENT_FSAL, "%ssend XID %u with %d bytes",
 				 (first_try ? "First attempt to " : "Re"),
 				 rmsg.rm_xid, pos);
 			PTHREAD_MUTEX_lock(&listlock);
 			while (bc < pos) {
 				int wc = write(rpc_sock, buf, pos - bc);
+
 				if (wc <= 0) {
 					close(rpc_sock);
 					break;
@@ -901,7 +900,7 @@ static void *pxy_clientid_renewer(void *Arg)
 
 		if (!needed && pxy_rpc_renewer_wait(lease_time - 5)) {
 			/* Simply renew the client id you've got */
-			LogDebug(COMPONENT_FSAL, "Renewing client id %lx",
+			LogDebug(COMPONENT_FSAL, "Renewing client id %" PRIx64,
 				 pxy_clientid);
 			arg.argop = NFS4_OP_RENEW;
 			arg.nfs_argop4_u.oprenew.clientid = pxy_clientid;
@@ -909,7 +908,8 @@ static void *pxy_clientid_renewer(void *Arg)
 						    &res);
 			if (rc == NFS4_OK) {
 				LogDebug(COMPONENT_FSAL,
-					 "Renewed client id %lx", pxy_clientid);
+					 "Renewed client id %" PRIx64,
+					 pxy_clientid);
 				continue;
 			}
 		}
@@ -931,9 +931,11 @@ static void *pxy_clientid_renewer(void *Arg)
 static void free_io_contexts(void)
 {
 	struct glist_head *cur, *n;
+
 	glist_for_each_safe(cur, n, &free_contexts) {
 		struct pxy_rpc_io_context *c =
 		    container_of(cur, struct pxy_rpc_io_context, calls);
+
 		glist_del(cur);
 		gsh_free(c);
 	}
@@ -1004,18 +1006,12 @@ int pxy_init_rpc(const struct pxy_fsal_module *pm)
 static fsal_status_t pxy_make_object(struct fsal_export *export,
 				     fattr4 *obj_attributes,
 				     const nfs_fh4 *fh,
-				     struct fsal_obj_handle **handle)
+				     struct fsal_obj_handle **handle,
+				     struct attrlist *attrs_out)
 {
-	struct attrlist attributes;
 	struct pxy_obj_handle *pxy_hdl;
 
-	memset(&attributes, 0, sizeof(struct attrlist));
-
-	if (nfs4_Fattr_To_FSAL_attr(&attributes, obj_attributes, NULL) !=
-	    NFS4_OK)
-		return fsalstat(ERR_FSAL_INVAL, 0);
-
-	pxy_hdl = pxy_alloc_handle(export, fh, &attributes);
+	pxy_hdl = pxy_alloc_handle(export, fh, obj_attributes, attrs_out);
 	if (pxy_hdl == NULL)
 		return fsalstat(ERR_FSAL_FAULT, 0);
 	*handle = &pxy_hdl->obj;
@@ -1032,7 +1028,8 @@ static fsal_status_t pxy_lookup_impl(struct fsal_obj_handle *parent,
 				     struct fsal_export *export,
 				     const struct user_cred *cred,
 				     const char *path,
-				     struct fsal_obj_handle **handle)
+				     struct fsal_obj_handle **handle,
+				     struct attrlist *attrs_out)
 {
 	int rc;
 	uint32_t opcnt = 0;
@@ -1093,15 +1090,16 @@ static fsal_status_t pxy_lookup_impl(struct fsal_obj_handle *parent,
 		return nfsstat4_to_fsal(rc);
 
 	return pxy_make_object(export, &atok->obj_attributes, &fhok->object,
-			       handle);
+			       handle, attrs_out);
 }
 
 static fsal_status_t pxy_lookup(struct fsal_obj_handle *parent,
 				const char *path,
-				struct fsal_obj_handle **handle)
+				struct fsal_obj_handle **handle,
+				struct attrlist *attrs_out)
 {
 	return pxy_lookup_impl(parent, op_ctx->fsal_export,
-			       op_ctx->creds, path, handle);
+			       op_ctx->creds, path, handle, attrs_out);
 }
 
 static fsal_status_t pxy_do_close(const struct user_cred *creds,
@@ -1172,7 +1170,8 @@ static uint64_t fcnt;
 
 static fsal_status_t pxy_create(struct fsal_obj_handle *dir_hdl,
 				const char *name, struct attrlist *attrib,
-				struct fsal_obj_handle **handle)
+				struct fsal_obj_handle **handle,
+				struct attrlist *attrs_out)
 {
 	int rc;
 	int opcnt = 0;
@@ -1197,7 +1196,7 @@ static fsal_status_t pxy_create(struct fsal_obj_handle *dir_hdl,
 		 getpid(), atomic_inc_uint64_t(&fcnt));
 	owner_len = strnlen(owner_val, sizeof(owner_val));
 
-	attrib->mask &= ATTR_MODE | ATTR_OWNER | ATTR_GROUP;
+	attrib->valid_mask &= ATTR_MODE | ATTR_OWNER | ATTR_GROUP;
 	if (pxy_fsalattr_to_fattr4(attrib, &input_attr) == -1)
 		return fsalstat(ERR_FSAL_INVAL, -1);
 
@@ -1242,18 +1241,18 @@ static fsal_status_t pxy_create(struct fsal_obj_handle *dir_hdl,
 			  &opok->stateid, op_ctx->fsal_export);
 	if (FSAL_IS_ERROR(st))
 		return st;
-	st = pxy_make_object(op_ctx->fsal_export,
-			     &atok->obj_attributes,
-			     &fhok->object, handle);
+	st = pxy_make_object(op_ctx->fsal_export, &atok->obj_attributes,
+			     &fhok->object, handle, attrs_out);
 	if (FSAL_IS_ERROR(st))
 		return st;
-	*attrib = (*handle)->attributes;
-	return st;
+
+	return (*handle)->obj_ops.getattrs(*handle, attrib);
 }
 
 static fsal_status_t pxy_mkdir(struct fsal_obj_handle *dir_hdl,
 			       const char *name, struct attrlist *attrib,
-			       struct fsal_obj_handle **handle)
+			       struct fsal_obj_handle **handle,
+			       struct attrlist *attrs_out)
 {
 	int rc;
 	int opcnt = 0;
@@ -1273,7 +1272,7 @@ static fsal_status_t pxy_mkdir(struct fsal_obj_handle *dir_hdl,
 	 * The caller gives us partial attributes which include mode and owner
 	 * and expects the full attributes back at the end of the call.
 	 */
-	attrib->mask &= ATTR_MODE | ATTR_OWNER | ATTR_GROUP;
+	attrib->valid_mask &= ATTR_MODE | ATTR_OWNER | ATTR_GROUP;
 	if (pxy_fsalattr_to_fattr4(attrib, &input_attr) == -1)
 		return fsalstat(ERR_FSAL_INVAL, -1);
 
@@ -1301,18 +1300,19 @@ static fsal_status_t pxy_mkdir(struct fsal_obj_handle *dir_hdl,
 	if (rc != NFS4_OK)
 		return nfsstat4_to_fsal(rc);
 
-	st = pxy_make_object(op_ctx->fsal_export,
-			     &atok->obj_attributes,
-			     &fhok->object, handle);
-	if (!FSAL_IS_ERROR(st))
-		*attrib = (*handle)->attributes;
-	return st;
+	st = pxy_make_object(op_ctx->fsal_export, &atok->obj_attributes,
+			     &fhok->object, handle, attrs_out);
+	if (FSAL_IS_ERROR(st))
+		return st;
+
+	return (*handle)->obj_ops.getattrs(*handle, attrib);
 }
 
 static fsal_status_t pxy_mknod(struct fsal_obj_handle *dir_hdl,
 			       const char *name, object_file_type_t nodetype,
 			       fsal_dev_t *dev, struct attrlist *attrib,
-			       struct fsal_obj_handle **handle)
+			       struct fsal_obj_handle **handle,
+			       struct attrlist *attrs_out)
 {
 	int rc;
 	int opcnt = 0;
@@ -1358,7 +1358,7 @@ static fsal_status_t pxy_mknod(struct fsal_obj_handle *dir_hdl,
 	 * The caller gives us partial attributes which include mode and owner
 	 * and expects the full attributes back at the end of the call.
 	 */
-	attrib->mask &= ATTR_MODE | ATTR_OWNER | ATTR_GROUP;
+	attrib->valid_mask &= ATTR_MODE | ATTR_OWNER | ATTR_GROUP;
 	if (pxy_fsalattr_to_fattr4(attrib, &input_attr) == -1)
 		return fsalstat(ERR_FSAL_INVAL, -1);
 
@@ -1386,18 +1386,19 @@ static fsal_status_t pxy_mknod(struct fsal_obj_handle *dir_hdl,
 	if (rc != NFS4_OK)
 		return nfsstat4_to_fsal(rc);
 
-	st = pxy_make_object(op_ctx->fsal_export,
-			     &atok->obj_attributes,
-			     &fhok->object, handle);
-	if (!FSAL_IS_ERROR(st))
-		*attrib = (*handle)->attributes;
-	return st;
+	st = pxy_make_object(op_ctx->fsal_export, &atok->obj_attributes,
+			     &fhok->object, handle, attrs_out);
+	if (FSAL_IS_ERROR(st))
+		return st;
+
+	return (*handle)->obj_ops.getattrs(*handle, attrib);
 }
 
 static fsal_status_t pxy_symlink(struct fsal_obj_handle *dir_hdl,
 				 const char *name, const char *link_path,
 				 struct attrlist *attrib,
-				 struct fsal_obj_handle **handle)
+				 struct fsal_obj_handle **handle,
+				 struct attrlist *attrs_out)
 {
 	int rc;
 	int opcnt = 0;
@@ -1417,7 +1418,7 @@ static fsal_status_t pxy_symlink(struct fsal_obj_handle *dir_hdl,
 						  fso_symlink_support))
 		return fsalstat(ERR_FSAL_NOTSUPP, ENOTSUP);
 
-	attrib->mask = ATTR_MODE;
+	attrib->valid_mask = ATTR_MODE;
 	if (pxy_fsalattr_to_fattr4(attrib, &input_attr) == -1)
 		return fsalstat(ERR_FSAL_INVAL, -1);
 
@@ -1445,12 +1446,12 @@ static fsal_status_t pxy_symlink(struct fsal_obj_handle *dir_hdl,
 	if (rc != NFS4_OK)
 		return nfsstat4_to_fsal(rc);
 
-	st = pxy_make_object(op_ctx->fsal_export,
-			     &atok->obj_attributes,
-			     &fhok->object, handle);
-	if (!FSAL_IS_ERROR(st))
-		*attrib = (*handle)->attributes;
-	return st;
+	st = pxy_make_object(op_ctx->fsal_export, &atok->obj_attributes,
+			     &fhok->object, handle, attrs_out);
+	if (FSAL_IS_ERROR(st))
+		return st;
+
+	return (*handle)->obj_ops.getattrs(*handle, attrib);
 }
 
 static fsal_status_t pxy_readlink(struct fsal_obj_handle *obj_hdl,
@@ -1473,13 +1474,8 @@ static fsal_status_t pxy_readlink(struct fsal_obj_handle *obj_hdl,
 	   the \NUL terminator. The link length should be cached in
 	   the file handle. */
 
-	link_content->len =
-	    obj_hdl->attributes.filesize ? (obj_hdl->attributes.filesize +
-					    1) : fsal_default_linksize;
+	link_content->len = fsal_default_linksize;
 	link_content->addr = gsh_malloc(link_content->len);
-
-	if (link_content->addr == NULL)
-		return fsalstat(ERR_FSAL_NOMEM, 0);
 
 	rlok = &resoparray[opcnt].nfs_resop4_u.opreadlink.READLINK4res_u.resok4;
 	rlok->link.utf8string_val = link_content->addr;
@@ -1544,7 +1540,8 @@ static bool xdr_readdirres(XDR *x, nfs_resop4 *rdres)
  */
 static fsal_status_t pxy_do_readdir(struct pxy_obj_handle *ph,
 				    nfs_cookie4 *cookie, fsal_readdir_cb cb,
-				    void *cbarg, bool *eof)
+				    void *cbarg, attrmask_t attrmask,
+				    bool *eof)
 {
 	uint32_t opcnt = 0;
 	int rc;
@@ -1559,7 +1556,7 @@ static fsal_status_t pxy_do_readdir(struct pxy_obj_handle *ph,
 	rdok = &resoparray[opcnt].nfs_resop4_u.opreaddir.READDIR4res_u.resok4;
 	rdok->reply.entries = NULL;
 	COMPOUNDV4_ARG_ADD_OP_READDIR(opcnt, argoparray, *cookie,
-				      pxy_bitmap_readdir);
+				      pxy_bitmap_getattr);
 
 	rc = pxy_nfsv4_call(ph->obj.export, op_ctx->creds, opcnt, argoparray,
 			    resoparray);
@@ -1569,8 +1566,10 @@ static fsal_status_t pxy_do_readdir(struct pxy_obj_handle *ph,
 	*eof = rdok->reply.eof;
 
 	for (e4 = rdok->reply.entries; e4; e4 = e4->nextentry) {
-		struct attrlist attr;
+		struct attrlist attrs;
 		char name[MAXNAMLEN + 1];
+		struct fsal_obj_handle *handle;
+		bool cb_rc;
 
 		/* UTF8 name does not include trailing 0 */
 		if (e4->name.utf8string_len > sizeof(name) - 1)
@@ -1578,12 +1577,26 @@ static fsal_status_t pxy_do_readdir(struct pxy_obj_handle *ph,
 		memcpy(name, e4->name.utf8string_val, e4->name.utf8string_len);
 		name[e4->name.utf8string_len] = '\0';
 
-		if (nfs4_Fattr_To_FSAL_attr(&attr, &e4->attrs, NULL))
+		if (nfs4_Fattr_To_FSAL_attr(&attrs, &e4->attrs, NULL))
 			return fsalstat(ERR_FSAL_FAULT, 0);
 
 		*cookie = e4->cookie;
 
-		if (!cb(name, cbarg, e4->cookie))
+		/** @todo FSF: this could be handled by getting handle as part
+		 *             of readdir attributes. However, if acl is
+		 *             requested, we might get it separately to
+		 *             avoid over large READDIR response.
+		 */
+		st = pxy_lookup_impl(&ph->obj, op_ctx->fsal_export,
+				     op_ctx->creds, name, &handle, NULL);
+		if (FSAL_IS_ERROR(st))
+			break;
+
+		cb_rc = cb(name, handle, &attrs, cbarg, e4->cookie);
+
+		fsal_release_attrs(&attrs);
+
+		if (!cb_rc)
 			break;
 	}
 	xdr_free((xdrproc_t) xdr_readdirres, resoparray);
@@ -1593,7 +1606,8 @@ static fsal_status_t pxy_do_readdir(struct pxy_obj_handle *ph,
 /* What to do about verifier if server needs one? */
 static fsal_status_t pxy_readdir(struct fsal_obj_handle *dir_hdl,
 				 fsal_cookie_t *whence, void *cbarg,
-				 fsal_readdir_cb cb, bool *eof)
+				 fsal_readdir_cb cb, attrmask_t attrmask,
+				 bool *eof)
 {
 	nfs_cookie4 cookie = 0;
 	struct pxy_obj_handle *ph;
@@ -1606,7 +1620,7 @@ static fsal_status_t pxy_readdir(struct fsal_obj_handle *dir_hdl,
 	do {
 		fsal_status_t st;
 
-		st = pxy_do_readdir(ph, &cookie, cb, cbarg, eof);
+		st = pxy_do_readdir(ph, &cookie, cb, cbarg, attrmask, eof);
 		if (FSAL_IS_ERROR(st))
 			return st;
 	} while (*eof == false);
@@ -1641,11 +1655,10 @@ static fsal_status_t pxy_rename(struct fsal_obj_handle *obj_hdl,
 	return nfsstat4_to_fsal(rc);
 }
 
-static fsal_status_t pxy_getattrs_impl(const struct user_cred *creds,
-				       struct fsal_export *exp,
-				       nfs_fh4 *filehandle,
-				       struct attrlist *obj_attr)
+static fsal_status_t pxy_getattrs(struct fsal_obj_handle *obj_hdl,
+				  struct attrlist *attrs)
 {
+	struct pxy_obj_handle *ph;
 	int rc;
 	uint32_t opcnt = 0;
 #define FSAL_GETATTR_NB_OP_ALLOC 2
@@ -1654,35 +1667,30 @@ static fsal_status_t pxy_getattrs_impl(const struct user_cred *creds,
 	GETATTR4resok *atok;
 	char fattr_blob[FATTR_BLOB_SZ];
 
-	COMPOUNDV4_ARG_ADD_OP_PUTFH(opcnt, argoparray, *filehandle);
+	ph = container_of(obj_hdl, struct pxy_obj_handle, obj);
+
+	COMPOUNDV4_ARG_ADD_OP_PUTFH(opcnt, argoparray, ph->fh4);
 
 	atok = pxy_fill_getattr_reply(resoparray + opcnt, fattr_blob,
 				      sizeof(fattr_blob));
 	COMPOUNDV4_ARG_ADD_OP_GETATTR(opcnt, argoparray, pxy_bitmap_getattr);
 
-	rc = pxy_nfsv4_call(exp, creds, opcnt, argoparray, resoparray);
-	if (rc != NFS4_OK)
-		return nfsstat4_to_fsal(rc);
+	rc = pxy_nfsv4_call(op_ctx->fsal_export, op_ctx->creds, opcnt,
+			    argoparray, resoparray);
 
-	if (nfs4_Fattr_To_FSAL_attr(obj_attr, &atok->obj_attributes, NULL) !=
+	if (rc != NFS4_OK) {
+		if (attrs->request_mask & ATTR_RDATTR_ERR) {
+			/* Caller asked for error to be visible. */
+			attrs->valid_mask = ATTR_RDATTR_ERR;
+		}
+		return nfsstat4_to_fsal(rc);
+	}
+
+	if (nfs4_Fattr_To_FSAL_attr(attrs, &atok->obj_attributes, NULL) !=
 	    NFS4_OK)
 		return fsalstat(ERR_FSAL_INVAL, 0);
 
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
-}
-
-static fsal_status_t pxy_getattrs(struct fsal_obj_handle *obj_hdl)
-{
-	struct pxy_obj_handle *ph;
-	fsal_status_t st;
-	struct attrlist obj_attr;
-
-	ph = container_of(obj_hdl, struct pxy_obj_handle, obj);
-	st = pxy_getattrs_impl(op_ctx->creds, op_ctx->fsal_export,
-			       &ph->fh4, &obj_attr);
-	if (!FSAL_IS_ERROR(st))
-		obj_hdl->attributes = obj_attr;
-	return st;
 }
 
 /*
@@ -1699,15 +1707,26 @@ static fsal_status_t pxy_setattrs(struct fsal_obj_handle *obj_hdl,
 	fattr4 input_attr;
 	uint32_t opcnt = 0;
 	struct pxy_obj_handle *ph;
+#if GETATTR_AFTER
 	char fattr_blob[FATTR_BLOB_SZ];
 	GETATTR4resok *atok;
 	struct attrlist attrs_after;
+#endif
 
 #define FSAL_SETATTR_NB_OP_ALLOC 3
 	nfs_argop4 argoparray[FSAL_SETATTR_NB_OP_ALLOC];
 	nfs_resop4 resoparray[FSAL_SETATTR_NB_OP_ALLOC];
 
-	if (FSAL_TEST_MASK(attrs->mask, ATTR_MODE))
+	/*
+	* No way to update CTIME using a NFSv4 SETATTR.
+	* Server will return NFS4ERR_INVAL (22).
+	* time_metadata is a readonly attribute in NFSv4 and NFSv4.1.
+	* (section 5.7 in RFC7530 or RFC5651)
+	* Nevermind : this update is useless, we prevent it.
+	*/
+	FSAL_UNSET_MASK(attrs->valid_mask, ATTR_CTIME);
+
+	if (FSAL_TEST_MASK(attrs->valid_mask, ATTR_MODE))
 		attrs->mode &= ~op_ctx->fsal_export->exp_ops.
 				fs_umask(op_ctx->fsal_export);
 
@@ -1721,10 +1740,12 @@ static fsal_status_t pxy_setattrs(struct fsal_obj_handle *obj_hdl,
 	resoparray[opcnt].nfs_resop4_u.opsetattr.attrsset = empty_bitmap;
 	COMPOUNDV4_ARG_ADD_OP_SETATTR(opcnt, argoparray, input_attr);
 
+#if GETATTR_AFTER
 	atok =
 	    pxy_fill_getattr_reply(resoparray + opcnt, fattr_blob,
 				   sizeof(fattr_blob));
 	COMPOUNDV4_ARG_ADD_OP_GETATTR(opcnt, argoparray, pxy_bitmap_getattr);
+#endif
 
 	rc = pxy_nfsv4_call(op_ctx->fsal_export, op_ctx->creds,
 			    opcnt, argoparray, resoparray);
@@ -1732,14 +1753,16 @@ static fsal_status_t pxy_setattrs(struct fsal_obj_handle *obj_hdl,
 	if (rc != NFS4_OK)
 		return nfsstat4_to_fsal(rc);
 
+#if GETATTR_AFTER
 	rc = nfs4_Fattr_To_FSAL_attr(&attrs_after, &atok->obj_attributes, NULL);
 	if (rc != NFS4_OK) {
 		LogWarn(COMPONENT_FSAL,
-			"Attribute conversion fails with %d, "
-			"ignoring attibutes after making changes", rc);
+			"Attribute conversion fails with %d, ignoring attibutes after making changes",
+			rc);
 	} else {
-		obj_hdl->attributes = attrs_after;
+		ph->attributes = attrs_after;
 	}
+#endif
 
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
@@ -1751,6 +1774,7 @@ static bool pxy_handle_is(struct fsal_obj_handle *obj_hdl,
 }
 
 static fsal_status_t pxy_unlink(struct fsal_obj_handle *dir_hdl,
+				struct fsal_obj_handle *obj_hdl,
 				const char *name)
 {
 	int opcnt = 0;
@@ -1759,27 +1783,33 @@ static fsal_status_t pxy_unlink(struct fsal_obj_handle *dir_hdl,
 #define FSAL_UNLINK_NB_OP_ALLOC 3
 	nfs_argop4 argoparray[FSAL_UNLINK_NB_OP_ALLOC];
 	nfs_resop4 resoparray[FSAL_UNLINK_NB_OP_ALLOC];
+#if GETATTR_AFTER
 	GETATTR4resok *atok;
 	char fattr_blob[FATTR_BLOB_SZ];
 	struct attrlist dirattr;
+#endif
 
 	ph = container_of(dir_hdl, struct pxy_obj_handle, obj);
 	COMPOUNDV4_ARG_ADD_OP_PUTFH(opcnt, argoparray, ph->fh4);
 	COMPOUNDV4_ARG_ADD_OP_REMOVE(opcnt, argoparray, (char *)name);
 
+#if GETATTR_AFTER
 	atok =
 	    pxy_fill_getattr_reply(resoparray + opcnt, fattr_blob,
 				   sizeof(fattr_blob));
 	COMPOUNDV4_ARG_ADD_OP_GETATTR(opcnt, argoparray, pxy_bitmap_getattr);
+#endif
 
 	rc = pxy_nfsv4_call(op_ctx->fsal_export, op_ctx->creds,
 			    opcnt, argoparray, resoparray);
 	if (rc != NFS4_OK)
 		return nfsstat4_to_fsal(rc);
 
+#if GETATTR_AFTER
 	if (nfs4_Fattr_To_FSAL_attr(&dirattr, &atok->obj_attributes, NULL) ==
 	    NFS4_OK)
-		dir_hdl->attributes = dirattr;
+		ph->attributes = dirattr;
+#endif
 
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
@@ -2041,24 +2071,39 @@ static unsigned int hash_nfs_fh4(const nfs_fh4 *fh, unsigned int cookie)
 
 static struct pxy_obj_handle *pxy_alloc_handle(struct fsal_export *exp,
 					       const nfs_fh4 *fh,
-					       const struct attrlist *attr)
+					       fattr4 *obj_attributes,
+					       struct attrlist *attrs_out)
 {
 	struct pxy_obj_handle *n = gsh_malloc(sizeof(*n) + fh->nfs_fh4_len);
+	compound_data_t data;
+	struct attrlist attributes;
+
+	memset(&attributes, 0, sizeof(attributes));
+	memset(&data, 0, sizeof(data));
 
 	if (n) {
+		data.current_obj = &n->obj;
+
+		if (nfs4_Fattr_To_FSAL_attr(&attributes,
+					    obj_attributes,
+					    &data) != NFS4_OK) {
+			gsh_free(n);
+			return NULL;
+		}
+
 		n->fh4 = *fh;
 		n->fh4.nfs_fh4_val = n->blob.bytes;
 		memcpy(n->blob.bytes, fh->nfs_fh4_val, fh->nfs_fh4_len);
-		n->obj.attributes = *attr;
 		n->blob.len = fh->nfs_fh4_len + sizeof(n->blob);
-		n->blob.type = attr->type;
+		n->blob.type = attributes.type;
 #ifdef PROXY_HANDLE_MAPPING
 		int rc;
+
 		memset(&n->h23, 0, sizeof(n->h23));
 		n->h23.len = sizeof(n->h23);
 		n->h23.type = PXY_HANDLE_MAPPED;
-		n->h23.object_id = attr->fileid;
-		n->h23.handle_hash = hash_nfs_fh4(fh, attr->fileid);
+		n->h23.object_id = n->obj.fileid;
+		n->h23.handle_hash = hash_nfs_fh4(fh, n->obj.fileid);
 
 		rc = HandleMap_SetFH(&n->h23, &n->blob, n->blob.len);
 		if ((rc != HANDLEMAP_SUCCESS) && (rc != HANDLEMAP_EXISTS)) {
@@ -2066,8 +2111,19 @@ static struct pxy_obj_handle *pxy_alloc_handle(struct fsal_export *exp,
 			return NULL;
 		}
 #endif
-		fsal_obj_handle_init(&n->obj, exp, attr->type);
+		fsal_obj_handle_init(&n->obj, exp, attributes.type);
+		n->obj.fsid = attributes.fsid;
+		n->obj.fileid = attributes.fileid;
 		pxy_handle_ops_init(&n->obj.obj_ops);
+		if (attrs_out != NULL) {
+			/* We aren't keeping ACL ref ourself, so pass it
+			 * to the caller.
+			 */
+			fsal_copy_attrs(attrs_out, &attributes, true);
+		} else {
+			/* Make sure we release the attributes. */
+			fsal_release_attrs(&attributes);
+		}
 	}
 	return n;
 }
@@ -2077,21 +2133,17 @@ static struct pxy_obj_handle *pxy_alloc_handle(struct fsal_export *exp,
 
 fsal_status_t pxy_lookup_path(struct fsal_export *exp_hdl,
 			      const char *path,
-			      struct fsal_obj_handle **handle)
+			      struct fsal_obj_handle **handle,
+			      struct attrlist *attrs_out)
 {
 	struct fsal_obj_handle *next;
 	struct fsal_obj_handle *parent = NULL;
 	char *saved;
 	char *pcopy;
-	char *p;
+	char *p, *pnext;
 	struct user_cred *creds = op_ctx->creds;
 
-	if (!path || path[0] != '/')
-		return fsalstat(ERR_FSAL_INVAL, EINVAL);
-
 	pcopy = gsh_strdup(path);
-	if (!pcopy)
-		return fsalstat(ERR_FSAL_NOMEM, ENOMEM);
 
 	p = strtok_r(pcopy, "/", &saved);
 	while (p) {
@@ -2103,17 +2155,24 @@ fsal_status_t pxy_lookup_path(struct fsal_export *exp_hdl,
 			gsh_free(pcopy);
 			return fsalstat(ERR_FSAL_ACCESS, EACCES);
 		}
-		/* Note that if any element is a symlink, the following will
-		 * fail, thus no security exposure.
+		/* Get the next token now, so we know if we are at the
+		 * terminal token or not.
 		 */
-		fsal_status_t st = pxy_lookup_impl(parent, exp_hdl,
-						   creds, p, &next);
+		pnext = strtok_r(NULL, "/", &saved);
+
+		/* Note that if any element is a symlink, the following will
+		 * fail, thus no security exposure. Only pass back the
+		 * attributes of the terminal lookup.
+		 */
+		fsal_status_t st = pxy_lookup_impl(parent, exp_hdl, creds, p,
+						   &next, pnext == NULL ?
+						   attrs_out : NULL);
 		if (FSAL_IS_ERROR(st)) {
 			gsh_free(pcopy);
 			return st;
 		}
 
-		p = strtok_r(NULL, "/", &saved);
+		p = pnext;
 		parent = next;
 	}
 	/* The final element could be a symlink, but either way we are called
@@ -2132,13 +2191,18 @@ fsal_status_t pxy_lookup_path(struct fsal_export *exp_hdl,
  */
 fsal_status_t pxy_create_handle(struct fsal_export *exp_hdl,
 				struct gsh_buffdesc *hdl_desc,
-				struct fsal_obj_handle **handle)
+				struct fsal_obj_handle **handle,
+				struct attrlist *attrs_out)
 {
-	fsal_status_t st;
 	nfs_fh4 fh4;
-	struct attrlist attr;
 	struct pxy_obj_handle *ph;
 	struct pxy_handle_blob *blob;
+	int rc;
+	uint32_t opcnt = 0;
+	nfs_argop4 argoparray[FSAL_GETATTR_NB_OP_ALLOC];
+	nfs_resop4 resoparray[FSAL_GETATTR_NB_OP_ALLOC];
+	GETATTR4resok *atok;
+	char fattr_blob[FATTR_BLOB_SZ];
 
 	blob = (struct pxy_handle_blob *)hdl_desc->addr;
 	if (blob->len != hdl_desc->len)
@@ -2147,11 +2211,19 @@ fsal_status_t pxy_create_handle(struct fsal_export *exp_hdl,
 	fh4.nfs_fh4_val = blob->bytes;
 	fh4.nfs_fh4_len = blob->len - sizeof(*blob);
 
-	st = pxy_getattrs_impl(op_ctx->creds, exp_hdl, &fh4, &attr);
-	if (FSAL_IS_ERROR(st))
-		return st;
+	COMPOUNDV4_ARG_ADD_OP_PUTFH(opcnt, argoparray, fh4);
 
-	ph = pxy_alloc_handle(exp_hdl, &fh4, &attr);
+	atok = pxy_fill_getattr_reply(resoparray + opcnt, fattr_blob,
+				      sizeof(fattr_blob));
+	COMPOUNDV4_ARG_ADD_OP_GETATTR(opcnt, argoparray, pxy_bitmap_getattr);
+
+	rc = pxy_nfsv4_call(exp_hdl, op_ctx->creds, opcnt,
+			    argoparray, resoparray);
+
+	if (rc != NFS4_OK)
+		return nfsstat4_to_fsal(rc);
+
+	ph = pxy_alloc_handle(exp_hdl, &fh4, &atok->obj_attributes, attrs_out);
 	if (!ph)
 		return fsalstat(ERR_FSAL_FAULT, 0);
 
@@ -2213,7 +2285,7 @@ fsal_status_t pxy_extract_handle(struct fsal_export *exp_hdl,
 #endif
 	if (fh_desc->len != fh_size) {
 		LogMajor(COMPONENT_FSAL,
-			 "Size mismatch for handle.  should be %lu, got %lu",
+			 "Size mismatch for handle.  should be %zu, got %zu",
 			 fh_size, fh_desc->len);
 		return fsalstat(ERR_FSAL_SERVERFAULT, 0);
 	}

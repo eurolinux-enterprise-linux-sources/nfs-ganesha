@@ -47,8 +47,8 @@ void display_xfs_handle(struct display_buffer *dspbuf,
 	xfs_handle_t *hdl = (xfs_handle_t *) fh->handle_data;
 
 	(void) display_printf(dspbuf,
-			      "Handle len %hhu:"
-			      " fsid=0x%016"PRIx32".0x%016"PRIx32
+			      "Handle len %hhu: fsid=0x%016"
+			      PRIx32".0x%016"PRIx32
 			      " fid_len=%"PRIu16
 			      " fid_pad=%"PRIu16
 			      " fid_gen=%"PRIu32
@@ -204,6 +204,7 @@ int vfs_readlink(struct vfs_fsal_obj_handle *hdl,
 {
 	char ldata[MAXPATHLEN + 1];
 	int retval;
+
 	LogXFSHandle(hdl->handle);
 	retval = readlink_by_handle(hdl->handle->handle_data,
 				    hdl->handle->handle_len,
@@ -217,13 +218,10 @@ int vfs_readlink(struct vfs_fsal_obj_handle *hdl,
 	ldata[retval] = '\0';
 
 	hdl->u.symlink.link_content = gsh_strdup(ldata);
-	if (hdl->u.symlink.link_content == NULL) {
-		*ferr = ERR_FSAL_NOMEM;
-		retval = -ENOMEM;
-	} else {
-		hdl->u.symlink.link_size = retval + 1;
-		retval = 0;
-	}
+
+	hdl->u.symlink.link_size = retval + 1;
+	retval = 0;
+
  out:
 	return retval;
 }
@@ -326,8 +324,8 @@ bool vfs_valid_handle(struct gsh_buffdesc *desc)
 		struct display_buffer dspbuf = {sizeof(buf), buf, buf};
 
 		(void) display_printf(&dspbuf,
-				      "Handle len %d: "
-				      " fsid=0x%016"PRIx32".0x%016"PRIx32
+				      "Handle len %d: fsid=0x%016"
+				      PRIx32".0x%016"PRIx32
 				      " fid_len=%"PRIu16
 				      " fid_pad=%"PRIu16
 				      " fid_gen=%"PRIu32
@@ -412,10 +410,13 @@ int vfs_get_root_handle(struct vfs_filesystem *vfs_fs,
 		goto errout;
 	}
 
+	/* Extract fsid from the root handle and re-index the filesystem
+	 * using it. This is because the file handle already has an fsid in
+	 * it.
+	 */
 	(void) vfs_extract_fsid(fh, &fsid_type, &fsid);
 
-	retval = re_index_fs_fsid(vfs_fs->fs, fsid_type,
-				  fsid.major, fsid.minor);
+	retval = re_index_fs_fsid(vfs_fs->fs, fsid_type, &fsid);
 
 	if (retval < 0) {
 		LogCrit(COMPONENT_FSAL,

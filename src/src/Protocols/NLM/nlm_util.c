@@ -37,13 +37,6 @@
 
 /* nlm grace time tracking */
 static struct timeval nlm_grace_tv;
-static const int NLM4_GRACE_PERIOD = 10;
-
-/*
- * Time after which we should retry the granted
- * message request again
- */
-static const int NLM4_CLIENT_GRACE_PERIOD = 3;
 
 /* We manage our own cookie for GRANTED call backs
  * Cookie
@@ -101,42 +94,31 @@ inline uint64_t lock_end(uint64_t start, uint64_t len)
 		return start + len - 1;
 }
 
-bool fill_netobj(netobj *dst, char *data, int len)
+void fill_netobj(netobj *dst, char *data, int len)
 {
 	dst->n_len = 0;
 	dst->n_bytes = NULL;
 	if (len != 0) {
 		dst->n_bytes = gsh_malloc(len);
-		if (dst->n_bytes != NULL) {
-			dst->n_len = len;
-			memcpy(dst->n_bytes, data, len);
-		} else
-			return false;
+		dst->n_len = len;
+		memcpy(dst->n_bytes, data, len);
 	}
-	return true;
 }
 
-netobj *copy_netobj(netobj *dst, netobj *src)
+void copy_netobj(netobj *dst, netobj *src)
 {
-	if (dst == NULL)
-		return NULL;
-	dst->n_len = 0;
 	if (src->n_len != 0) {
 		dst->n_bytes = gsh_malloc(src->n_len);
-		if (!dst->n_bytes)
-			return NULL;
 		memcpy(dst->n_bytes, src->n_bytes, src->n_len);
 	} else
 		dst->n_bytes = NULL;
 
 	dst->n_len = src->n_len;
-	return dst;
 }
 
 void netobj_free(netobj *obj)
 {
-	if (obj->n_bytes)
-		gsh_free(obj->n_bytes);
+	gsh_free(obj->n_bytes);
 }
 
 void netobj_to_string(netobj *obj, char *buffer, int maxlen)
@@ -165,9 +147,7 @@ void free_grant_arg(state_async_queue_t *arg)
 	netobj_free(&nlm_arg->nlm_async_args.nlm_async_grant.cookie);
 	netobj_free(&nlm_arg->nlm_async_args.nlm_async_grant.alock.oh);
 	netobj_free(&nlm_arg->nlm_async_args.nlm_async_grant.alock.fh);
-	if (nlm_arg->nlm_async_args.nlm_async_grant.alock.caller_name != NULL)
-		gsh_free(nlm_arg->nlm_async_args.nlm_async_grant.alock.
-			 caller_name);
+	gsh_free(nlm_arg->nlm_async_args.nlm_async_grant.alock.caller_name);
 	gsh_free(arg);
 }
 
@@ -234,18 +214,13 @@ static void nlm4_send_grant_msg(state_async_queue_t *arg)
 		goto out;
 	}
 
-	PTHREAD_RWLOCK_wrlock(&cookie_entry->sce_entry->state_lock);
-
 	if (cookie_entry->sce_lock_entry->sle_block_data == NULL) {
 		/* Wow, we're not doing well... */
-		PTHREAD_RWLOCK_unlock(&cookie_entry->sce_entry->state_lock);
 		LogFullDebug(COMPONENT_NLM,
 			     "Could not find block data for cookie=%s (must be an old NLM_GRANTED_RES)",
 			     buffer);
 		goto out;
 	}
-
-	PTHREAD_RWLOCK_unlock(&cookie_entry->sce_entry->state_lock);
 
 	/* Initialize a context, it is ok if the export is stale because
 	 * we must clean up the cookie_entry.
@@ -275,11 +250,14 @@ static void nlm4_send_grant_msg(state_async_queue_t *arg)
 
 int nlm_process_parameters(struct svc_req *req, bool exclusive,
 			   nlm4_lock *alock, fsal_lock_param_t *plock,
-			   cache_entry_t **ppentry,
+			   struct fsal_obj_handle **ppobj,
 			   care_t care, state_nsm_client_t **ppnsm_client,
 			   state_nlm_client_t **ppnlm_client,
 			   state_owner_t **ppowner,
-			   state_block_data_t **block_data)
+			   state_block_data_t **block_data,
+			   bool nsm_state_applies,
+			   int32_t nsm_state,
+			   state_t **state)
 {
 	nfsstat3 nfsstat3;
 	SVCXPRT *ptr_svc = req->rq_xprt;
@@ -289,12 +267,15 @@ int nlm_process_parameters(struct svc_req *req, bool exclusive,
 	*ppnlm_client = NULL;
 	*ppowner = NULL;
 
-	/* Convert file handle into a cache entry */
-	*ppentry = nfs3_FhandleToCache((struct nfs_fh3 *)&alock->fh,
+	if (state != NULL)
+		*state = NULL;
+
+	/* Convert file handle into a fsal object */
+	*ppobj = nfs3_FhandleToCache((struct nfs_fh3 *)&alock->fh,
 				       &nfsstat3,
 				       &rc);
 
-	if (*ppentry == NULL) {
+	if (*ppobj == NULL) {
 		/* handle is not valid */
 		return NLM4_STALE_FH;
 	}
@@ -322,8 +303,6 @@ int nlm_process_parameters(struct svc_req *req, bool exclusive,
 		 * unlock), just return GRANTED (the unlock must succeed,
 		 * there can't be any locks).
 		 */
-		dec_nsm_client_ref(*ppnsm_client);
-
 		if (care != CARE_NOT)
 			rc = NLM4_DENIED_NOLOCKS;
 		else
@@ -336,9 +315,6 @@ int nlm_process_parameters(struct svc_req *req, bool exclusive,
 
 	if (*ppowner == NULL) {
 		LogDebug(COMPONENT_NLM, "Could not get NLM Owner");
-		dec_nsm_client_ref(*ppnsm_client);
-		dec_nlm_client_ref(*ppnlm_client);
-		*ppnlm_client = NULL;
 
 		/* If owner is not found, and we don't care (such as unlock),
 		 * just return GRANTED (the unlock must succeed, there can't be
@@ -352,26 +328,38 @@ int nlm_process_parameters(struct svc_req *req, bool exclusive,
 		goto out_put;
 	}
 
-	if (block_data != NULL) {
-		state_block_data_t *bdat = gsh_malloc(sizeof(*bdat));
-		*block_data = bdat;
+	if (state != NULL) {
+		rc = get_nlm_state(STATE_TYPE_NLM_LOCK,
+				   *ppobj,
+				   *ppowner,
+				   nsm_state_applies,
+				   nsm_state,
+				   state);
 
-		/* Fill in the block data, if we don't get one, we will just
-		 * proceed without (which will mean the lock doesn't block.
-		 */
-		if (bdat != NULL) {
-			memset(bdat, 0, sizeof(*bdat));
-			bdat->sbd_granted_callback = nlm_granted_callback;
-			bdat->sbd_prot.sbd_nlm.sbd_nlm_fh.n_bytes =
-				bdat->sbd_prot.sbd_nlm.sbd_nlm_fh_buf;
-			bdat->sbd_prot.sbd_nlm.sbd_nlm_fh.n_len =
-				alock->fh.n_len;
-			memcpy(bdat->sbd_prot.sbd_nlm.sbd_nlm_fh_buf,
-			       alock->fh.n_bytes,
-			       alock->fh.n_len);
+		if (rc > 0) {
+			LogDebug(COMPONENT_NLM, "Could not get NLM State");
+			goto out_put;
 		}
 	}
-	/* Fill in plock */
+
+	if (block_data != NULL) {
+		state_block_data_t *bdat = gsh_calloc(1, sizeof(*bdat));
+		*block_data = bdat;
+
+		/* Fill in the block data. */
+		bdat->sbd_granted_callback = nlm_granted_callback;
+		bdat->sbd_prot.sbd_nlm.sbd_nlm_fh.n_bytes =
+			bdat->sbd_prot.sbd_nlm.sbd_nlm_fh_buf;
+		bdat->sbd_prot.sbd_nlm.sbd_nlm_fh.n_len =
+			alock->fh.n_len;
+		memcpy(bdat->sbd_prot.sbd_nlm.sbd_nlm_fh_buf,
+		       alock->fh.n_bytes,
+		       alock->fh.n_len);
+	}
+
+	/* Fill in plock (caller will reset reclaim if appropriate) */
+	plock->lock_sle_type = FSAL_POSIX_LOCK;
+	plock->lock_reclaim = false;
 	plock->lock_type = exclusive ? FSAL_LOCK_W : FSAL_LOCK_R;
 	plock->lock_start = alock->l_offset;
 	plock->lock_length = alock->l_len;
@@ -382,17 +370,34 @@ int nlm_process_parameters(struct svc_req *req, bool exclusive,
 
  out_put:
 
-	cache_inode_put(*ppentry);
-	*ppentry = NULL;
+	(*ppobj)->obj_ops.put_ref((*ppobj));
+
+	if (*ppnsm_client != NULL) {
+		dec_nsm_client_ref(*ppnsm_client);
+		*ppnsm_client = NULL;
+	}
+
+	if (*ppnlm_client != NULL) {
+		dec_nlm_client_ref(*ppnlm_client);
+		*ppnlm_client = NULL;
+	}
+
+	if (*ppowner != NULL) {
+		dec_state_owner_ref(*ppowner);
+		*ppowner = NULL;
+	}
+
+	*ppobj = NULL;
 	return rc;
 }
 
 int nlm_process_share_parms(struct svc_req *req, nlm4_share *share,
 			    struct fsal_export *exp_hdl,
-			    cache_entry_t **ppentry, care_t care,
+			    struct fsal_obj_handle **ppobj, care_t care,
 			    state_nsm_client_t **ppnsm_client,
 			    state_nlm_client_t **ppnlm_client,
-			    state_owner_t **ppowner)
+			    state_owner_t **ppowner,
+			    state_t **state)
 {
 	nfsstat3 nfsstat3;
 	SVCXPRT *ptr_svc = req->rq_xprt;
@@ -402,12 +407,12 @@ int nlm_process_share_parms(struct svc_req *req, nlm4_share *share,
 	*ppnlm_client = NULL;
 	*ppowner = NULL;
 
-	/* Convert file handle into a cache entry */
-	*ppentry = nfs3_FhandleToCache((struct nfs_fh3 *)&share->fh,
+	/* Convert file handle into a fsal object */
+	*ppobj = nfs3_FhandleToCache((struct nfs_fh3 *)&share->fh,
 				       &nfsstat3,
 				       &rc);
 
-	if (*ppentry == NULL) {
+	if (*ppobj == NULL) {
 		/* handle is not valid */
 		return NLM4_STALE_FH;
 	}
@@ -435,8 +440,6 @@ int nlm_process_share_parms(struct svc_req *req, nlm4_share *share,
 		 * unlock), just return GRANTED (the unlock must succeed, there
 		 * can't be any locks).
 		 */
-		dec_nsm_client_ref(*ppnsm_client);
-
 		if (care != CARE_NOT)
 			rc = NLM4_DENIED_NOLOCKS;
 		else
@@ -449,9 +452,6 @@ int nlm_process_share_parms(struct svc_req *req, nlm4_share *share,
 
 	if (*ppowner == NULL) {
 		LogDebug(COMPONENT_NLM, "Could not get NLM Owner");
-		dec_nsm_client_ref(*ppnsm_client);
-		dec_nlm_client_ref(*ppnlm_client);
-		*ppnlm_client = NULL;
 
 		/* If owner is not found, and we don't care (such as unlock),
 		 * just return GRANTED (the unlock must succeed, there can't be
@@ -465,14 +465,44 @@ int nlm_process_share_parms(struct svc_req *req, nlm4_share *share,
 		goto out_put;
 	}
 
+	if (state != NULL) {
+		rc = get_nlm_state(STATE_TYPE_NLM_SHARE,
+				   *ppobj,
+				   *ppowner,
+				   false,
+				   0,
+				   state);
+
+		if (rc > 0 || !(*state)) {
+			LogDebug(COMPONENT_NLM, "Could not get NLM State");
+			goto out_put;
+		}
+	}
+
 	LogFullDebug(COMPONENT_NLM, "Parameters Processed");
 
+	/* Return non NLM error code '-1' on success. */
 	return -1;
 
  out_put:
 
-	cache_inode_put(*ppentry);
-	*ppentry = NULL;
+	if (*ppnsm_client != NULL) {
+		dec_nsm_client_ref(*ppnsm_client);
+		*ppnsm_client = NULL;
+	}
+
+	if (*ppnlm_client != NULL) {
+		dec_nlm_client_ref(*ppnlm_client);
+		*ppnlm_client = NULL;
+	}
+
+	if (*ppowner != NULL) {
+		dec_state_owner_ref(*ppowner);
+		*ppowner = NULL;
+	}
+
+	(*ppobj)->obj_ops.put_ref((*ppobj));
+	*ppobj = NULL;
 	return rc;
 }
 
@@ -520,7 +550,7 @@ nlm4_stats nlm_convert_state_error(state_status_t status)
 		return NLM4_GRANTED;
 	case STATE_LOCK_CONFLICT:
 		return NLM4_DENIED;
-	case STATE_STATE_CONFLICT:
+	case STATE_SHARE_DENIED:
 		return NLM4_DENIED;
 	case STATE_MALLOC_ERROR:
 		return NLM4_DENIED_NOLOCKS;
@@ -537,13 +567,14 @@ nlm4_stats nlm_convert_state_error(state_status_t status)
 	case STATE_ESTALE:
 		return NLM4_STALE_FH;
 	case STATE_FILE_BIG:
+	case STATE_BAD_RANGE:
 		return NLM4_FBIG;
 	default:
 		return NLM4_FAILED;
 	}
 }
 
-state_status_t nlm_granted_callback(cache_entry_t *pentry,
+state_status_t nlm_granted_callback(struct fsal_obj_handle *obj,
 				    state_lock_entry_t *lock_entry)
 {
 	state_block_data_t *block_data = lock_entry->sle_block_data;
@@ -558,17 +589,7 @@ state_status_t nlm_granted_callback(cache_entry_t *pentry,
 	state_status_t state_status;
 	state_status_t state_status_int;
 
-	arg = gsh_malloc(sizeof(*arg));
-	if (arg == NULL) {
-		/* If we fail allocation the best is to delete the block entry
-		 * so that client can try again and get the lock. May be
-		 * by then we are able to allocate objects
-		 */
-		state_status = STATE_MALLOC_ERROR;
-		return state_status;
-	}
-
-	memset(arg, 0, sizeof(*arg));
+	arg = gsh_calloc(1, sizeof(*arg));
 
 	/* Get a cookie to use for this grant */
 	next_granted_cookie(&nlm_grant_cookie);
@@ -577,7 +598,7 @@ state_status_t nlm_granted_callback(cache_entry_t *pentry,
 	 * It will also request lock from FSAL.
 	 * Could return STATE_LOCK_BLOCKED because FSAL would have had to block.
 	 */
-	state_status = state_add_grant_cookie(pentry,
+	state_status = state_add_grant_cookie(obj,
 					      &nlm_grant_cookie,
 					      sizeof(nlm_grant_cookie),
 					      lock_entry,
@@ -597,24 +618,18 @@ state_status_t nlm_granted_callback(cache_entry_t *pentry,
 	inarg = &arg->state_async_data.state_nlm_async_data.nlm_async_args.
 		nlm_async_grant;
 
-	if (!copy_netobj(&inarg->alock.fh, &nlm_block_data->sbd_nlm_fh))
-		goto grant_fail_malloc;
+	copy_netobj(&inarg->alock.fh, &nlm_block_data->sbd_nlm_fh);
 
-	if (!fill_netobj(&inarg->alock.oh,
-			 lock_entry->sle_owner->so_owner_val,
-			 lock_entry->sle_owner->so_owner_len))
-		goto grant_fail_malloc;
+	fill_netobj(&inarg->alock.oh,
+		    lock_entry->sle_owner->so_owner_val,
+		    lock_entry->sle_owner->so_owner_len);
 
-	if (!fill_netobj(&inarg->cookie,
-			 (char *)&nlm_grant_cookie,
-			 sizeof(nlm_grant_cookie)))
-		goto grant_fail_malloc;
+	fill_netobj(&inarg->cookie,
+		    (char *)&nlm_grant_cookie,
+		    sizeof(nlm_grant_cookie));
 
 	inarg->alock.caller_name =
 	    gsh_strdup(nlm_grant_client->slc_nlm_caller_name);
-
-	if (!inarg->alock.caller_name)
-		goto grant_fail_malloc;
 
 	inarg->exclusive = lock_entry->sle_lock.lock_type == FSAL_LOCK_W;
 	inarg->alock.svid = nlm_grant_owner->so_nlm_svid;
@@ -640,9 +655,6 @@ state_status_t nlm_granted_callback(cache_entry_t *pentry,
 		goto grant_fail;
 
 	return state_status;
-
- grant_fail_malloc:
-	state_status = STATE_MALLOC_ERROR;
 
  grant_fail:
 

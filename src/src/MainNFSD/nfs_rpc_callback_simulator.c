@@ -337,6 +337,7 @@ static int32_t cbsim_fake_cbrecall(clientid4 clientid)
 
 	/* allocate a new call--freed in completion hook */
 	call = alloc_rpc_call();
+
 	call->chan = chan;
 
 	/* setup a compound */
@@ -457,5 +458,5 @@ void nfs_rpc_cbsim_pkginit(void)
  */
 void nfs_rpc_cbsim_pkgshutdown(void)
 {
-	return;
+	/* return */
 }

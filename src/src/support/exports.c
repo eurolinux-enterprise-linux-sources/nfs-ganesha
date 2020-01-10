@@ -31,8 +31,6 @@
 #include "log.h"
 #include "fsal.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
-#include "cache_inode_lru.h"
 #include "nfs_file_handle.h"
 #include "nfs_exports.h"
 #include "nfs_ip_stats.h"
@@ -52,213 +50,365 @@
 #include "export_mgr.h"
 #include "fsal_up.h"
 #include "sal_functions.h"
+#include "pnfs_utils.h"
+#include "netgroup_cache.h"
+
+/**
+ * @brief Protect EXPORT_DEFAULTS structure for dynamic update.
+ *
+ * If an export->lock is also held by the code, this lock MUST be
+ * taken AFTER the export->lock to avoid ABBA deadlock.
+ *
+ */
+pthread_rwlock_t export_opt_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+#define GLOBAL_EXPORT_PERMS_INITIALIZER				\
+	.def.anonymous_uid = ANON_UID,				\
+	.def.anonymous_gid = ANON_GID,				\
+	/* Note: Access_Type defaults to None on purpose */	\
+	.def.options = EXPORT_OPTION_ROOT_SQUASH |		\
+		       EXPORT_OPTION_NO_ACCESS |		\
+		       EXPORT_OPTION_AUTH_DEFAULTS |		\
+		       EXPORT_OPTION_PROTO_DEFAULTS |		\
+		       EXPORT_OPTION_XPORT_DEFAULTS |		\
+		       EXPORT_OPTION_NO_DELEGATIONS,		\
+	.def.set = UINT32_MAX,					\
+	.expire_time_attr = 60,
 
 struct global_export_perms export_opt = {
-	.def.anonymous_uid = ANON_UID,
-	.def.anonymous_gid = ANON_GID,
-	/* Note: Access_Type defaults to None on purpose */
-	.def.options = EXPORT_OPTION_ROOT_SQUASH |
-		       EXPORT_OPTION_NO_ACCESS |
-		       EXPORT_OPTION_AUTH_NONE |
-		       EXPORT_OPTION_AUTH_UNIX |
-		       EXPORT_OPTION_NFSV3 |
-		       EXPORT_OPTION_NFSV4 |
-		       EXPORT_OPTION_UDP |
-		       EXPORT_OPTION_TCP |
-		       EXPORT_OPTION_NO_DELEGATIONS,
-	.def.set = UINT32_MAX
+	GLOBAL_EXPORT_PERMS_INITIALIZER
+};
+
+/* A second copy used in configuration, so we can atomically update the
+ * primary set.
+ */
+struct global_export_perms export_opt_cfg = {
+	GLOBAL_EXPORT_PERMS_INITIALIZER
 };
 
 static void FreeClientList(struct glist_head *clients);
 
-static void StrExportOptions(struct export_perms *p_perms, char *buffer)
+static int StrExportOptions(struct display_buffer *dspbuf,
+			    struct export_perms *p_perms)
 {
-	char *buf = buffer;
+	int b_left = display_start(dspbuf);
+
+	if (b_left <= 0)
+		return b_left;
+
+	b_left = display_printf(dspbuf, "options=%08 "PRIx32, p_perms->options);
+
+	if (b_left <= 0)
+		return b_left;
 
 	if ((p_perms->set & EXPORT_OPTION_SQUASH_TYPES) != 0) {
-		if ((p_perms->options & EXPORT_OPTION_ROOT) != 0)
-			buf += sprintf(buf, "no_root_squash");
+		if ((p_perms->options & EXPORT_OPTION_ROOT_SQUASH) != 0)
+			b_left = display_cat(dspbuf, "root_squash   ");
+
+		if (b_left <= 0)
+			return b_left;
+
+		if ((p_perms->options & EXPORT_OPTION_ROOT_ID_SQUASH) != 0)
+			b_left = display_cat(dspbuf, "root_id_squash");
+
+		if (b_left <= 0)
+			return b_left;
 
 		if ((p_perms->options & EXPORT_OPTION_ALL_ANONYMOUS)  != 0)
-			buf += sprintf(buf, "all_squash    ");
+			b_left = display_cat(dspbuf, "all_squash    ");
 
-		if ((p_perms->options &
-		     (EXPORT_OPTION_ROOT | EXPORT_OPTION_ALL_ANONYMOUS)) == 0)
-			buf += sprintf(buf, "root_squash   ");
+		if (b_left <= 0)
+			return b_left;
+
+		if ((p_perms->options & EXPORT_OPTION_SQUASH_TYPES) == 0)
+			b_left = display_cat(dspbuf, "no_root_squash");
 	} else
-		buf += sprintf(buf, "              ");
+		b_left = display_cat(dspbuf, "              ");
 
-	if ((p_perms->set & EXPORT_OPTION_ACCESS_TYPE) != 0) {
+	if (b_left <= 0)
+		return b_left;
+
+	if ((p_perms->set & EXPORT_OPTION_ACCESS_MASK) != 0) {
 		if ((p_perms->options & EXPORT_OPTION_READ_ACCESS) != 0)
-			buf += sprintf(buf, ", R");
+			b_left = display_cat(dspbuf, ", R");
 		else
-			buf += sprintf(buf, ", -");
+			b_left = display_cat(dspbuf, ", -");
+
+		if (b_left <= 0)
+			return b_left;
+
 		if ((p_perms->options & EXPORT_OPTION_WRITE_ACCESS) != 0)
-			buf += sprintf(buf, "W");
+			b_left = display_cat(dspbuf, "W");
 		else
-			buf += sprintf(buf, "-");
+			b_left = display_cat(dspbuf, "-");
+
+		if (b_left <= 0)
+			return b_left;
+
 		if ((p_perms->options & EXPORT_OPTION_MD_READ_ACCESS) != 0)
-			buf += sprintf(buf, "r");
+			b_left = display_cat(dspbuf, "r");
 		else
-			buf += sprintf(buf, "-");
+			b_left = display_cat(dspbuf, "-");
+
+		if (b_left <= 0)
+			return b_left;
+
 		if ((p_perms->options & EXPORT_OPTION_MD_WRITE_ACCESS) != 0)
-			buf += sprintf(buf, "w");
+			b_left = display_cat(dspbuf, "w");
 		else
-			buf += sprintf(buf, "-");
+			b_left = display_cat(dspbuf, "-");
 	} else
-		buf += sprintf(buf, ",     ");
+		b_left = display_cat(dspbuf, ",     ");
+
+	if (b_left <= 0)
+		return b_left;
 
 	if ((p_perms->set & EXPORT_OPTION_PROTOCOLS) != 0) {
 		if ((p_perms->options & EXPORT_OPTION_NFSV3) != 0)
-			buf += sprintf(buf, ", 3");
+			b_left = display_cat(dspbuf, ", 3");
 		else
-			buf += sprintf(buf, ", -");
+			b_left = display_cat(dspbuf, ", -");
+
+		if (b_left <= 0)
+			return b_left;
+
 		if ((p_perms->options & EXPORT_OPTION_NFSV4) != 0)
-			buf += sprintf(buf, "4");
+			b_left = display_cat(dspbuf, "4");
 		else
-			buf += sprintf(buf, "-");
+			b_left = display_cat(dspbuf, "-");
+
+		if (b_left <= 0)
+			return b_left;
+
 		if ((p_perms->options & EXPORT_OPTION_9P) != 0)
-			buf += sprintf(buf, "9");
+			b_left = display_cat(dspbuf, "9");
 		else
-			buf += sprintf(buf, "-");
+			b_left = display_cat(dspbuf, "-");
 	} else
-		buf += sprintf(buf, ",    ");
+		b_left = display_cat(dspbuf, ",    ");
+
+	if (b_left <= 0)
+		return b_left;
 
 	if ((p_perms->set & EXPORT_OPTION_TRANSPORTS) != 0) {
 		if ((p_perms->options & EXPORT_OPTION_UDP) != 0)
-			buf += sprintf(buf, ", UDP");
+			b_left = display_cat(dspbuf, ", UDP");
 		else
-			buf += sprintf(buf, ", ---");
+			b_left = display_cat(dspbuf, ", ---");
+
+		if (b_left <= 0)
+			return b_left;
+
 		if ((p_perms->options & EXPORT_OPTION_TCP) != 0)
-			buf += sprintf(buf, ", TCP");
+			b_left = display_cat(dspbuf, ", TCP");
 		else
-			buf += sprintf(buf, ", ---");
+			b_left = display_cat(dspbuf, ", ---");
+
+		if (b_left <= 0)
+			return b_left;
+
 		if ((p_perms->options & EXPORT_OPTION_RDMA) != 0)
-			buf += sprintf(buf, ", RDMA");
+			b_left = display_cat(dspbuf, ", RDMA");
 		else
-			buf += sprintf(buf, ", ----");
+			b_left = display_cat(dspbuf, ", ----");
 	} else
-		buf += sprintf(buf, ",               ");
+		b_left = display_cat(dspbuf, ",               ");
+
+	if (b_left <= 0)
+		return b_left;
 
 	if ((p_perms->set & EXPORT_OPTION_MANAGE_GIDS) == 0)
-		buf += sprintf(buf, ",               ");
+		b_left = display_cat(dspbuf, ",               ");
 	else if ((p_perms->options & EXPORT_OPTION_MANAGE_GIDS) != 0)
-		buf += sprintf(buf, ", Manage_Gids   ");
+		b_left = display_cat(dspbuf, ", Manage_Gids   ");
 	else
-		buf += sprintf(buf, ", No Manage_Gids");
+		b_left = display_cat(dspbuf, ", No Manage_Gids");
+
+	if (b_left <= 0)
+		return b_left;
 
 	if ((p_perms->set & EXPORT_OPTION_DELEGATIONS) != 0) {
 		if ((p_perms->options & EXPORT_OPTION_READ_DELEG) != 0)
-			buf += sprintf(buf, ", R");
+			b_left = display_cat(dspbuf, ", R");
 		else
-			buf += sprintf(buf, ", -");
+			b_left = display_cat(dspbuf, ", -");
+
+		if (b_left <= 0)
+			return b_left;
+
 		if ((p_perms->options & EXPORT_OPTION_WRITE_DELEG) != 0)
-			buf += sprintf(buf, "W Deleg");
+			b_left = display_cat(dspbuf, "W Deleg");
 		else
-			buf += sprintf(buf, "- Deleg");
+			b_left = display_cat(dspbuf, "- Deleg");
 	} else
-		buf += sprintf(buf, ",         ");
+		b_left = display_cat(dspbuf, ",         ");
+
+	if (b_left <= 0)
+		return b_left;
 
 	if ((p_perms->set & EXPORT_OPTION_ANON_UID_SET) != 0)
-		buf += sprintf(buf, ", anon_uid=%6d",
-			       (int)p_perms->anonymous_uid);
+		b_left = display_printf(dspbuf, ", anon_uid=%6d",
+					(int)p_perms->anonymous_uid);
 	else
-		buf += sprintf(buf, ",                ");
+		b_left = display_cat(dspbuf, ",                ");
+
+	if (b_left <= 0)
+		return b_left;
 
 	if ((p_perms->set & EXPORT_OPTION_ANON_GID_SET) != 0)
-		buf += sprintf(buf, ", anon_gid=%6d",
-			       (int)p_perms->anonymous_gid);
+		b_left = display_printf(dspbuf, ", anon_gid=%6d",
+					(int)p_perms->anonymous_gid);
 	else
-		buf += sprintf(buf, ",                ");
+		b_left = display_cat(dspbuf, ",                ");
+
+	if (b_left <= 0)
+		return b_left;
 
 	if ((p_perms->set & EXPORT_OPTION_AUTH_TYPES) != 0) {
 		if ((p_perms->options & EXPORT_OPTION_AUTH_NONE) != 0)
-			buf += sprintf(buf, ", none");
+			b_left = display_cat(dspbuf, ", none");
+
+		if (b_left <= 0)
+			return b_left;
+
 		if ((p_perms->options & EXPORT_OPTION_AUTH_UNIX) != 0)
-			buf += sprintf(buf, ", sys");
+			b_left = display_cat(dspbuf, ", sys");
+
+		if (b_left <= 0)
+			return b_left;
+
 		if ((p_perms->options & EXPORT_OPTION_RPCSEC_GSS_NONE) != 0)
-			buf += sprintf(buf, ", krb5");
+			b_left = display_cat(dspbuf, ", krb5");
+
+		if (b_left <= 0)
+			return b_left;
+
 		if ((p_perms->options & EXPORT_OPTION_RPCSEC_GSS_INTG) != 0)
-			buf += sprintf(buf, ", krb5i");
+			b_left = display_cat(dspbuf, ", krb5i");
+
+		if (b_left <= 0)
+			return b_left;
+
 		if ((p_perms->options & EXPORT_OPTION_RPCSEC_GSS_PRIV) != 0)
-			buf += sprintf(buf, ", krb5p");
+			b_left = display_cat(dspbuf, ", krb5p");
 	}
+
+	return b_left;
 }
 
-void LogClientListEntry(log_components_t component,
+static char *client_types[] = {
+	[PROTO_CLIENT] = "PROTO_CLIENT",
+	[HOSTIF_CLIENT] = "HOSTIF_CLIENT",
+	[NETWORK_CLIENT] = "NETWORK_CLIENT",
+	[NETGROUP_CLIENT] = "NETGROUP_CLIENT",
+	[WILDCARDHOST_CLIENT] = "WILDCARDHOST_CLIENT",
+	[GSSPRINCIPAL_CLIENT] = "GSSPRINCIPAL_CLIENT",
+	[HOSTIF_CLIENT_V6] = "HOSTIF_CLIENT_V6",
+	[MATCH_ANY_CLIENT] = "MATCH_ANY_CLIENT",
+	[BAD_CLIENT] = "BAD_CLIENT"
+	 };
+
+void LogClientListEntry(log_levels_t level,
+			log_components_t component,
+			int line,
+			char *func,
+			char *tag,
 			exportlist_client_entry_t *entry)
 {
 	char perms[1024];
+	struct display_buffer dspbuf = {sizeof(perms), perms, perms};
 	char addr[INET6_ADDRSTRLEN];
 	char *paddr = addr;
+	char *client_type;
 
-	StrExportOptions(&entry->client_perms, perms);
+	if (!isLevel(component, level))
+		return;
+
+	if (entry->type > BAD_CLIENT) {
+		sprintf(paddr, "0x%08x", entry->type);
+		client_type = "UNKNOWN_CLIENT_TYPE";
+	} else {
+		client_type = client_types[entry->type];
+	}
+
+	(void) StrExportOptions(&dspbuf, &entry->client_perms);
 
 	switch (entry->type) {
 	case HOSTIF_CLIENT:
-		if (inet_ntop
-		    (AF_INET, &(entry->client.hostif.clientaddr), addr,
-		     sizeof(addr)) == NULL) {
+		if (inet_ntop(AF_INET,
+			      &entry->client.hostif.clientaddr,
+			      addr,
+			      sizeof(addr)) == NULL) {
 			paddr = "Invalid Host address";
 		}
-		LogMidDebug(component, "  %p HOSTIF_CLIENT: %s (%s)", entry,
-			    paddr, perms);
-		return;
+		break;
 
 	case NETWORK_CLIENT:
-		if (inet_ntop
-		    (AF_INET, &(entry->client.network.netaddr), addr,
-		     sizeof(addr)) == NULL) {
+		if (inet_ntop(AF_INET,
+			      &entry->client.network.netaddr,
+			      addr,
+			      sizeof(addr)) == NULL) {
 			paddr = "Invalid Network address";
 		}
-		LogMidDebug(component, "  %p NETWORK_CLIENT: %s (%s)", entry,
-			    paddr, perms);
-		return;
+		break;
 
 	case NETGROUP_CLIENT:
-		LogMidDebug(component, "  %p NETWORK_CLIENT: %s (%s)", entry,
-			    entry->client.netgroup.netgroupname, perms);
-		return;
+		paddr = entry->client.netgroup.netgroupname;
+		break;
 
 	case WILDCARDHOST_CLIENT:
-		LogMidDebug(component, "  %p WILDCARDHOST_CLIENT: %s (%s)",
-			    entry, entry->client.wildcard.wildcard, perms);
-		return;
+		paddr = entry->client.wildcard.wildcard;
+		break;
 
 	case GSSPRINCIPAL_CLIENT:
-		LogMidDebug(component, "  %p NETWORK_CLIENT: %s (%s)", entry,
-			    entry->client.gssprinc.princname, perms);
-		return;
+		paddr = entry->client.gssprinc.princname;
+		break;
 
 	case HOSTIF_CLIENT_V6:
-		if (inet_ntop
-		    (AF_INET6, &(entry->client.hostif.clientaddr6), addr,
-		     sizeof(addr)) == NULL) {
+		if (inet_ntop(AF_INET6,
+			      &entry->client.hostif.clientaddr6,
+			      addr,
+			      sizeof(addr)) == NULL) {
 			paddr = "Invalid Host address";
 		}
-		LogMidDebug(component, "  %p HOSTIF_CLIENT_V6: %s (%s)", entry,
-			    paddr, perms);
-		return;
+		break;
 
 	case MATCH_ANY_CLIENT:
-		LogMidDebug(component, "  %p MATCH_ANY_CLIENT: * (%s)", entry,
-			    perms);
-		return;
+		paddr = "*";
+		break;
 
 	case PROTO_CLIENT:
-		LogCrit(component, "  %p PROTO_CLIENT: <unknown>(%s)", entry,
-			perms);
-		return;
 	case BAD_CLIENT:
-		LogCrit(component, "  %p BAD_CLIENT: <unknown>(%s)", entry,
-			perms);
-		return;
+		paddr = "<unknown>";
+		break;
 	}
 
-	LogCrit(component, "  %p UNKNOWN_CLIENT_TYPE: %08x (%s)", entry,
-		entry->type, perms);
+	DisplayLogComponentLevel(component, (char *) __FILE__, line, func,
+				 level, "%s%p %s: %s (%s)",
+				 tag, entry, client_type, paddr, perms);
 }
 
+static void display_clients(struct gsh_export *export)
+{
+	struct glist_head *glist;
+
+	PTHREAD_RWLOCK_rdlock(&export->lock);
+
+	glist_for_each(glist, &export->clients) {
+		exportlist_client_entry_t *client;
+
+		client = glist_entry(glist, exportlist_client_entry_t,
+				     cle_list);
+		LogClientListEntry(NIV_MID_DEBUG,
+				   COMPONENT_EXPORT,
+				   __LINE__,
+				   (char *) __func__,
+				   "",
+				   client);
+	}
+
+	PTHREAD_RWLOCK_unlock(&export->lock);
+}
 
 /**
  * @brief Expand the client name token into one or more client entries
@@ -287,12 +437,8 @@ static int add_client(struct glist_head *client_list,
 	uint32_t addr;
 	int rc;
 
-	cli = gsh_calloc(sizeof(struct exportlist_client_entry__), 1);
-	if (cli == NULL) {
-		config_proc_error(cnode, err_type,
-				  "Allocate of client space failed");
-		goto out;
-	}
+	cli = gsh_calloc(1, sizeof(struct exportlist_client_entry__));
+
 	glist_init(&cli->cle_list);
 	switch (type_hint) {
 	case TERM_V4_ANY:
@@ -368,18 +514,9 @@ static int add_client(struct glist_head *client_list,
 					     (int) ap->ai_addrlen,
 					     ap->ai_canonname);
 				if (cli == NULL) {
-					cli = gsh_calloc(
+					cli = gsh_calloc(1,
 						sizeof(struct
-						    exportlist_client_entry__),
-						1);
-					if (cli == NULL) {
-						config_proc_error(cnode,
-								  err_type,
-								  "Allocate of client space failed");
-						err_type->resource = true;
-						errcnt++;
-						break;
-					}
+						    exportlist_client_entry__));
 					glist_init(&cli->cle_list);
 				}
 				if (ap->ai_family == AF_INET &&
@@ -426,7 +563,12 @@ static int add_client(struct glist_head *client_list,
 				} else
 					continue;
 				cli->client_perms = *perms;
-				LogClientListEntry(COMPONENT_CONFIG, cli);
+				LogClientListEntry(NIV_MID_DEBUG,
+						   COMPONENT_CONFIG,
+						   __LINE__,
+						   (char *) __func__,
+						   "",
+						   cli);
 				glist_add_tail(client_list, &cli->cle_list);
 				cli = NULL; /* let go of it */
 			}
@@ -450,7 +592,12 @@ static int add_client(struct glist_head *client_list,
 		goto out;
 	}
 	cli->client_perms = *perms;
-	LogClientListEntry(COMPONENT_CONFIG, cli);
+	LogClientListEntry(NIV_MID_DEBUG,
+			   COMPONENT_CONFIG,
+			   __LINE__,
+			   (char *) __func__,
+			   "",
+			   cli);
 	glist_add_tail(client_list, &cli->cle_list);
 	cli = NULL;
 out:
@@ -482,9 +629,8 @@ static void *client_init(void *link_mem, void *self_struct)
 	if (link_mem == NULL) {
 		return self_struct;
 	} else if (self_struct == NULL) {
-		cli = gsh_calloc(sizeof(struct exportlist_client_entry__), 1);
-		if (cli == NULL)
-			return NULL;
+		cli = gsh_calloc(1, sizeof(struct exportlist_client_entry__));
+
 		glist_init(&cli->cle_list);
 		cli->type = PROTO_CLIENT;
 		return cli;
@@ -538,6 +684,38 @@ static int client_commit(void *node, void *link_mem, void *self_struct,
 }
 
 /**
+ * @brief Clean up EXPORT path strings
+ */
+void clean_export_paths(struct gsh_export *export)
+{
+	/* Some admins stuff a '/' at  the end for some reason.
+	 * chomp it so we have a /dir/path/basename to work
+	 * with. But only if it's a non-root path starting
+	 * with /.
+	 */
+	if (export->fullpath && export->fullpath[0] == '/') {
+		int pathlen;
+
+		pathlen = strlen(export->fullpath);
+		while ((export->fullpath[pathlen - 1] == '/') &&
+		       (pathlen > 1))
+			pathlen--;
+		export->fullpath[pathlen] = '\0';
+	}
+
+	/* Remove trailing slash */
+	if (export->pseudopath && export->pseudopath[0] == '/') {
+		int pathlen;
+
+		pathlen = strlen(export->pseudopath);
+		while ((export->pseudopath[pathlen - 1] == '/') &&
+		       (pathlen > 1))
+			pathlen--;
+		export->pseudopath[pathlen] = '\0';
+	}
+}
+
+/**
  * @brief Commit a FSAL sub-block
  *
  * Use the Name parameter passed in via the link_mem to lookup the
@@ -547,8 +725,8 @@ static int client_commit(void *node, void *link_mem, void *self_struct,
  * fsal method can process the rest of the parameters in the block
  */
 
-static int fsal_commit(void *node, void *link_mem, void *self_struct,
-		       struct config_error_type *err_type)
+static int fsal_cfg_commit(void *node, void *link_mem, void *self_struct,
+			   struct config_error_type *err_type)
 {
 	struct fsal_export **exp_hdl = link_mem;
 	struct gsh_export *export =
@@ -568,24 +746,16 @@ static int fsal_commit(void *node, void *link_mem, void *self_struct,
 	if (errcnt > 0)
 		goto err;
 
-	/* Some admins stuff a '/' at  the end for some reason.
-	 * chomp it so we have a /dir/path/basename to work
-	 * with. But only if it's a non-root path starting
-	 * with /.
-	 */
-	if (export->fullpath[0] == '/') {
-		int pathlen;
-		pathlen = strlen(export->fullpath);
-		while ((export->fullpath[pathlen - 1] == '/') &&
-		       (pathlen > 1))
-			pathlen--;
-		export->fullpath[pathlen] = '\0';
-	}
-	status = fsal->m_ops.create_export(fsal,
-					   node, err_type,
-					  &fsal_up_top);
+	clean_export_paths(export);
+
+	status = fsal->m_ops.create_export(fsal, node, err_type, &fsal_up_top);
+
+	PTHREAD_RWLOCK_rdlock(&export_opt_lock);
+
 	if ((export->options_set & EXPORT_OPTION_EXPIRE_SET) == 0)
-		export->expire_time_attr = cache_param.expire_time_attr;
+		export->expire_time_attr = export_opt.expire_time_attr;
+
+	PTHREAD_RWLOCK_unlock(&export_opt_lock);
 
 	if (FSAL_IS_ERROR(status)) {
 		fsal_put(fsal);
@@ -593,7 +763,7 @@ static int fsal_commit(void *node, void *link_mem, void *self_struct,
 			"Could not create export for (%s) to (%s)",
 			export->pseudopath,
 			export->fullpath);
-		err_type->export = true;
+		err_type->export_ = true;
 		errcnt++;
 		goto err;
 	}
@@ -630,6 +800,96 @@ err:
 }
 
 /**
+ * @brief Commit a FSAL sub-block for export update
+ *
+ * Use the Name parameter passed in via the link_mem to lookup the
+ * fsal.  If the fsal is not loaded (yet), load it and call its init.
+ *
+ * Create an export and pass the FSAL sub-block to it so that the
+ * fsal method can process the rest of the parameters in the block
+ */
+
+static int fsal_update_cfg_commit(void *node, void *link_mem, void *self_struct,
+				  struct config_error_type *err_type)
+{
+	struct fsal_export **exp_hdl = link_mem;
+	struct gsh_export *probe_exp;
+	struct gsh_export *export =
+	    container_of(exp_hdl, struct gsh_export, fsal_export);
+	struct root_op_context root_op_context;
+	uint64_t MaxRead, MaxWrite;
+
+	/* Determine if this is actually an update */
+	probe_exp = get_gsh_export(export->export_id);
+
+	if (probe_exp == NULL) {
+		/* Export not found by ID, assume it's a new export. */
+		return fsal_cfg_commit(node, link_mem, self_struct, err_type);
+	}
+
+	/** @todo - we really should verify update of FSAL options in
+	 *          export, at the moment any changes there will be
+	 *          ignored. In fact, we can't even process the
+	 *          FSAL name...
+	 */
+
+	/* We have to clean the export paths so we can properly compare them
+	 * later.
+	 */
+	clean_export_paths(export);
+
+	PTHREAD_RWLOCK_rdlock(&export_opt_lock);
+
+	if ((export->options_set & EXPORT_OPTION_EXPIRE_SET) == 0)
+		export->expire_time_attr = export_opt.expire_time_attr;
+
+	PTHREAD_RWLOCK_unlock(&export_opt_lock);
+
+	/* We don't assign export->fsal_export because we don't have a new
+	 * fsal_export to later release...
+	 */
+
+	/* Initialize req_ctx from the probe_exp */
+	init_root_op_context(&root_op_context, probe_exp,
+			     probe_exp->fsal_export, 0, 0, UNKNOWN_REQUEST);
+
+	/* Now validate maxread/write etc with fsal params based on the
+	 * original export, which will then allow us to validate the
+	 * possibly changed values in the new export config.
+	 */
+	MaxRead = probe_exp->fsal_export->
+		exp_ops.fs_maxread(probe_exp->fsal_export);
+	MaxWrite = probe_exp->fsal_export->
+		exp_ops.fs_maxwrite(probe_exp->fsal_export);
+
+	release_root_op_context();
+
+	if (export->MaxRead > MaxRead && MaxRead != 0) {
+		LogInfo(COMPONENT_CONFIG,
+			 "Readjusting MaxRead to FSAL, %" PRIu64 " -> %" PRIu64,
+			 export->MaxRead,
+			 MaxRead);
+		export->MaxRead = MaxRead;
+	}
+
+	if (export->MaxWrite > MaxWrite && MaxWrite != 0) {
+		LogInfo(COMPONENT_CONFIG,
+			 "Readjusting MaxWrite to FSAL, %"PRIu64" -> %"PRIu64,
+			 export->MaxWrite,
+			 MaxWrite);
+		export->MaxWrite = MaxWrite;
+	}
+
+	LogDebug(COMPONENT_CONFIG,
+		 "Export %d FSAL config update processed",
+		 export->export_id);
+
+	put_gsh_export(probe_exp);
+
+	return 0;
+}
+
+/**
  * @brief EXPORT block handlers
  */
 
@@ -650,14 +910,62 @@ static void *export_init(void *link_mem, void *self_struct)
 
 	if (self_struct == NULL) {
 		export = alloc_export();
-		if (export == NULL)
-			return NULL;
 		return export;
 	} else { /* free resources case */
 		export = self_struct;
-		free_export(export);
+		/* As part of create_export(), FSAL shall take
+		 * reference to the export if it supports pNFS.
+		 */
+		if (export->has_pnfs_ds) {
+			assert(export->refcnt == 1);
+			/* export is not yet added to the export
+			 * manager. Hence there shall not be any
+			 * other thread racing here. So no need
+			 * to take lock. */
+			export->has_pnfs_ds = false;
+			pnfs_ds_remove(export->export_id, true);
+		} else {
+			assert(export->refcnt == 0);
+			free_export(export);
+		}
+
 		return NULL;
 	}
+}
+
+static inline int strcmp_null(const char *s1, const char *s2)
+{
+	if (s1 == s2) {
+		/* Both strings are NULL or both are same pointer */
+		return 0;
+	}
+
+	if (s1 == NULL) {
+		/* First string is NULL, consider that LESS than */
+		return -1;
+	}
+
+	if (s2 == NULL) {
+		/* Second string is NULL, consider that GREATER than */
+		return 1;
+	}
+
+	return strcmp(s1, s2);
+}
+
+static inline void update_atomic_fields(struct gsh_export *export,
+					struct gsh_export *src)
+{
+	atomic_store_uint64_t(&export->MaxRead, src->MaxRead);
+	atomic_store_uint64_t(&export->MaxWrite, src->MaxWrite);
+	atomic_store_uint64_t(&export->PrefRead, src->PrefRead);
+	atomic_store_uint64_t(&export->PrefWrite, src->PrefWrite);
+	atomic_store_uint64_t(&export->PrefReaddir, src->PrefReaddir);
+	atomic_store_uint64_t(&export->MaxOffsetWrite, src->MaxOffsetWrite);
+	atomic_store_uint64_t(&export->MaxOffsetRead, src->MaxOffsetRead);
+	atomic_store_uint32_t(&export->options, src->options);
+	atomic_store_uint32_t(&export->options_set, src->options_set);
+	atomic_store_int32_t(&export->expire_time_attr, src->expire_time_attr);
 }
 
 /**
@@ -667,15 +975,22 @@ static void *export_init(void *link_mem, void *self_struct)
  * parameters are already done.
  */
 
+enum export_commit_type {
+	initial_export,
+	add_export,
+	update_export,
+};
+
 static int export_commit_common(void *node, void *link_mem, void *self_struct,
 				struct config_error_type *err_type,
-				bool add_export)
+				enum export_commit_type commit_type)
 {
-	struct gsh_export *export, *probe_exp;
+	struct gsh_export *export = self_struct, *probe_exp;
 	int errcnt = 0;
 	char perms[1024];
+	struct display_buffer dspbuf = {sizeof(perms), perms, perms};
 
-	export = self_struct;
+	LogFullDebug(COMPONENT_EXPORT, "Processing %p", export);
 
 	/* validate the export now */
 	if (export->export_perms.options & EXPORT_OPTION_NFSV4) {
@@ -684,7 +999,7 @@ static int export_commit_common(void *node, void *link_mem, void *self_struct,
 				"Exporting to NFSv4 but not Pseudo path defined");
 			err_type->invalid = true;
 			errcnt++;
-			goto err_out;
+			return errcnt;
 		} else if (export->export_id == 0 &&
 			   strcmp(export->pseudopath, "/") != 0) {
 			LogCrit(COMPONENT_CONFIG,
@@ -692,7 +1007,7 @@ static int export_commit_common(void *node, void *link_mem, void *self_struct,
 				export->pseudopath);
 			err_type->invalid = true;
 			errcnt++;
-			goto err_out;
+			return errcnt;
 		}
 	}
 	if (export->pseudopath != NULL &&
@@ -723,19 +1038,128 @@ static int export_commit_common(void *node, void *link_mem, void *self_struct,
 		}
 	}
 	if (errcnt)
-		goto err_out;  /* have basic errors. don't even try more... */
+		return errcnt;  /* have basic errors. don't even try more... */
 
-	/* export->fsal_export is valid iff fsal_commit succeeds.
-	 * Config code calls export_commit even if fsal_commit fails at
-	 * the moment, so error out here if fsal_commit failed.
+	/* Note: need to check export->fsal_export AFTER we have checked for
+	 * duplicate export_id. That is because an update export WILL NOT
+	 * have fsal_export attached.
 	 */
-	if (export->fsal_export == NULL) {
-		err_type->validate = true;
-		errcnt++;
-		goto err_out;
-	}
 
 	probe_exp = get_gsh_export(export->export_id);
+
+	if (commit_type == update_export && probe_exp != NULL) {
+		/* We have an actual update case, probe_exp is the target
+		 * to update. Check all the options that MUST match.
+		 * Note that Path/fullpath will not be NULL, but we compare
+		 * the same way as the other string options for code
+		 * consistency.
+		 */
+		LogFullDebug(COMPONENT_EXPORT, "Updating %p", probe_exp);
+
+		LogMidDebug(COMPONENT_EXPORT, "Old Client List");
+		display_clients(probe_exp);
+
+		LogMidDebug(COMPONENT_EXPORT, "New Client List");
+		display_clients(export);
+
+		if (strcmp_null(export->FS_tag,
+				probe_exp->FS_tag) != 0) {
+			/* Tag does not match, currently not a candidate for
+			 * update.
+			 */
+			LogCrit(COMPONENT_CONFIG,
+				"Tag for export update %d doesn't match",
+				export->export_id);
+			err_type->invalid = true;
+			errcnt++;
+		}
+
+		if (strcmp_null(export->pseudopath,
+				probe_exp->pseudopath) != 0) {
+			/* Pseudo does not match, currently not a candidate for
+			 * update.
+			 */
+			LogCrit(COMPONENT_CONFIG,
+				"Pseudo for export update %d doesn't match",
+				export->export_id);
+			err_type->invalid = true;
+			errcnt++;
+		}
+
+		if (strcmp_null(export->fullpath,
+				probe_exp->fullpath) != 0) {
+			/* Path does not match, currently not a candidate for
+			 * update.
+			 */
+			LogCrit(COMPONENT_CONFIG,
+				"Path for export update %d doesn't match",
+				export->export_id);
+			err_type->invalid = true;
+			errcnt++;
+		}
+
+		/* At present Filesystem_Id is not updateable, check that
+		 * it did not change.
+		 */
+		if (probe_exp->filesystem_id.major
+					!= export->filesystem_id.major ||
+		    probe_exp->filesystem_id.minor
+					!= export->filesystem_id.minor) {
+			LogCrit(COMPONENT_CONFIG,
+				"Filesystem_Id for export update %d doesn't match",
+				export->export_id);
+			err_type->invalid = true;
+			errcnt++;
+		}
+
+		/* We can't compare the FSAL names because we don't actually
+		 * have an fsal_export for "export".
+		 */
+
+		if (errcnt > 0) {
+			put_gsh_export(probe_exp);
+			return errcnt;
+		}
+
+		/* Update atomic fields */
+		update_atomic_fields(probe_exp, export);
+
+		/* Now take lock and swap out client list and export_perms... */
+		PTHREAD_RWLOCK_wrlock(&probe_exp->lock);
+
+		/* Copy the export perms into the existing export. */
+		probe_exp->export_perms = export->export_perms;
+
+		/* Swap the client list from the new export and the existing
+		 * export. When we then dispose of the new export, the
+		 * old client list will also be disposed of.
+		 */
+		LogFullDebug(COMPONENT_EXPORT,
+			     "Original clients = (%p,%p) New clients = (%p,%p)",
+			     probe_exp->clients.next, probe_exp->clients.prev,
+			     export->clients.next, export->clients.prev);
+
+		glist_swap_lists(&probe_exp->clients, &export->clients);
+
+		PTHREAD_RWLOCK_unlock(&probe_exp->lock);
+
+		/* We will need to dispose of the config export since we
+		 * updated the existing export.
+		 */
+		err_type->dispose = true;
+
+		/* Release the reference to the updated export. */
+		put_gsh_export(probe_exp);
+		goto success;
+	}
+
+	if (commit_type == update_export) {
+		/* We found a new export during export update, consider it
+		 * an add_export for the rest of configuration.
+		 */
+		commit_type = add_export;
+	}
+
 	if (probe_exp != NULL) {
 		LogDebug(COMPONENT_CONFIG,
 			 "Export %d already exists", export->export_id);
@@ -743,6 +1167,17 @@ static int export_commit_common(void *node, void *link_mem, void *self_struct,
 		err_type->exists = true;
 		errcnt++;
 	}
+
+	/* export->fsal_export is valid iff fsal_cfg_commit succeeds.
+	 * Config code calls export_commit even if fsal_cfg_commit fails at
+	 * the moment, so error out here if fsal_cfg_commit failed.
+	 */
+	if (export->fsal_export == NULL) {
+		err_type->validate = true;
+		errcnt++;
+		return errcnt;
+	}
+
 	if (export->FS_tag != NULL) {
 		probe_exp = get_gsh_export_by_tag(export->FS_tag);
 		if (probe_exp != NULL) {
@@ -755,6 +1190,7 @@ static int export_commit_common(void *node, void *link_mem, void *self_struct,
 			errcnt++;
 		}
 	}
+
 	if (export->pseudopath != NULL) {
 		probe_exp = get_gsh_export_by_pseudo(export->pseudopath, true);
 		if (probe_exp != NULL) {
@@ -767,17 +1203,24 @@ static int export_commit_common(void *node, void *link_mem, void *self_struct,
 			put_gsh_export(probe_exp);
 		}
 	}
+
 	probe_exp = get_gsh_export_by_path(export->fullpath, true);
-	if (probe_exp != NULL &&
-	    export->pseudopath == NULL &&
-	    export->FS_tag == NULL) {
-		LogCrit(COMPONENT_CONFIG,
-			"Duplicate path (%s) without unique tag or Pseudo path",
-			export->fullpath);
-		err_type->invalid = true;
-		errcnt++;
+
+	if (probe_exp != NULL) {
+		if (export->pseudopath == NULL &&
+		    export->FS_tag == NULL) {
+			LogCrit(COMPONENT_CONFIG,
+				"Duplicate path (%s) without unique tag or Pseudo path",
+				export->fullpath);
+			err_type->invalid = true;
+			errcnt++;
+		}
+		/* If unique Tag and/or Pseudo, there is no error, but we still
+		 * need to release the export reference.
+		 */
 		put_gsh_export(probe_exp);
 	}
+
 	if (errcnt) {
 		if (err_type->exists && !err_type->invalid)
 			LogDebug(COMPONENT_CONFIG,
@@ -787,18 +1230,16 @@ static int export_commit_common(void *node, void *link_mem, void *self_struct,
 			LogCrit(COMPONENT_CONFIG,
 				 "Duplicate export id = %d",
 				 export->export_id);
-		goto err_out;  /* have errors. don't init or load a fsal */
+		return errcnt;  /* have errors. don't init or load a fsal */
 	}
 
-	/* now probe the fsal and init it */
-	/* pass along the block that is/was the FS_Specific */
 	if (!insert_gsh_export(export)) {
 		LogCrit(COMPONENT_CONFIG,
 			"Export id %d already in use.",
 			export->export_id);
 		err_type->exists = true;
 		errcnt++;
-		goto err_out;
+		return errcnt;
 	}
 
 	/* add_export_commit shouldn't add this export to mount work as
@@ -806,33 +1247,80 @@ static int export_commit_common(void *node, void *link_mem, void *self_struct,
 	 * So add this export to mount work only if NFSv4 exported and
 	 * is not a dynamically added export.
 	 */
-	if (!add_export && export->export_perms.options & EXPORT_OPTION_NFSV4)
+	if (commit_type == initial_export &&
+	    export->export_perms.options & EXPORT_OPTION_NFSV4)
 		export_add_to_mount_work(export);
 
-	StrExportOptions(&export->export_perms, perms);
+	if (commit_type != initial_export) {
+		/* add_export or update_export with new export_id. */
+		int rc = init_export_root(export);
+
+		if (rc) {
+			export_revert(export);
+			errcnt++;
+
+			switch (rc) {
+			case EINVAL:
+				err_type->invalid = true;
+				break;
+
+			case EFAULT:
+				err_type->internal = true;
+				break;
+
+			default:
+				err_type->resource = true;
+			}
+
+			return errcnt;
+		}
+
+		if (!mount_gsh_export(export)) {
+			export_revert(export);
+			err_type->internal = true;
+			errcnt++;
+			return errcnt;
+		}
+	}
+
+	display_clients(export);
+
+success:
+
+	(void) StrExportOptions(&dspbuf, &export->export_perms);
 
 	LogInfo(COMPONENT_CONFIG,
-		"Export %d created at pseudo (%s) with path (%s) and tag (%s) perms (%s)",
-		export->export_id, export->pseudopath,
+		"Export %d %s at pseudo (%s) with path (%s) and tag (%s) perms (%s)",
+		export->export_id,
+		commit_type == update_export ? "updated" : "created",
+		export->pseudopath,
 		export->fullpath, export->FS_tag, perms);
 
 	LogInfo(COMPONENT_CONFIG,
-		"Export %d has %ld defined clients", export->export_id,
+		"Export %d has %zd defined clients", export->export_id,
 		glist_length(&export->clients));
-	put_gsh_export(export);
-	return 0;
 
-err_out:
-	return errcnt;
+	if (commit_type != update_export) {
+		/* For initial or add export, insert_gsh_export gave out
+		 * two references, a sentinel reference for the export's
+		 * presence in the export table, and one reference for our
+		 * use here, drop that second reference now.
+		 *
+		 * In the case of update_export, we already dropped the
+		 * reference to the updated export, and this export has
+		 * no references and will be freed by the config code.
+		 */
+		put_gsh_export(export);
+	}
+
+	return 0;
 }
 
 static int export_commit(void *node, void *link_mem, void *self_struct,
 			 struct config_error_type *err_type)
 {
-	bool add_export = false; /* not a dynamic add export */
-
 	return export_commit_common(node, link_mem, self_struct, err_type,
-				    add_export);
+				    initial_export);
 }
 
 /**
@@ -847,8 +1335,9 @@ static void export_display(const char *step, void *node,
 {
 	struct gsh_export *export = self_struct;
 	char perms[1024];
+	struct display_buffer dspbuf = {sizeof(perms), perms, perms};
 
-	StrExportOptions(&export->export_perms, perms);
+	(void) StrExportOptions(&dspbuf, &export->export_perms);
 
 	LogMidDebug(COMPONENT_CONFIG,
 		    "%s %p Export %d pseudo (%s) with path (%s) and tag (%s) perms (%s)",
@@ -865,37 +1354,21 @@ static void export_display(const char *step, void *node,
 static int add_export_commit(void *node, void *link_mem, void *self_struct,
 			     struct config_error_type *err_type)
 {
-	struct gsh_export *export = self_struct;
-	int errcnt = 0;
-	int status;
-	bool add_export = true; /* dynamic add export */
+	return export_commit_common(node, link_mem, self_struct, err_type,
+				    add_export);
+}
 
-	errcnt = export_commit_common(node, link_mem, self_struct, err_type,
-				      add_export);
-	if (errcnt != 0)
-		goto err_out;
+/**
+ * @brief Commit an update export
+ * commit the export
+ * init export root and mount it in pseudo fs
+ */
 
-	status = init_export_root(export);
-	if (status) {
-		export_revert(export);
-		errcnt++;
-		if (status == EINVAL)
-			err_type->invalid = true;
-		else if (status == EFAULT)
-			err_type->internal = true;
-		else
-			err_type->resource = true;
-		goto err_out;
-	}
-
-	if (!mount_gsh_export(export)) {
-		export_revert(export);
-		err_type->internal = true;
-		errcnt++;
-	}
-
-err_out:
-	return errcnt;
+static int update_export_commit(void *node, void *link_mem, void *self_struct,
+				struct config_error_type *err_type)
+{
+	return export_commit_common(node, link_mem, self_struct, err_type,
+				    update_export);
 }
 
 /**
@@ -906,7 +1379,7 @@ err_out:
 static void *export_defaults_init(void *link_mem, void *self_struct)
 {
 	if (self_struct == NULL)
-		return &export_opt;
+		return &export_opt_cfg;
 	else
 		return NULL;
 }
@@ -922,6 +1395,18 @@ static int export_defaults_commit(void *node, void *link_mem,
 				  void *self_struct,
 				  struct config_error_type *err_type)
 {
+	char perms[1024];
+	struct display_buffer dspbuf = {sizeof(perms), perms, perms};
+
+	(void) StrExportOptions(&dspbuf, &export_opt_cfg.conf);
+
+	LogInfo(COMPONENT_CONFIG, "Export Defaults now (%s)", perms);
+
+	/* Update under lock. */
+	PTHREAD_RWLOCK_wrlock(&export_opt_lock);
+	export_opt = export_opt_cfg;
+	PTHREAD_RWLOCK_unlock(&export_opt_lock);
+
 	return 0;
 }
 
@@ -933,16 +1418,17 @@ static int export_defaults_commit(void *node, void *link_mem,
  */
 
 static void export_defaults_display(const char *step, void *node,
-			   void *link_mem, void *self_struct)
+				    void *link_mem, void *self_struct)
 {
 	struct export_perms *defaults = self_struct;
 	char perms[1024];
+	struct display_buffer dspbuf = {sizeof(perms), perms, perms};
 
-	StrExportOptions(defaults, perms);
+	(void) StrExportOptions(&dspbuf, defaults);
 
-	LogEvent(COMPONENT_CONFIG,
-		 "%s Export Defaults (%s)",
-		 step, perms);
+	LogMidDebug(COMPONENT_CONFIG,
+		    "%s Export Defaults (%s)",
+		    step, perms);
 }
 
 /**
@@ -1020,6 +1506,9 @@ static struct config_item_list squash_types[] = {
 	CONFIG_LIST_TOK("No_Root_Squash", EXPORT_OPTION_ROOT),
 	CONFIG_LIST_TOK("None", EXPORT_OPTION_ROOT),
 	CONFIG_LIST_TOK("NoIdSquash", EXPORT_OPTION_ROOT),
+	CONFIG_LIST_TOK("RootId", EXPORT_OPTION_ROOT_ID_SQUASH),
+	CONFIG_LIST_TOK("Root_Id_Squash", EXPORT_OPTION_ROOT_ID_SQUASH),
+	CONFIG_LIST_TOK("RootIdSquash", EXPORT_OPTION_ROOT_ID_SQUASH),
 	CONFIG_LIST_EOL
 };
 
@@ -1053,13 +1542,13 @@ struct config_item_list deleg_types[] =  {
 	/* Note: Access_Type defaults to None on purpose */		\
 	CONF_ITEM_ENUM_BITS_SET("Access_Type",				\
 		EXPORT_OPTION_NO_ACCESS,				\
-		EXPORT_OPTION_ACCESS_TYPE,				\
+		EXPORT_OPTION_ACCESS_MASK,				\
 		access_types, _struct_, _perms_.options, _perms_.set),	\
 	CONF_ITEM_LIST_BITS_SET("Protocols",				\
-		EXPORT_OPTION_PROTOCOLS, EXPORT_OPTION_PROTOCOLS,	\
+		EXPORT_OPTION_PROTO_DEFAULTS, EXPORT_OPTION_PROTOCOLS,	\
 		nfs_protocols, _struct_, _perms_.options, _perms_.set),	\
 	CONF_ITEM_LIST_BITS_SET("Transports",				\
-		EXPORT_OPTION_TRANSPORTS, EXPORT_OPTION_TRANSPORTS,	\
+		EXPORT_OPTION_XPORT_DEFAULTS, EXPORT_OPTION_TRANSPORTS,	\
 		transports, _struct_, _perms_.options, _perms_.set),	\
 	CONF_ITEM_ANON_ID_SET("Anonymous_uid",				\
 		ANON_UID, _struct_, _perms_.anonymous_uid,		\
@@ -1068,8 +1557,7 @@ struct config_item_list deleg_types[] =  {
 		ANON_GID, _struct_, _perms_.anonymous_gid,		\
 		EXPORT_OPTION_ANON_GID_SET, _perms_.set),		\
 	CONF_ITEM_LIST_BITS_SET("SecType",				\
-		EXPORT_OPTION_AUTH_NONE | EXPORT_OPTION_AUTH_UNIX,	\
-		EXPORT_OPTION_AUTH_TYPES,				\
+		EXPORT_OPTION_AUTH_DEFAULTS, EXPORT_OPTION_AUTH_TYPES,	\
 		sec_types, _struct_, _perms_.options, _perms_.set),	\
 	CONF_ITEM_BOOLBIT_SET("PrivilegedPort",				\
 		false, EXPORT_OPTION_PRIVILEGED_PORT,			\
@@ -1085,10 +1573,7 @@ struct config_item_list deleg_types[] =  {
 		_struct_, _perms_.options, _perms_.set),		\
 	CONF_ITEM_ENUM_BITS_SET("Delegations",				\
 		EXPORT_OPTION_NO_DELEGATIONS, EXPORT_OPTION_DELEGATIONS,\
-		delegations, _struct_, _perms_.options, _perms_.set),	\
-	CONF_ITEM_BOOLBIT_SET("Disable_ACL",				\
-		false, EXPORT_OPTION_DISABLE_ACL,			\
-		_struct_, _perms_.options, _perms_.set)
+		delegations, _struct_, _perms_.options, _perms_.set)
 
 /**
  * @brief Process a list of clients for a client block
@@ -1137,7 +1622,7 @@ static int client_adder(const char *token,
  * @brief Table of client sub-block parameters
  *
  * NOTE: node discovery is ordered by this table!
- * "Access" is last because we must have all other params processed
+ * "Clients" is last because we must have all other params processed
  * before we walk the list of accessing clients!
  */
 
@@ -1163,7 +1648,7 @@ static struct config_item export_defaults_params[] = {
  * @brief Table of FSAL sub-block parameters
  *
  * NOTE: this points to a struct that is private to
- * fsal_commit.
+ * fsal_cfg_commit.
  */
 
 static struct config_item fsal_params[] = {
@@ -1173,58 +1658,90 @@ static struct config_item fsal_params[] = {
 };
 
 /**
+ * @brief Common EXPORT block parameters
+ */
+#define CONF_EXPORT_PARAMS(_struct_)					\
+	CONF_MAND_UI16("Export_id", 0, UINT16_MAX, 1,			\
+		       _struct_, export_id),				\
+	CONF_MAND_PATH("Path", 1, MAXPATHLEN, NULL,			\
+		       _struct_, fullpath), /* must chomp '/' */	\
+	CONF_UNIQ_PATH("Pseudo", 1, MAXPATHLEN, NULL,			\
+		       _struct_, pseudopath),				\
+	CONF_ITEM_UI64("MaxRead", 512, FSAL_MAXIOSIZE, FSAL_MAXIOSIZE,	\
+		       _struct_, MaxRead),				\
+	CONF_ITEM_UI64("MaxWrite", 512, FSAL_MAXIOSIZE, FSAL_MAXIOSIZE,	\
+		       _struct_, MaxWrite),				\
+	CONF_ITEM_UI64("PrefRead", 512, FSAL_MAXIOSIZE, FSAL_MAXIOSIZE,	\
+		       _struct_, PrefRead),				\
+	CONF_ITEM_UI64("PrefWrite", 512, FSAL_MAXIOSIZE, FSAL_MAXIOSIZE,\
+		       _struct_, PrefWrite),				\
+	CONF_ITEM_UI64("PrefReaddir", 512, FSAL_MAXIOSIZE, 16384,	\
+		       _struct_, PrefReaddir),				\
+	CONF_ITEM_FSID_SET("Filesystem_id", 666, 666,			\
+		       _struct_, filesystem_id, /* major.minor */	\
+		       EXPORT_OPTION_FSID_SET, options_set),		\
+	CONF_ITEM_STR("Tag", 1, MAXPATHLEN, NULL,			\
+		      _struct_, FS_tag),				\
+	CONF_ITEM_UI64("MaxOffsetWrite", 512, UINT64_MAX, UINT64_MAX,	\
+		       _struct_, MaxOffsetWrite),			\
+	CONF_ITEM_UI64("MaxOffsetRead", 512, UINT64_MAX, UINT64_MAX,	\
+		       _struct_, MaxOffsetRead),			\
+	CONF_ITEM_BOOLBIT_SET("UseCookieVerifier",			\
+		false, EXPORT_OPTION_USE_COOKIE_VERIFIER,		\
+		_struct_, options, options_set),			\
+	CONF_ITEM_BOOLBIT_SET("DisableReaddirPlus",			\
+		false, EXPORT_OPTION_NO_READDIR_PLUS,			\
+		_struct_, options, options_set),			\
+	CONF_ITEM_BOOLBIT_SET("Trust_Readdir_Negative_Cache",		\
+		false, EXPORT_OPTION_TRUST_READIR_NEGATIVE_CACHE,	\
+		_struct_, options, options_set),			\
+	CONF_ITEM_BOOLBIT_SET("Disable_ACL",				\
+		false, EXPORT_OPTION_DISABLE_ACL,			\
+		_struct_, options, options_set),			\
+	CONF_ITEM_I32_SET("Attr_Expiration_Time", -1, INT32_MAX, 60,	\
+		       _struct_, expire_time_attr,			\
+		       EXPORT_OPTION_EXPIRE_SET, options_set)
+
+/**
  * @brief Table of EXPORT block parameters
- *
- * NOTE: the Client and FSAL sub-blocks must be the *last*
- * two entries in the list.  This is so all other
- * parameters have been processed before these sub-blocks
- * are processed.
  */
 
 static struct config_item export_params[] = {
-	CONF_MAND_UI16("Export_id", 0, UINT16_MAX, 1,
-		       gsh_export, export_id),
-	CONF_MAND_PATH("Path", 1, MAXPATHLEN, NULL,
-		       gsh_export, fullpath), /* must chomp '/' */
-	CONF_UNIQ_PATH("Pseudo", 1, MAXPATHLEN, NULL,
-		       gsh_export, pseudopath),
-	CONF_ITEM_UI64("MaxRead", 512, FSAL_MAXIOSIZE, FSAL_MAXIOSIZE,
-		       gsh_export, MaxRead),
-	CONF_ITEM_UI64("MaxWrite", 512, FSAL_MAXIOSIZE, FSAL_MAXIOSIZE,
-		       gsh_export, MaxWrite),
-	CONF_ITEM_UI64("PrefRead", 512, FSAL_MAXIOSIZE, FSAL_MAXIOSIZE,
-		       gsh_export, PrefRead),
-	CONF_ITEM_UI64("PrefWrite", 512, FSAL_MAXIOSIZE, FSAL_MAXIOSIZE,
-		       gsh_export, PrefWrite),
-	CONF_ITEM_UI64("PrefReaddir", 512, FSAL_MAXIOSIZE, 16384,
-		       gsh_export, PrefReaddir),
-	CONF_ITEM_FSID_SET("Filesystem_id", 666, 666,
-		       gsh_export, filesystem_id, /* major.minor */
-		       EXPORT_OPTION_FSID_SET, options_set),
-	CONF_ITEM_STR("Tag", 1, MAXPATHLEN, NULL,
-		      gsh_export, FS_tag),
-	CONF_ITEM_UI64("MaxOffsetWrite", 512, UINT64_MAX, UINT64_MAX,
-		       gsh_export, MaxOffsetWrite),
-	CONF_ITEM_UI64("MaxOffsetRead", 512, UINT64_MAX, UINT64_MAX,
-		       gsh_export, MaxOffsetRead),
-	CONF_ITEM_BOOLBIT_SET("UseCookieVerifier",
-		true, EXPORT_OPTION_USE_COOKIE_VERIFIER,
-		gsh_export, options, options_set),
-	CONF_ITEM_BOOLBIT_SET("DisableReaddirPlus",
-		false, EXPORT_OPTION_NO_READDIR_PLUS,
-		gsh_export, options, options_set),
-	CONF_ITEM_BOOLBIT_SET("Trust_Readdir_Negative_Cache",
-		false, EXPORT_OPTION_TRUST_READIR_NEGATIVE_CACHE,
-		gsh_export, options, options_set),
+	CONF_EXPORT_PARAMS(gsh_export),
 	CONF_EXPORT_PERMS(gsh_export, export_perms),
+
+	/* NOTE: the Client and FSAL sub-blocks must be the *last*
+	 * two entries in the list.  This is so all other
+	 * parameters have been processed before these sub-blocks
+	 * are processed.
+	 */
 	CONF_ITEM_BLOCK("Client", client_params,
 			client_init, client_commit,
 			gsh_export, clients),
-	CONF_ITEM_I32_SET("Attr_Expiration_Time", -1, INT32_MAX, 60,
-		       gsh_export, expire_time_attr,
-		       EXPORT_OPTION_EXPIRE_SET,  options_set),
 	CONF_RELAX_BLOCK("FSAL", fsal_params,
-			 fsal_init, fsal_commit,
+			 fsal_init, fsal_cfg_commit,
+			 gsh_export, fsal_export),
+	CONFIG_EOL
+};
+
+/**
+ * @brief Table of EXPORT update block parameters
+ */
+
+static struct config_item export_update_params[] = {
+	CONF_EXPORT_PARAMS(gsh_export),
+	CONF_EXPORT_PERMS(gsh_export, export_perms),
+
+	/* NOTE: the Client and FSAL sub-blocks must be the *last*
+	 * two entries in the list.  This is so all other
+	 * parameters have been processed before these sub-blocks
+	 * are processed.
+	 */
+	CONF_ITEM_BLOCK("Client", client_params,
+			client_init, client_commit,
+			gsh_export, clients),
+	CONF_RELAX_BLOCK("FSAL", fsal_params,
+			 fsal_init, fsal_update_cfg_commit,
 			 gsh_export, fsal_export),
 	CONFIG_EOL
 };
@@ -1257,6 +1774,19 @@ struct config_block add_export_param = {
 	.blk_desc.u.blk.display = export_display
 };
 
+/**
+ * @brief Top level definition for an UPDATE EXPORT block
+ */
+
+struct config_block update_export_param = {
+	.dbus_interface_name = "org.ganesha.nfsd.config.%d",
+	.blk_desc.name = "EXPORT",
+	.blk_desc.type = CONFIG_BLOCK,
+	.blk_desc.u.blk.init = export_init,
+	.blk_desc.u.blk.params = export_update_params,
+	.blk_desc.u.blk.commit = update_export_commit,
+	.blk_desc.u.blk.display = export_display
+};
 
 /**
  * @brief Top level definition for an EXPORT_DEFAULTS block
@@ -1316,12 +1846,6 @@ static int build_default_root(struct config_error_type *err_type)
 		 "Allocating Pseudo root export");
 	export = alloc_export();
 
-	if (export == NULL) {
-		LogCrit(COMPONENT_CONFIG,
-			"Could not allocate space for pseudoroot export");
-		return -1;
-	}
-
 	/* Initialize req_ctx */
 	init_root_op_context(&root_op_context, export, NULL, 0, 0,
 			     UNKNOWN_REQUEST);
@@ -1334,14 +1858,14 @@ static int build_default_root(struct config_error_type *err_type)
 	export->PrefRead = FSAL_MAXIOSIZE;
 	export->PrefReaddir = 16384;
 
-	/* Default anonymous uid and gid */
-	export->export_perms.anonymous_uid = (uid_t) ANON_UID;
-	export->export_perms.anonymous_gid = (gid_t) ANON_GID;
+	/*Don't set anonymous uid and gid, they will actually be ignored */
 
 	/* Support only NFS v4 and TCP.
 	 * Root is allowed
 	 * MD Read Access
 	 * Allow use of default auth types
+	 *
+	 * Allow non-privileged client ports to access pseudo export.
 	 */
 	export->export_perms.options = EXPORT_OPTION_ROOT |
 					EXPORT_OPTION_MD_READ_ACCESS |
@@ -1350,10 +1874,11 @@ static int build_default_root(struct config_error_type *err_type)
 					EXPORT_OPTION_TCP;
 
 	export->export_perms.set = EXPORT_OPTION_SQUASH_TYPES |
-				    EXPORT_OPTION_ACCESS_TYPE |
+				    EXPORT_OPTION_ACCESS_MASK |
 				    EXPORT_OPTION_PROTOCOLS |
 				    EXPORT_OPTION_TRANSPORTS |
-				    EXPORT_OPTION_AUTH_TYPES;
+				    EXPORT_OPTION_AUTH_TYPES |
+				    EXPORT_OPTION_PRIVILEGED_PORT;
 
 	export->options = EXPORT_OPTION_USE_COOKIE_VERIFIER;
 	export->options_set = EXPORT_OPTION_FSID_SET |
@@ -1460,6 +1985,47 @@ int ReadExports(config_file_t in_config,
 	return num_exp;
 }
 
+/**
+ * @brief Reread the export entries from the parsed configuration file.
+ *
+ * @param[in]  in_config    The file that contains the export list
+ *
+ * @return A negative value on error,
+ *         the number of export entries else.
+ */
+
+int reread_exports(config_file_t in_config,
+		   struct config_error_type *err_type)
+{
+	int rc, num_exp;
+
+	LogInfo(COMPONENT_CONFIG, "Reread exports");
+
+	rc = load_config_from_parse(in_config,
+				    &export_defaults_param,
+				    NULL,
+				    false,
+				    err_type);
+
+	if (rc < 0) {
+		LogCrit(COMPONENT_CONFIG, "Export defaults block error");
+		return -1;
+	}
+
+	num_exp = load_config_from_parse(in_config,
+					 &update_export_param,
+					 NULL,
+					 false,
+					 err_type);
+
+	if (num_exp < 0) {
+		LogCrit(COMPONENT_CONFIG, "Export block error");
+		return -1;
+	}
+
+	return num_exp;
+}
+
 static void FreeClientList(struct glist_head *clients)
 {
 	struct glist_head *glist;
@@ -1467,6 +2033,7 @@ static void FreeClientList(struct glist_head *clients)
 
 	glist_for_each_safe(glist, glistn, clients) {
 		exportlist_client_entry_t *client;
+
 		client =
 		    glist_entry(glist, exportlist_client_entry_t, cle_list);
 		glist_del(&client->cle_list);
@@ -1496,6 +2063,7 @@ void free_export_resources(struct gsh_export *export)
 	FreeClientList(&export->clients);
 	if (export->fsal_export != NULL) {
 		struct fsal_module *fsal = export->fsal_export->fsal;
+
 		export->fsal_export->exp_ops.release(export->fsal_export);
 		fsal_put(fsal);
 	}
@@ -1531,35 +2099,38 @@ void exports_pkginit(void)
 }
 
 /**
- * @brief Return a reference to the root cache inode entry of the export
+ * @brief Return a reference to the root object of the export
  *
  * Must be called with the caller holding a reference to the export.
  *
- * Returns with an additional reference to the cache inode held for use by the
+ * Returns with an additional reference to the obj held for use by the
  * caller.
  *
  * @param export [IN] the aforementioned export
- * @param entry  [IN/OUT] call by ref pointer to store cache entry
+ * @param entry  [IN/OUT] call by ref pointer to store obj
  *
- * @return cache inode status code
+ * @return FSAL status
  */
 
-cache_inode_status_t nfs_export_get_root_entry(struct gsh_export *export,
-					       cache_entry_t **entry)
+fsal_status_t nfs_export_get_root_entry(struct gsh_export *export,
+					struct fsal_obj_handle **obj)
 {
-	cache_inode_status_t status;
-
 	PTHREAD_RWLOCK_rdlock(&export->lock);
 
-	status =
-	    cache_inode_lru_ref(export->exp_root_cache_inode, LRU_FLAG_NONE);
-
-	if (status == CACHE_INODE_SUCCESS)
-		*entry = export->exp_root_cache_inode;
+	if (export->exp_root_obj)
+		export->exp_root_obj->obj_ops.get_ref(export->exp_root_obj);
 
 	PTHREAD_RWLOCK_unlock(&export->lock);
 
-	return status;
+	*obj = export->exp_root_obj;
+
+	if (!(*obj))
+		return fsalstat(ERR_FSAL_NOENT, 0);
+
+	if ((*obj)->type != DIRECTORY)
+		return fsalstat(ERR_FSAL_NOTDIR, 0);
+
+	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
 
 /**
@@ -1575,9 +2146,7 @@ cache_inode_status_t nfs_export_get_root_entry(struct gsh_export *export,
 int init_export_root(struct gsh_export *export)
 {
 	fsal_status_t fsal_status;
-	cache_inode_status_t cache_status;
-	struct fsal_obj_handle *root_handle;
-	cache_entry_t *entry = NULL;
+	struct fsal_obj_handle *obj;
 	struct root_op_context root_op_context;
 	int my_status;
 
@@ -1589,10 +2158,12 @@ int init_export_root(struct gsh_export *export)
 	LogDebug(COMPONENT_EXPORT,
 		 "About to lookup_path for ExportId=%u Path=%s",
 		 export->export_id, export->fullpath);
+
+	/* This takes a reference, which will keep the root object around for
+	 * the lifetime of the export. */
 	fsal_status =
 	    export->fsal_export->exp_ops.lookup_path(export->fsal_export,
-						  export->fullpath,
-						  &root_handle);
+						  export->fullpath, &obj, NULL);
 
 	if (FSAL_IS_ERROR(fsal_status)) {
 		my_status = EINVAL;
@@ -1604,70 +2175,30 @@ int init_export_root(struct gsh_export *export)
 		goto out;
 	}
 
-	/* Add this entry to the Cache Inode as a "root" entry */
-
-	/* Get the cache inode entry (and an LRU reference */
-	cache_status = cache_inode_new_entry(root_handle, CACHE_INODE_FLAG_NONE,
-					     &entry);
-
-	if (entry == NULL) {
-		/* EFAULT for any internal error */
-		my_status = EFAULT;
-
-		LogCrit(COMPONENT_EXPORT,
-			"Error when creating root cached entry for %s, export_id=%d, cache_status=%s",
-			export->fullpath,
-			export->export_id,
-			cache_inode_err_str(cache_status));
-		goto out;
-	}
-
-	/* Instead of an LRU reference, we must hold a pin reference */
-	cache_status = cache_inode_inc_pin_ref(entry);
-
-	if (cache_status != CACHE_INODE_SUCCESS) {
-
-		my_status = EFAULT;
-
-		LogCrit(COMPONENT_EXPORT,
-			"Error when creating root cached entry for %s, export_id=%d, cache_status=%s",
-			export->fullpath,
-			export->export_id,
-			cache_inode_err_str(cache_status));
-
-		/* Release the LRU reference and return failure. */
-		cache_inode_put(entry);
-		goto out;
-	}
-
-	PTHREAD_RWLOCK_wrlock(&entry->attr_lock);
+	PTHREAD_RWLOCK_wrlock(&obj->state_hdl->state_lock);
 	PTHREAD_RWLOCK_wrlock(&export->lock);
 
-	export->exp_root_cache_inode = entry;
-
-	glist_add_tail(&entry->object.dir.export_roots,
+	/* Pass ref off to export */
+	export->exp_root_obj = obj;
+	glist_add_tail(&obj->state_hdl->dir.export_roots,
 		       &export->exp_root_list);
-
 	/* Protect this entry from removal (unlink) */
-	atomic_inc_int32_t(&entry->exp_root_refcount);
+	(void) atomic_inc_int32_t(&obj->state_hdl->dir.exp_root_refcount);
 
 	PTHREAD_RWLOCK_unlock(&export->lock);
-	PTHREAD_RWLOCK_unlock(&entry->attr_lock);
+	PTHREAD_RWLOCK_unlock(&obj->state_hdl->state_lock);
 
 	if (isDebug(COMPONENT_EXPORT)) {
 		LogDebug(COMPONENT_EXPORT,
-			 "Added root entry %p FSAL %s for path %s on export_id=%d",
-			 entry,
-			 entry->obj_handle->fsal->name,
-			 export->fullpath, export->export_id);
+			 "Added root obj %p FSAL %s for path %s on export_id=%d",
+			 obj, obj->fsal->name, export->fullpath,
+			 export->export_id);
 	} else {
 		LogInfo(COMPONENT_EXPORT,
-			"Added root entry for path %s on export_id=%d",
+			"Added root obj for path %s on export_id=%d",
 			export->fullpath, export->export_id);
 	}
 
-	/* Release the LRU reference and return success. */
-	cache_inode_put(entry);
 	my_status = 0;
 out:
 	release_root_op_context();
@@ -1680,69 +2211,46 @@ out:
  * @param exp [IN] the export
  */
 
-static inline void
-release_export_root_locked(struct gsh_export *export, cache_entry_t *entry)
-{
-	cache_entry_t *root_entry = NULL;
-
-	PTHREAD_RWLOCK_wrlock(&export->lock);
-
-	glist_del(&export->exp_root_list);
-	root_entry = export->exp_root_cache_inode;
-	export->exp_root_cache_inode = NULL;
-
-	if (root_entry != NULL) {
-		/* Allow this entry to be removed (unlink) */
-		(void) atomic_dec_int32_t(&entry->exp_root_refcount);
-
-		/* We must not hold entry->attr_lock across
-		 * cache_inode_dec_pin_ref (LRU lane lock order)
-		 */
-		PTHREAD_RWLOCK_unlock(&entry->attr_lock);
-		PTHREAD_RWLOCK_unlock(&export->lock);
-
-		/* Release the pin reference */
-		cache_inode_dec_pin_ref(root_entry, false);
-	} else {
-		PTHREAD_RWLOCK_unlock(&entry->attr_lock);
-		PTHREAD_RWLOCK_unlock(&export->lock);
-	}
-
-	LogDebug(COMPONENT_EXPORT,
-		 "Released root entry %p for path %s on export_id=%d",
-		 root_entry, export->fullpath, export->export_id);
-}
-
-/**
- * @brief Release the root cache inode for an export.
- *
- * @param exp [IN] the export
- */
-
 void release_export_root(struct gsh_export *export)
 {
-	cache_entry_t *entry = NULL;
-	cache_inode_status_t status;
+	struct fsal_obj_handle *obj = NULL;
+	fsal_status_t fsal_status;
 
 	/* Get a reference to the root entry */
-	status = nfs_export_get_root_entry(export, &entry);
+	fsal_status = nfs_export_get_root_entry(export, &obj);
 
-	if (status != CACHE_INODE_SUCCESS) {
+	if (FSAL_IS_ERROR(fsal_status)) {
 		/* No more root entry, bail out, this export is
 		 * probably about to be destroyed.
 		 */
 		LogInfo(COMPONENT_CACHE_INODE,
 			"Export root for export id %d status %s",
-			export->export_id, cache_inode_err_str(status));
+			export->export_id, msg_fsal_err(fsal_status.major));
 		return;
 	}
 
-	PTHREAD_RWLOCK_wrlock(&entry->attr_lock);
+	/* Make the export unreachable as a root object */
+	PTHREAD_RWLOCK_wrlock(&obj->state_hdl->state_lock);
+	PTHREAD_RWLOCK_wrlock(&export->lock);
 
-	/* Make the export unreachable as a root cache inode */
-	release_export_root_locked(export, entry);
+	glist_del(&export->exp_root_list);
+	export->exp_root_obj->obj_ops.put_ref(export->exp_root_obj);
+	export->exp_root_obj = NULL;
 
-	cache_inode_put(entry);
+	(void) atomic_dec_int32_t(&obj->state_hdl->dir.exp_root_refcount);
+
+	PTHREAD_RWLOCK_unlock(&export->lock);
+	PTHREAD_RWLOCK_unlock(&obj->state_hdl->state_lock);
+
+	/* Release sentinal ref */
+	obj->obj_ops.put_ref(obj);
+
+	LogDebug(COMPONENT_EXPORT,
+		 "Released root obj %p for path %s on export_id=%d",
+		 obj, export->fullpath, export->export_id);
+
+	/* Release ref taken above */
+	obj->obj_ops.put_ref(obj);
 }
 
 static inline void clean_up_export(struct gsh_export *export)
@@ -1754,120 +2262,32 @@ static inline void clean_up_export(struct gsh_export *export)
 	/* Release state belonging to this export */
 	state_release_export(export);
 
-	/* Flush cache inodes belonging to this export */
-	cache_inode_unexport(export);
+	/* Flush FSAL-specific state */
+	export->fsal_export->exp_ops.unexport(export->fsal_export);
 }
 
 void unexport(struct gsh_export *export)
 {
+	bool op_ctx_set = false;
+	struct root_op_context ctx;
 	/* Make the export unreachable */
 	LogDebug(COMPONENT_EXPORT,
 		 "Unexport %s, Pseduo %s",
 		 export->fullpath, export->pseudopath);
+
+	/* Lots of obj_ops may be called during cleanup; make sure that an
+	 * op_ctx exists */
+	if (!op_ctx) {
+		init_root_op_context(&ctx, export, export->fsal_export, 0, 0,
+				UNKNOWN_REQUEST);
+		op_ctx_set = true;
+	}
+
 	release_export_root(export);
 	clean_up_export(export);
+	if (op_ctx_set)
+		release_root_op_context();
 }
-
-/**
- * @brief Handle killing a cache inode entry that might be an export root.
- *
- * @param entry [IN] the cache inode entry
- */
-
-void kill_export_root_entry(cache_entry_t *entry)
-{
-	struct gsh_export *export;
-
-	if (entry->type != DIRECTORY)
-		return;
-
-	while (true) {
-		PTHREAD_RWLOCK_wrlock(&entry->attr_lock);
-
-		export = glist_first_entry(&entry->object.dir.export_roots,
-					   struct gsh_export,
-					   exp_root_list);
-
-		if (export == NULL) {
-			PTHREAD_RWLOCK_unlock(&entry->attr_lock);
-			return;
-		}
-
-		get_gsh_export_ref(export);
-		LogInfo(COMPONENT_CONFIG,
-			"Killing export_id %d because root entry went bad",
-			export->export_id);
-
-		/* Make the export unreachable as a root cache inode */
-		release_export_root_locked(export, entry);
-
-		/* Make the export otherwise unreachable and clean it up */
-		clean_up_export(export);
-
-		put_gsh_export(export);
-	}
-}
-
-/**
- * @brief Handle killing a cache inode entry that is a junction to an export.
- *
- * @param entry [IN] the cache inode entry
- */
-
-void kill_export_junction_entry(cache_entry_t *entry)
-{
-	struct gsh_export *export;
-
-	if (entry->type != DIRECTORY)
-		return;
-
-	PTHREAD_RWLOCK_wrlock(&entry->attr_lock);
-
-	export = entry->object.dir.junction_export;
-
-	if (export == NULL) {
-		PTHREAD_RWLOCK_unlock(&entry->attr_lock);
-		return;
-	}
-
-	/* Detach the export from the inode */
-	entry->object.dir.junction_export = NULL;
-
-	get_gsh_export_ref(export);
-
-	LogInfo(COMPONENT_CONFIG,
-		"Unmounting export_id %d because junction entry went bad",
-		export->export_id);
-
-	PTHREAD_RWLOCK_wrlock(&export->lock);
-
-	/* Detach the export */
-	export->exp_junction_inode = NULL;
-
-	PTHREAD_RWLOCK_unlock(&export->lock);
-	PTHREAD_RWLOCK_unlock(&entry->attr_lock);
-
-	/* Finish unmounting the export */
-	pseudo_unmount_export(export);
-
-	/* Don't remove the export (if export root is still valid, the
-	 * export is still accessible via NFS v3.
-	 */
-
-	put_gsh_export(export);
-}
-
-static char *client_types[] = {
-	[PROTO_CLIENT] = "PROTO_CLIENT",
-	[HOSTIF_CLIENT] = "HOSTIF_CLIENT",
-	[NETWORK_CLIENT] = "NETWORK_CLIENT",
-	[NETGROUP_CLIENT] = "NETGROUP_CLIENT",
-	[WILDCARDHOST_CLIENT] = "WILDCARDHOST_CLIENT",
-	[GSSPRINCIPAL_CLIENT] = "GSSPRINCIPAL_CLIENT",
-	[HOSTIF_CLIENT_V6] = "HOSTIF_CLIENT_V6",
-	[MATCH_ANY_CLIENT] = "MATCH_ANY_CLIENT",
-	[BAD_CLIENT] = "BAD_CLIENT"
-	 };
 
 /**
  * @brief Match a specific option in the client export list
@@ -1894,12 +2314,12 @@ static exportlist_client_entry_t *client_match(sockaddr_t *hostaddr,
 
 		client = glist_entry(glist, exportlist_client_entry_t,
 				     cle_list);
-		LogMidDebug(COMPONENT_EXPORT,
-			    "Match %p, type = %s, options 0x%X",
-			    client,
-			    client_types[client->type],
-			    client->client_perms.options);
-		LogClientListEntry(COMPONENT_EXPORT, client);
+		LogClientListEntry(NIV_MID_DEBUG,
+				   COMPONENT_EXPORT,
+				   __LINE__,
+				   (char *) __func__,
+				   "Match V4: ",
+				   client);
 
 		switch (client->type) {
 		case HOSTIF_CLIENT:
@@ -1931,8 +2351,8 @@ static exportlist_client_entry_t *client_match(sockaddr_t *hostaddr,
 			/* At this point 'hostname' should contain the
 			 * name that was found
 			 */
-			if (innetgr(client->client.netgroup.netgroupname,
-				    hostname, NULL, NULL) == 1) {
+			if (ng_innetgr(client->client.netgroup.netgroupname,
+				    hostname)) {
 				return client;
 			}
 			break;
@@ -2023,12 +2443,12 @@ static exportlist_client_entry_t *client_matchv6(struct in6_addr *paddrv6,
 
 		client = glist_entry(glist, exportlist_client_entry_t,
 				     cle_list);
-		LogMidDebug(COMPONENT_EXPORT,
-			    "Matchv6 %p, type = %s, options 0x%X",
-			    client,
-			    client_types[client->type],
-			    client->client_perms.options);
-		LogClientListEntry(COMPONENT_EXPORT, client);
+		LogClientListEntry(NIV_MID_DEBUG,
+				   COMPONENT_EXPORT,
+				   __LINE__,
+				   (char *) __func__,
+				   "Match V6: ",
+				   client);
 
 		switch (client->type) {
 		case HOSTIF_CLIENT:
@@ -2090,7 +2510,7 @@ bool export_check_security(struct svc_req *req)
 		     EXPORT_OPTION_AUTH_NONE) == 0) {
 			LogInfo(COMPONENT_EXPORT,
 				"Export %s does not support AUTH_NONE",
-				op_ctx->export->fullpath);
+				op_ctx->ctx_export->fullpath);
 			return false;
 		}
 		break;
@@ -2100,7 +2520,7 @@ bool export_check_security(struct svc_req *req)
 		     EXPORT_OPTION_AUTH_UNIX) == 0) {
 			LogInfo(COMPONENT_EXPORT,
 				"Export %s does not support AUTH_UNIX",
-				op_ctx->export->fullpath);
+				op_ctx->ctx_export->fullpath);
 			return false;
 		}
 		break;
@@ -2113,11 +2533,12 @@ bool export_check_security(struct svc_req *req)
 				 EXPORT_OPTION_RPCSEC_GSS_PRIV)) == 0) {
 			LogInfo(COMPONENT_EXPORT,
 				"Export %s does not support RPCSEC_GSS",
-				op_ctx->export->fullpath);
+				op_ctx->ctx_export->fullpath);
 			return false;
 		} else {
 			struct svc_rpc_gss_data *gd;
 			rpc_gss_svc_t svc;
+
 			gd = SVCAUTH_PRIVATE(req->rq_auth);
 			svc = gd->sec.svc;
 			LogFullDebug(COMPONENT_EXPORT, "Testing svc %d",
@@ -2128,7 +2549,7 @@ bool export_check_security(struct svc_req *req)
 				     EXPORT_OPTION_RPCSEC_GSS_NONE) == 0) {
 					LogInfo(COMPONENT_EXPORT,
 						"Export %s does not support RPCSEC_GSS_SVC_NONE",
-						op_ctx->export->fullpath);
+						op_ctx->ctx_export->fullpath);
 					return false;
 				}
 				break;
@@ -2138,7 +2559,7 @@ bool export_check_security(struct svc_req *req)
 				     EXPORT_OPTION_RPCSEC_GSS_INTG) == 0) {
 					LogInfo(COMPONENT_EXPORT,
 						"Export %s does not support RPCSEC_GSS_SVC_INTEGRITY",
-						op_ctx->export->fullpath);
+						op_ctx->ctx_export->fullpath);
 					return false;
 				}
 				break;
@@ -2148,7 +2569,7 @@ bool export_check_security(struct svc_req *req)
 				     EXPORT_OPTION_RPCSEC_GSS_PRIV) == 0) {
 					LogInfo(COMPONENT_EXPORT,
 						"Export %s does not support RPCSEC_GSS_SVC_PRIVACY",
-						op_ctx->export->fullpath);
+						op_ctx->ctx_export->fullpath);
 					return false;
 				}
 				break;
@@ -2156,7 +2577,7 @@ bool export_check_security(struct svc_req *req)
 			default:
 				LogInfo(COMPONENT_EXPORT,
 					"Export %s does not support unknown RPCSEC_GSS_SVC %d",
-					op_ctx->export->fullpath,
+					op_ctx->ctx_export->fullpath,
 					(int)svc);
 				return false;
 			}
@@ -2166,7 +2587,7 @@ bool export_check_security(struct svc_req *req)
 	default:
 		LogInfo(COMPONENT_EXPORT,
 			"Export %s does not support unknown oa_flavor %d",
-			op_ctx->export->fullpath,
+			op_ctx->ctx_export->fullpath,
 			(int)req->rq_cred.oa_flavor);
 		return false;
 	}
@@ -2195,6 +2616,7 @@ sockaddr_t *convert_ipv6_to_ipv4(sockaddr_t *ipv6, sockaddr_t *ipv4)
 	    && (psockaddr_in6->sin6_addr.s6_addr[10] == 0xFF)
 	    && (psockaddr_in6->sin6_addr.s6_addr[11] == 0xFF)) {
 		void *ab;
+
 		memset(ipv4, 0, sizeof(*ipv4));
 		ab = &(psockaddr_in6->sin6_addr.s6_addr[12]);
 
@@ -2220,24 +2642,100 @@ sockaddr_t *convert_ipv6_to_ipv4(sockaddr_t *ipv6, sockaddr_t *ipv4)
 }
 
 /**
+ * @brief Get the best anonymous uid available.
+ *
+ * This is safe if there is no op_ctx or there is one but there is no
+ * export_perms attached.
+ *
+ */
+
+uid_t get_anonymous_uid(void)
+{
+	uid_t anon_uid;
+
+	if (op_ctx != NULL &&  op_ctx->export_perms != NULL) {
+		/* We have export_perms, use it. */
+		return op_ctx->export_perms->anonymous_uid;
+	}
+
+	PTHREAD_RWLOCK_rdlock(&export_opt_lock);
+
+	if ((export_opt.conf.set & EXPORT_OPTION_ANON_UID_SET) != 0) {
+		/* Option was set in EXPORT_DEFAULTS */
+		anon_uid = export_opt.conf.anonymous_uid;
+	} else {
+		/* Default to code default. */
+		anon_uid = export_opt.def.anonymous_uid;
+	}
+
+	PTHREAD_RWLOCK_unlock(&export_opt_lock);
+
+	return anon_uid;
+}
+
+/**
+ * @brief Get the best anonymous gid available.
+ *
+ * This is safe if there is no op_ctx or there is one but there is no
+ * export_perms attached.
+ *
+ */
+
+gid_t get_anonymous_gid(void)
+{
+	/* Default to code default. */
+	gid_t anon_gid = export_opt.def.anonymous_gid;
+
+	if (op_ctx != NULL &&  op_ctx->export_perms != NULL) {
+		/* We have export_perms, use it. */
+		return op_ctx->export_perms->anonymous_gid;
+	}
+
+	PTHREAD_RWLOCK_rdlock(&export_opt_lock);
+
+	if ((export_opt.conf.set & EXPORT_OPTION_ANON_GID_SET) != 0) {
+		/* Option was set in EXPORT_DEFAULTS */
+		anon_gid = export_opt.conf.anonymous_gid;
+	} else {
+		/* Default to code default. */
+		anon_gid = export_opt.def.anonymous_gid;
+	}
+
+	PTHREAD_RWLOCK_unlock(&export_opt_lock);
+
+	return anon_gid;
+}
+
+/**
  * @brief Checks if a machine is authorized to access an export entry
  *
- * Permissions in the op context get updated based on export and client
+ * Permissions in the op context get updated based on export and client.
+ *
+ * Takes the export->lock in read mode to protect the client list and
+ * export permissions while performing this work.
  */
 
 void export_check_access(void)
 {
-	exportlist_client_entry_t *client;
+	exportlist_client_entry_t *client = NULL;
 	sockaddr_t alt_hostaddr;
-	sockaddr_t *hostaddr;
+	sockaddr_t *hostaddr = NULL;
 
-	/* Initialize permissions to allow nothing */
-	op_ctx->export_perms->options = 0;
-	op_ctx->export_perms->set = 0;
-	op_ctx->export_perms->anonymous_uid = (uid_t) ANON_UID;
-	op_ctx->export_perms->anonymous_gid = (gid_t) ANON_GID;
+	assert(op_ctx != NULL);
+	assert(op_ctx->export_perms != NULL);
 
-	assert(op_ctx != NULL && op_ctx->export != NULL);
+	/* Initialize permissions to allow nothing, anonymous_uid and
+	 * anonymous_gid will get set farther down.
+	 */
+	memset(op_ctx->export_perms, 0, sizeof(*op_ctx->export_perms));
+
+	if (op_ctx->ctx_export != NULL) {
+		/* Take lock */
+		PTHREAD_RWLOCK_rdlock(&op_ctx->ctx_export->lock);
+	} else {
+		/* Shortcut if no export */
+		goto no_export;
+	}
 
 	hostaddr = convert_ipv6_to_ipv4(op_ctx->caller_addr, &alt_hostaddr);
 
@@ -2249,12 +2747,12 @@ void export_check_access(void)
 				     ipstring, sizeof(ipstring));
 		LogMidDebug(COMPONENT_EXPORT,
 			    "Check for address %s for export id %u fullpath %s",
-			    ipstring, op_ctx->export->export_id,
-			    op_ctx->export->fullpath);
+			    ipstring, op_ctx->ctx_export->export_id,
+			    op_ctx->ctx_export->fullpath);
 	}
 
 	/* Does the client match anyone on the client list? */
-	client = client_match_any(hostaddr, op_ctx->export);
+	client = client_match_any(hostaddr, op_ctx->ctx_export);
 	if (client != NULL) {
 		/* Take client options */
 		op_ctx->export_perms->options = client->client_perms.options &
@@ -2273,23 +2771,27 @@ void export_check_access(void)
 
 	/* Any options not set by the client, take from the export */
 	op_ctx->export_perms->options |=
-				op_ctx->export->export_perms.options &
-				op_ctx->export->export_perms.set &
+				op_ctx->ctx_export->export_perms.options &
+				op_ctx->ctx_export->export_perms.set &
 				~op_ctx->export_perms->set;
 
 	if ((op_ctx->export_perms->set & EXPORT_OPTION_ANON_UID_SET) == 0 &&
-	    (op_ctx->export->export_perms.set &
+	    (op_ctx->ctx_export->export_perms.set &
 	     EXPORT_OPTION_ANON_UID_SET) != 0)
 		op_ctx->export_perms->anonymous_uid =
-			op_ctx->export->export_perms.anonymous_uid;
+			op_ctx->ctx_export->export_perms.anonymous_uid;
 
 	if ((op_ctx->export_perms->set & EXPORT_OPTION_ANON_GID_SET) == 0 &&
-	    (op_ctx->export->export_perms.set &
+	    (op_ctx->ctx_export->export_perms.set &
 	     EXPORT_OPTION_ANON_GID_SET) != 0)
 		op_ctx->export_perms->anonymous_gid =
-			op_ctx->export->export_perms.anonymous_gid;
+			op_ctx->ctx_export->export_perms.anonymous_gid;
 
-	op_ctx->export_perms->set |= op_ctx->export->export_perms.set;
+	op_ctx->export_perms->set |= op_ctx->ctx_export->export_perms.set;
+
+ no_export:
+
+	PTHREAD_RWLOCK_rdlock(&export_opt_lock);
 
 	/* Any options not set by the client or export, take from the
 	 *  EXPORT_DEFAULTS block.
@@ -2326,27 +2828,47 @@ void export_check_access(void)
 
 	if (isMidDebug(COMPONENT_EXPORT)) {
 		char perms[1024];
+		struct display_buffer dspbuf = {sizeof(perms), perms, perms};
+
 		if (client != NULL) {
-			StrExportOptions(&client->client_perms, perms);
+			(void) StrExportOptions(&dspbuf, &client->client_perms);
 			LogMidDebug(COMPONENT_EXPORT,
 				    "CLIENT          (%s)",
 				    perms);
+			display_reset_buffer(&dspbuf);
 		}
-		StrExportOptions(&op_ctx->export->export_perms, perms);
-		LogMidDebug(COMPONENT_EXPORT,
-			    "EXPORT          (%s)",
-			    perms);
-		StrExportOptions(&export_opt.conf, perms);
+
+		if (op_ctx->ctx_export != NULL) {
+			(void) StrExportOptions(&dspbuf,
+						&op_ctx->ctx_export->export_perms);
+			LogMidDebug(COMPONENT_EXPORT,
+				    "EXPORT          (%s)",
+				    perms);
+			display_reset_buffer(&dspbuf);
+		}
+
+		(void) StrExportOptions(&dspbuf, &export_opt.conf);
 		LogMidDebug(COMPONENT_EXPORT,
 			    "EXPORT_DEFAULTS (%s)",
 			    perms);
-		StrExportOptions(&export_opt.def, perms);
+		display_reset_buffer(&dspbuf);
+
+		(void) StrExportOptions(&dspbuf, &export_opt.def);
 		LogMidDebug(COMPONENT_EXPORT,
 			    "default options (%s)",
 			    perms);
-		StrExportOptions(op_ctx->export_perms, perms);
+		display_reset_buffer(&dspbuf);
+
+		(void) StrExportOptions(&dspbuf, op_ctx->export_perms);
 		LogMidDebug(COMPONENT_EXPORT,
 			    "Final options   (%s)",
 			    perms);
 	}
-}				/* nfs_export_check_access */
+
+	PTHREAD_RWLOCK_unlock(&export_opt_lock);
+
+	if (op_ctx->ctx_export != NULL) {
+		/* Release lock */
+		PTHREAD_RWLOCK_unlock(&op_ctx->ctx_export->lock);
+	}
+}

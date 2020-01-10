@@ -148,12 +148,10 @@ typedef struct nfs41_cb_session_slot {
 /**
  * Flag indicating that the backchannel is up
  */
-static const uint32_t session_bc_up = 0x01;
-/**
- * Flag indicating that there is an irrecoverable fault with the
- * backchannel
- */
-static const uint32_t session_bc_fault = 0x02;
+enum {
+	session_bc_up = 0x01,
+	session_bc_fault = 0x02, /* not actually used anywhere */
+};
 
 /**
  * @brief Structure representing an NFSv4.1 session
@@ -205,20 +203,6 @@ struct state_refer {
  *****************************************************************************/
 
 /**
- * @brief Grace period control structure
- *
- * This could be expanded to implement grace instances, where a new
- * grace period is started for every failover.  for now keep it
- * simple, just a global used by all clients.
- */
-typedef struct grace {
-	pthread_mutex_t g_mutex;	/*< Mutex */
-	time_t g_start;		/*< Start of grace period */
-	time_t g_duration;	/*< Duration of grace period */
-	struct glist_head g_clid_list;	/*< Clients */
-} grace_t;
-
-/**
  * @brief Revoked filehandle list
  */
 typedef struct rdel_fh {
@@ -246,25 +230,30 @@ extern char v4_recov_dir[PATH_MAX];
 
 extern hash_table_t *ht_state_id;
 
-/**
- * @brief Type of state
- */
-
-enum state_type {
-	STATE_TYPE_NONE = 0,
-	STATE_TYPE_SHARE = 1,
-	STATE_TYPE_DELEG = 2,
-	STATE_TYPE_LOCK = 4,
-	STATE_TYPE_LAYOUT = 5
-};
+#include "sal_shared.h"
 
 /**
- * @brief Data for a share reservation/open
+ * @brief Data for an NFS v4 share reservation/open
  */
 
 struct state_share {
 	struct glist_head share_lockstates;	/*< Lock states for this
-						   open state */
+						   open state
+						   This field MUST be first */
+	unsigned int share_access;	/*< The NFSv4 Share Access state */
+	unsigned int share_deny;	/*< The NFSv4 Share Deny state */
+	unsigned int share_access_prev;	/*< Previous share access state */
+	unsigned int share_deny_prev;	/*< Previous share deny state   */
+};
+
+/**
+ * @brief Data for an NLM share reservation/open
+ */
+
+struct state_nlm_share {
+	struct glist_head share_perclient;	/*< Lock states for this
+						    open state
+						    This field MUST be first */
 	unsigned int share_access;	/*< The NFSv4 Share Access state */
 	unsigned int share_deny;	/*< The NFSv4 Share Deny state */
 	unsigned int share_access_prev;	/*< Previous share access state */
@@ -277,10 +266,23 @@ struct state_share {
 
 struct state_lock {
 	struct glist_head state_locklist;	/*< List of locks owned by
-						   this stateid */
+						   this stateid
+						   This field MUST be first */
 	struct glist_head state_sharelist;	/*< List of states related
 						   to a share */
 	state_t *openstate;	/*< The related open-state */
+};
+
+/**
+ * @brief Data for a 9p fid
+ */
+
+struct state_9p_fid {
+	struct glist_head state_locklist;	/*< List of locks owned by
+						   this fid
+						   This field MUST be first */
+	unsigned int share_access;	/*< The 9p Access state */
+	unsigned int share_deny;	/*< Will always be 0 */
 };
 
 /**
@@ -334,9 +336,11 @@ struct state_layout {
 
 union state_data {
 	struct state_share share;
+	struct state_nlm_share nlm_share;
 	struct state_lock lock;
 	struct state_deleg deleg;
 	struct state_layout layout;
+	struct state_9p_fid fid;
 	uint32_t io_advise;
 };
 
@@ -350,32 +354,41 @@ union state_data {
 extern char all_zero[OTHERSIZE];
 extern char all_ones[OTHERSIZE];
 
+struct state_obj {
+	char digest[58];
+	size_t len;
+};
+
 /**
  * @brief Structure representing a single NFSv4 state
  *
  * Each state is identified by stateid and represents some resource or
  * set of resources.
+ *
+ * The lists are protected by the state_lock
  */
 
 struct state_t {
-	struct glist_head state_list;	/*< List of states on a file */
-	struct glist_head state_owner_list;  /*< List of states for an owner */
-	struct glist_head state_export_list; /*< List of states on the same
+	struct glist_head state_list;	/**< List of states on a file */
+	struct glist_head state_owner_list;  /**< List of states for an owner */
+	struct glist_head state_export_list; /**< List of states on the same
 						 export */
 #ifdef DEBUG_SAL
-	struct glist_head state_list_all;    /*< Global list of all stateids */
+	struct glist_head state_list_all;    /**< Global list of all stateids */
 #endif
-	pthread_mutex_t state_mutex; /*< Mutex protecting following pointers */
-	struct gsh_export *state_export; /*< Export this entry belongs to */
-	state_owner_t *state_owner;	/*< State Owner related to this state */
-	cache_entry_t *state_entry;	/*< Related entry */
+	pthread_mutex_t state_mutex; /**< Mutex protecting following pointers */
+	struct gsh_export *state_export; /**< Export this entry belongs to */
+	/* Don't re-order or move these next two.  They are used for hashing */
+	state_owner_t *state_owner;	/**< State Owner related to state */
+	struct state_obj state_obj;	/**< digest of owning object */
+	struct fsal_export *state_exp;  /**< FSAL export */
 	union state_data state_data;
 	enum state_type state_type;
-	u_int32_t state_seqid;		/*< The NFSv4 Sequence id */
-	int32_t state_refcount;		/*< Refcount for state_t objects */
-	char stateid_other[OTHERSIZE];	/*< "Other" part of state id,
+	u_int32_t state_seqid;		/**< The NFSv4 Sequence id */
+	int32_t state_refcount;		/**< Refcount for state_t objects */
+	char stateid_other[OTHERSIZE];	/**< "Other" part of state id,
 					   used as hash key */
-	struct state_refer state_refer;	/*< For NFSv4.1, track the
+	struct state_refer state_refer;	/**< For NFSv4.1, track the
 					   call that created a
 					   state. */
 };
@@ -405,6 +418,9 @@ extern hash_table_t *ht_9p_owner;
 #endif
 extern hash_table_t *ht_nfs4_owner;
 
+extern struct glist_head cached_open_owners;
+extern pthread_mutex_t cached_open_owners_lock;
+
 /**
  * @brief A structure identifying the owner of an NFSv4 open or lock state
  *
@@ -427,7 +443,9 @@ typedef struct state_nfs4_owner_name_t {
 
 typedef enum state_owner_type_t {
 	STATE_LOCK_OWNER_UNKNOWN,	/*< Unknown */
+#ifdef _USE_NLM
 	STATE_LOCK_OWNER_NLM,	/*< An NLM client */
+#endif /* _USE_NLM */
 #ifdef _USE_9P
 	STATE_LOCK_OWNER_9P,	/*< A 9P client */
 #endif
@@ -554,7 +572,7 @@ struct state_nfs4_owner_t {
 	struct glist_head so_state_list; /*< States owned by this owner */
 	struct glist_head so_perclient;  /*< open owner entry to be
 					   linked to client */
-	time_t last_close_time; /* time last CLOSE op performed */
+	time_t cache_expire; /* time cached OPEN owner will expire */
 };
 
 /**
@@ -747,7 +765,7 @@ typedef enum state_blocking_t {
  * The granted call back is responsible for acquiring a reference to
  * the lock entry if needed.
  */
-typedef state_status_t(*granted_callback_t) (cache_entry_t *entry,
+typedef state_status_t(*granted_callback_t) (struct fsal_obj_handle *obj,
 					     state_lock_entry_t *lock_entry);
 
 /**
@@ -769,8 +787,20 @@ typedef enum state_grant_type_t {
 	STATE_GRANT_NONE,	/*< No grant */
 	STATE_GRANT_INTERNAL,	/*< Grant generated by SAL */
 	STATE_GRANT_FSAL,	/*< FSAL granting lock */
-	STATE_GRANT_FSAL_AVAILABLE	/*< FSAL signalling lock availability */
+	STATE_GRANT_FSAL_AVAILABLE,	/*< FSAL signalling lock availability */
+	STATE_GRANT_POLL,		/*< Poll this lock */
 } state_grant_type_t;
+
+typedef enum state_block_type_t {
+	/** Not blocking */
+	STATE_BLOCK_NONE,
+	/** Lock is blocked by an internal lock. */
+	STATE_BLOCK_INTERNAL,
+	/** Lock is blocked and FSAL supports async blocking locks. */
+	STATE_BLOCK_ASYNC,
+	/** Lock is blocked and SAL will poll the lock. */
+	STATE_BLOCK_POLL,
+} state_block_type_t;
 
 /**
  * @brief Blocking lock data
@@ -778,6 +808,7 @@ typedef enum state_grant_type_t {
 struct state_block_data_t {
 	struct glist_head sbd_list;	/*< Lost of blocking locks */
 	state_grant_type_t sbd_grant_type;	/*< Type of grant */
+	state_block_type_t sbd_block_type;	/*< Type of block */
 	granted_callback_t sbd_granted_callback; /*< Callback for grant */
 	state_cookie_entry_t *sbd_blocked_cookie; /*< Blocking lock cookie */
 	state_lock_entry_t *sbd_lock_entry;	/*< Details of lock */
@@ -790,14 +821,15 @@ struct state_block_data_t {
 struct state_lock_entry_t {
 	struct glist_head sle_list;	/*< Locks on this file */
 	struct glist_head sle_owner_locks; /*< Link on the owner lock list */
-	struct glist_head sle_locks;	/*< Locks on this state/client */
+	struct glist_head sle_client_locks;	/*< Locks on this client */
+	struct glist_head sle_state_locks;	/*< Locks on this state */
 #ifdef DEBUG_SAL
 	struct glist_head sle_all_locks; /*< Link on the global lock list */
 #endif				/* DEBUG_SAL */
 	struct glist_head sle_export_locks;	/*< Link on the export
 						   lock list */
 	struct gsh_export *sle_export;
-	cache_entry_t *sle_entry;	/*< File being locked */
+	struct fsal_obj_handle *sle_obj;	/*< File being locked */
 	state_block_data_t *sle_block_data;	/*< Blocking lock data */
 	state_owner_t *sle_owner;	/* Lock owner */
 	state_t *sle_state;	/*< Associated lock state */
@@ -805,6 +837,97 @@ struct state_lock_entry_t {
 	int32_t sle_ref_count;	/*< Reference count */
 	fsal_lock_param_t sle_lock;	/*< Lock description */
 	pthread_mutex_t sle_mutex;	/*< Mutex to protect the structure */
+};
+
+/**
+ * @brief The ref counted share reservation state.
+ *
+ * Each field represents the count of instances of that flag being present
+ * in a v3 or v4 share reservation.
+ *
+ * There is a separate count of v4 deny write flags so that they can be
+ * enforced against v3 writes (v3 deny writes can not be enforced against
+ * v3 writes because there is no connection between the share reservation
+ * and the write operation). v3 reads will always be allowed.
+ */
+typedef struct sal_share__ {
+	unsigned int share_access_read;
+	unsigned int share_access_write;
+	unsigned int share_deny_read;
+	unsigned int share_deny_write;
+	unsigned int share_deny_write_v4; /**< Count of v4 share deny write */
+} sal_share_t;
+
+/**
+ * @brief Stats for file-specific and client-file delegation heuristics
+ */
+
+struct file_deleg_stats {
+	uint32_t fds_curr_delegations;    /* number of delegations on file */
+	open_delegation_type4 fds_deleg_type; /* delegation type */
+	uint32_t fds_delegation_count;  /* times file has been delegated */
+	uint32_t fds_recall_count;      /* times file has been recalled */
+	time_t fds_avg_hold;            /* avg amount of time deleg held */
+	time_t fds_last_delegation;
+	time_t fds_last_recall;
+	uint32_t fds_num_opens;         /* total num of opens so far. */
+	time_t fds_first_open;          /* time that we started recording
+					   num_opens */
+};
+
+/**
+ * @brief Per-file state lists
+ *
+ * To be used by FSALs
+ */
+struct state_file {
+	/** File owning state */
+	struct fsal_obj_handle *obj;
+	/** NFSv4 states on this file. Protected by state_lock */
+	struct glist_head list_of_states;
+	/** Layout recalls on this file. Protected by state_lock */
+	struct glist_head layoutrecall_list;
+	/** Pointers for lock list. Protected by state_lock */
+	struct glist_head lock_list;
+	/** Pointers for NLM share list. Protected by state_lock */
+	struct glist_head nlm_share_list;
+	/** Share reservation state for this file. Protected by state_lock */
+	sal_share_t share_state;
+	bool write_delegated; /* true iff write delegated */
+	/** Delegation statistics. Protected by state_lock */
+	struct file_deleg_stats fdeleg_stats;
+	uint32_t anon_ops;   /* number of anonymous operations
+			      * happening at the moment which
+			      * prevents delegations from being
+			      * granted */
+};
+
+/**
+ * @brief Per-directory state lists
+ *
+ * To be used by FSALs/SAL
+ */
+struct state_dir {
+	/** If this is a junction, the export this node points to.
+	 * Protected by state_lock. */
+	struct gsh_export *junction_export;
+	/** List of exports that have this cache inode as their root.
+	 * Protected by state_lock */
+	struct glist_head export_roots;
+	/** There is one export root reference counted for each export
+	    for which this entry is a root for. This field is used
+	    with the atomic inc/dec/fetch routines. */
+	int32_t exp_root_refcount;
+};
+
+struct state_hdl {
+	/** Lock protecting state */
+	pthread_rwlock_t state_lock;
+	bool no_cleanup;
+	union {
+		struct state_file	file;
+		struct state_dir	dir;
+	};
 };
 
 /**
@@ -838,7 +961,7 @@ struct recall_state_list {
 
 struct state_layout_recall_file {
 	struct glist_head entry_link;	/*< List of recalls on a file */
-	cache_entry_t *entry;	/*< Related cache entry */
+	struct fsal_obj_handle *obj;	/*< Related file */
 	layouttype4 type;	/*< Type of layout being recalled */
 	struct pnfs_segment segment;	/*< Segment to recall */
 	struct glist_head state_list;	/*< List of states affected by this
@@ -846,9 +969,6 @@ struct state_layout_recall_file {
 	void *recall_cookie;	/*< Cookie returned to FSAL on return of last
 				   segment satisfying the layout */
 };
-
-#define sle_client_locks sle_locks
-#define sle_state_locks  sle_locks
 
 /**
  * @brief Blocking lock cookie entry
@@ -886,7 +1006,7 @@ struct state_layout_recall_file {
  */
 
 struct state_cookie_entry_t {
-	cache_entry_t *sce_entry;	/*< Associated file */
+	struct fsal_obj_handle *sce_obj;	/*< Associated file */
 	state_lock_entry_t *sce_lock_entry;	/*< Associated lock */
 	void *sce_cookie;	/*< Cookie data */
 	int sce_cookie_size;	/*< Length of cookie */
@@ -968,23 +1088,6 @@ typedef struct nfs_grace_start {
 /* Memory pools */
 
 extern pool_t *state_owner_pool;	/*< Pool for NFSv4 files's open owner */
-extern pool_t *state_v4_pool;	/*< Pool for NFSv4 files's states */
-
-/**
- * @brief NLM share reservation
- */
-
-typedef struct state_nlm_share {
-	struct glist_head sns_share_per_file;	/*< Shares on this file */
-	struct glist_head sns_share_per_owner;	/*< Shares for this owner */
-	struct glist_head sns_share_per_client;	/*< Shares for this client */
-	struct glist_head sns_share_per_export;	/*< Shares for this export */
-	state_owner_t *sns_owner;	/*< State owner */
-	cache_entry_t *sns_entry;	/*< File */
-	struct gsh_export *sns_export;	/*< Export */
-	int sns_access;		/*< Access mode */
-	int sns_deny;		/*< Deny mode */
-} state_nlm_share_t;
 
 #ifdef DEBUG_SAL
 extern struct glist_head state_v4_all;

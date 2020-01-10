@@ -16,11 +16,13 @@ libzfswrap_vfs_t *tank_get_root_pvfs(struct fsal_export *exp_hdl);
 
 fsal_status_t tank_lookup_path(struct fsal_export *exp_hdl,
 			       const char *path,
-			       struct fsal_obj_handle **handle);
+			       struct fsal_obj_handle **handle,
+			       struct attrlist *attrs_out);
 
 fsal_status_t tank_create_handle(struct fsal_export *exp_hdl,
 				 struct gsh_buffdesc *hdl_desc,
-				 struct fsal_obj_handle **handle);
+				 struct fsal_obj_handle **handle,
+				 struct attrlist *attrs_out);
 
 /* ZFS FSAL module private storage
  */
@@ -83,8 +85,6 @@ fsal_status_t tank_write(struct fsal_obj_handle *obj_hdl,
 fsal_status_t tank_share_op(struct fsal_obj_handle *obj_hdl, void *p_owner,
 			    fsal_share_param_t request_share);
 fsal_status_t tank_close(struct fsal_obj_handle *obj_hdl);
-fsal_status_t tank_lru_cleanup(struct fsal_obj_handle *obj_hdl,
-			       lru_actions_t requests);
 
 /* extended attributes management */
 fsal_status_t tank_list_ext_attrs(struct fsal_obj_handle *obj_hdl,
@@ -113,9 +113,6 @@ fsal_status_t tank_setextattr_value_by_id(struct fsal_obj_handle *obj_hdl,
 					  unsigned int xattr_id,
 					  caddr_t buffer_addr,
 					  size_t buffer_size);
-fsal_status_t tank_getextattr_attrs(struct fsal_obj_handle *obj_hdl,
-				    unsigned int xattr_id,
-				    struct attrlist *p_attrs);
 fsal_status_t tank_remove_extattr_by_id(struct fsal_obj_handle *obj_hdl,
 					unsigned int xattr_id);
 fsal_status_t tank_remove_extattr_by_name(struct fsal_obj_handle *obj_hdl,

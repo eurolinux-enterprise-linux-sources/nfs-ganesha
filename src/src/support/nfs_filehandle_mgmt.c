@@ -43,92 +43,30 @@
 #include "export_mgr.h"
 #include "fsal_convert.h"
 
+#ifdef _USE_NFS3
 /**
  *
- * @brief Allocates a buffer to be used for storing a NFSv4 filehandle.
+ *  nfs3_FhandleToCache: gets the FSAL obj from the NFSv3 file handle.
  *
- * Allocates a buffer to be used for storing a NFSv3 filehandle.
- *
- * @param fh [INOUT] the filehandle to manage.
- *
- * @return NFS3_OK if successful, NFS3ERR_SERVERFAULT, otherwise.
- *
- */
-int nfs3_AllocateFH(nfs_fh3 *fh)
-{
-	/* Allocating the filehandle in memory */
-	fh->data.data_len = sizeof(struct alloc_file_handle_v3);
-
-	fh->data.data_val = gsh_malloc(fh->data.data_len);
-
-	if (fh->data.data_val == NULL) {
-		LogCrit(COMPONENT_NFSPROTO,
-			"Could not allocate space for filehandle");
-		return NFS3ERR_SERVERFAULT;
-	}
-
-	memset((char *)fh->data.data_val, 0, fh->data.data_len);
-
-	return NFS3_OK;
-}				/* nfs4_AllocateFH */
-
-/**
- *
- * @brief Allocates a buffer to be used for storing a NFSv4 filehandle.
- *
- * Allocates a buffer to be used for storing a NFSv4 filehandle.
- *
- * @param fh [INOUT] the filehandle to manage.
- *
- * @return NFS4_OK if successful, NFS3ERR_SERVERFAULT, NFS4ERR_RESOURCE or
- *                 NFS4ERR_STALE  otherwise.
- *
- */
-int nfs4_AllocateFH(nfs_fh4 *fh)
-{
-	/* Allocating the filehandle in memory */
-	fh->nfs_fh4_len = sizeof(struct alloc_file_handle_v4);
-
-	fh->nfs_fh4_val = gsh_malloc(fh->nfs_fh4_len);
-
-	if (fh->nfs_fh4_val == NULL) {
-		LogCrit(COMPONENT_NFS_V4,
-			"Could not allocate memory for filehandle");
-		return NFS4ERR_RESOURCE;
-	}
-
-	memset(fh->nfs_fh4_val, 0, fh->nfs_fh4_len);
-
-	LogFullDebugOpaque(COMPONENT_FILEHANDLE, "NFS4 Handle %s", LEN_FH_STR,
-			   fh->nfs_fh4_val, fh->nfs_fh4_len);
-
-	return NFS4_OK;
-}
-
-/**
- *
- *  nfs3_FhandleToCache: gets the cache entry from the NFSv3 file handle.
- *
- * Validates and Converts a V3 file handle and then gets the cache entry.
+ * Validates and Converts a V3 file handle and then gets the FSAL obj.
  *
  * @param fh3 [IN] pointer to the file handle to be converted
  * @param exp_list [IN] export fsal to use
  * @param status [OUT] protocol status
  * @param rc [OUT] operation status
  *
- * @return cache entry or NULL on failure
+ * @return FSAL obj or NULL on failure
  *
  */
-cache_entry_t *nfs3_FhandleToCache(nfs_fh3 *fh3,
+struct fsal_obj_handle *nfs3_FhandleToCache(nfs_fh3 *fh3,
 				   nfsstat3 *status,
 				   int *rc)
 {
 	fsal_status_t fsal_status;
 	file_handle_v3_t *v3_handle;
 	struct fsal_export *export;
-	cache_entry_t *entry = NULL;
-	cache_inode_fsal_data_t fsal_data;
-	cache_inode_status_t cache_status;
+	struct fsal_obj_handle *obj = NULL;
+	struct gsh_buffdesc fh_desc;
 
 	/* Default behaviour */
 	*rc = NFS_REQ_OK;
@@ -142,35 +80,34 @@ cache_entry_t *nfs3_FhandleToCache(nfs_fh3 *fh3,
 	/* Cast the fh as a non opaque structure */
 	v3_handle = (file_handle_v3_t *) (fh3->data.data_val);
 
-	assert(v3_handle->exportid == op_ctx->export->export_id);
+	assert(ntohs(v3_handle->exportid) == op_ctx->ctx_export->export_id);
 
 	export = op_ctx->fsal_export;
 
 	/* Give the export a crack at it */
-	fsal_data.export = export;
-	fsal_data.fh_desc.len = v3_handle->fs_len;
-	fsal_data.fh_desc.addr = &v3_handle->fsopaque;
+	fh_desc.len = v3_handle->fs_len;
+	fh_desc.addr = &v3_handle->fsopaque;
 
 	/* adjust the handle opaque into a cache key */
 	fsal_status =
 	    export->exp_ops.extract_handle(export, FSAL_DIGEST_NFSV3,
-					   &fsal_data.fh_desc,
+					   &fh_desc,
 					   v3_handle->fhflags1);
 
-	if (FSAL_IS_ERROR(fsal_status))
-		cache_status = cache_inode_error_convert(fsal_status);
-	else
-		cache_status = cache_inode_get(&fsal_data, &entry);
+	if (!FSAL_IS_ERROR(fsal_status))
+		fsal_status = export->exp_ops.create_handle(export, &fh_desc,
+							    &obj, NULL);
 
-	if (cache_status != CACHE_INODE_SUCCESS) {
-		*status = nfs3_Errno(cache_status);
-		if (nfs_RetryableError(cache_status))
+	if (FSAL_IS_ERROR(fsal_status)) {
+		*status = nfs3_Errno_status(fsal_status);
+		if (nfs_RetryableError(fsal_status.major))
 			*rc = NFS_REQ_DROP;
 	}
 
  badhdl:
-	return entry;
+	return obj;
 }
+#endif /* _USE_NFS3 */
 
 /**
  * @brief Converts an FSAL object to an NFSv4 file handle
@@ -180,28 +117,36 @@ cache_entry_t *nfs3_FhandleToCache(nfs_fh3 *fh3,
  *
  * @return true if successful, false otherwise
  */
-bool nfs4_FSALToFhandle(nfs_fh4 *fh4,
+bool nfs4_FSALToFhandle(bool allocate,
+			nfs_fh4 *fh4,
 			const struct fsal_obj_handle *fsalhandle,
 			struct gsh_export *exp)
 {
-	fsal_status_t fsal_status;
 	file_handle_v4_t *file_handle;
 	struct gsh_buffdesc fh_desc;
 
-	/* reset the buffer to be used as handle */
-	fh4->nfs_fh4_len = sizeof(struct alloc_file_handle_v4);
-	memset(fh4->nfs_fh4_val, 0, fh4->nfs_fh4_len);
+	if (allocate) {
+		/* Allocating the filehandle in memory */
+		nfs4_AllocateFH(fh4);
+	} else {
+		/* reset the buffer to be used as handle */
+		fh4->nfs_fh4_len = NFS4_FHSIZE;
+		memset(fh4->nfs_fh4_val, 0, NFS4_FHSIZE);
+	}
+
 	file_handle = (file_handle_v4_t *) fh4->nfs_fh4_val;
 
 	/* Fill in the fs opaque part */
 	fh_desc.addr = &file_handle->fsopaque;
 	fh_desc.len = fh4->nfs_fh4_len - offsetof(file_handle_v4_t, fsopaque);
-	fsal_status =
-	    fsalhandle->obj_ops.handle_digest(fsalhandle, FSAL_DIGEST_NFSV4,
-					   &fh_desc);
-	if (FSAL_IS_ERROR(fsal_status)) {
+
+	if (FSAL_IS_ERROR(fsalhandle->obj_ops.handle_digest(fsalhandle,
+							    FSAL_DIGEST_NFSV4,
+							    &fh_desc))) {
 		LogDebug(COMPONENT_FILEHANDLE,
 			 "handle_digest FSAL_DIGEST_NFSV4 failed");
+		if (allocate)
+			nfs4_freeFH(fh4);
 		return false;
 	}
 
@@ -210,14 +155,14 @@ bool nfs4_FSALToFhandle(nfs_fh4 *fh4,
 	file_handle->fhflags1 = FH_FSAL_BIG_ENDIAN;
 #endif
 	file_handle->fs_len = fh_desc.len;	/* set the actual size */
-	/* keep track of the export id */
-	file_handle->id.exports = exp->export_id;
+	/* keep track of the export id network byte order for nfs_fh4*/
+	file_handle->id.exports = htons(exp->export_id);
 
 	/* Set the len */
 	fh4->nfs_fh4_len = nfs4_sizeof_handle(file_handle);
 
 	LogFullDebug(COMPONENT_FILEHANDLE, "NFS4 Handle 0x%X export id %d",
-		file_handle->fhflags1, file_handle->id.exports);
+		file_handle->fhflags1, ntohs(file_handle->id.exports));
 	LogFullDebugOpaque(COMPONENT_FILEHANDLE, "NFS4 Handle %s", LEN_FH_STR,
 			   fh4->nfs_fh4_val, fh4->nfs_fh4_len);
 
@@ -236,28 +181,36 @@ bool nfs4_FSALToFhandle(nfs_fh4 *fh4,
  * @todo Do we have to worry about buffer alignment and memcpy to
  * compensate??
  */
-bool nfs3_FSALToFhandle(nfs_fh3 *fh3,
+bool nfs3_FSALToFhandle(bool allocate,
+			nfs_fh3 *fh3,
 			const struct fsal_obj_handle *fsalhandle,
 			struct gsh_export *exp)
 {
-	fsal_status_t fsal_status;
 	file_handle_v3_t *file_handle;
 	struct gsh_buffdesc fh_desc;
 
-	/* reset the buffer to be used as handle */
-	fh3->data.data_len = sizeof(struct alloc_file_handle_v3);
-	memset(fh3->data.data_val, 0, fh3->data.data_len);
+	if (allocate) {
+		/* Allocating the filehandle in memory */
+		nfs3_AllocateFH(fh3);
+	} else {
+		/* reset the buffer to be used as handle */
+		fh3->data.data_len = NFS3_FHSIZE;
+		memset(fh3->data.data_val, 0, NFS3_FHSIZE);
+	}
+
 	file_handle = (file_handle_v3_t *) fh3->data.data_val;
 
 	/* Fill in the fs opaque part */
 	fh_desc.addr = &file_handle->fsopaque;
-	fh_desc.len = fh3->data.data_len - offsetof(file_handle_v3_t, fsopaque);
-	fsal_status =
-	    fsalhandle->obj_ops.handle_digest(fsalhandle, FSAL_DIGEST_NFSV3,
-					   &fh_desc);
-	if (FSAL_IS_ERROR(fsal_status)) {
+	fh_desc.len = NFS3_FHSIZE - offsetof(file_handle_v3_t, fsopaque);
+
+	if (FSAL_IS_ERROR(fsalhandle->obj_ops.handle_digest(fsalhandle,
+							    FSAL_DIGEST_NFSV3,
+							    &fh_desc))) {
 		LogDebug(COMPONENT_FILEHANDLE,
 			 "handle_digest FSAL_DIGEST_NFSV3 failed");
+		if (allocate)
+			nfs3_freeFH(fh3);
 		return false;
 	}
 
@@ -266,8 +219,8 @@ bool nfs3_FSALToFhandle(nfs_fh3 *fh3,
 	file_handle->fhflags1 = FH_FSAL_BIG_ENDIAN;
 #endif
 	file_handle->fs_len = fh_desc.len;	/* set the actual size */
-	/* keep track of the export id */
-	file_handle->exportid = exp->export_id;
+	/* keep track of the export id in network byte order*/
+	file_handle->exportid = htons(exp->export_id);
 
 	/* Set the len */
 	/* re-adjust to as built */
@@ -275,6 +228,12 @@ bool nfs3_FSALToFhandle(nfs_fh3 *fh3,
 
 	LogFullDebugOpaque(COMPONENT_FILEHANDLE, "NFS3 Handle %s", LEN_FH_STR,
 			   fh3->data.data_val, fh3->data.data_len);
+
+	/* Check VMware NFSv3 client's 56 byte file handle size restriction */
+	if (nfs_param.core_param.short_file_handle && fh3->data.data_len > 56)
+		LogWarnOnce(COMPONENT_FILEHANDLE,
+			    "Short file handle option is enabled but file handle size computed is: %d",
+			fh3->data.data_len);
 
 	return true;
 }
@@ -314,8 +273,6 @@ int nfs4_Is_Fh_Invalid(nfs_fh4 *fh)
 {
 	file_handle_v4_t *pfile_handle;
 
-	BUILD_BUG_ON(sizeof(struct alloc_file_handle_v4) != NFS4_FHSIZE);
-
 	if (fh == NULL) {
 		LogMajor(COMPONENT_FILEHANDLE, "INVALID HANDLE: fh==NULL");
 		return NFS4ERR_BADHANDLE;
@@ -328,13 +285,13 @@ int nfs4_Is_Fh_Invalid(nfs_fh4 *fh)
 	pfile_handle = (file_handle_v4_t *) (fh->nfs_fh4_val);
 
 	LogFullDebug(COMPONENT_FILEHANDLE, "NFS4 Handle 0x%X export id %d",
-		pfile_handle->fhflags1, pfile_handle->id.exports);
+		pfile_handle->fhflags1, ntohs(pfile_handle->id.exports));
 
 	/* validate the filehandle  */
 	if (pfile_handle == NULL || fh->nfs_fh4_len == 0
 	    || pfile_handle->fhversion != GANESHA_FH_VERSION
 	    || fh->nfs_fh4_len < offsetof(struct file_handle_v4, fsopaque)
-	    || fh->nfs_fh4_len > sizeof(struct alloc_file_handle_v4)
+	    || fh->nfs_fh4_len > NFS4_FHSIZE
 	    || fh->nfs_fh4_len != nfs4_sizeof_handle(pfile_handle)) {
 		if (isInfo(COMPONENT_FILEHANDLE)) {
 			if (pfile_handle == NULL) {
@@ -356,12 +313,11 @@ int nfs4_Is_Fh_Invalid(nfs_fh4 *fh)
 					(int)offsetof(struct file_handle_v4,
 						      fsopaque));
 			} else if (fh->nfs_fh4_len >
-				   sizeof(struct alloc_file_handle_v4)) {
+				   NFS4_FHSIZE) {
 				LogInfo(COMPONENT_FILEHANDLE,
 					"INVALID HANDLE: data.data_len=%d is greater than %d",
 					fh->nfs_fh4_len,
-					(int)sizeof(struct
-						    alloc_file_handle_v4));
+					(int)NFS4_FHSIZE);
 			} else if (fh->nfs_fh4_len !=
 				   nfs4_sizeof_handle(pfile_handle)) {
 				LogInfo(COMPONENT_FILEHANDLE,
@@ -371,7 +327,7 @@ int nfs4_Is_Fh_Invalid(nfs_fh4 *fh)
 			} else {
 				LogInfo(COMPONENT_FILEHANDLE,
 					"INVALID HANDLE: is_pseudofs=%d",
-					pfile_handle->id.exports == 0);
+					ntohs(pfile_handle->id.exports) == 0);
 			}
 		}
 
@@ -393,8 +349,6 @@ int nfs3_Is_Fh_Invalid(nfs_fh3 *fh3)
 {
 	file_handle_v3_t *pfile_handle;
 
-	BUILD_BUG_ON(sizeof(struct alloc_file_handle_v3) != NFS3_FHSIZE);
-
 	if (fh3 == NULL) {
 		LogMajor(COMPONENT_FILEHANDLE, "INVALID HANDLE: fh3==NULL");
 		return NFS3ERR_BADHANDLE;
@@ -409,8 +363,8 @@ int nfs3_Is_Fh_Invalid(nfs_fh3 *fh3)
 	/* validate the filehandle  */
 	if (pfile_handle == NULL || fh3->data.data_len == 0
 	    || pfile_handle->fhversion != GANESHA_FH_VERSION
-	    || fh3->data.data_len < sizeof(file_handle_v3_t)
-	    || fh3->data.data_len > sizeof(struct alloc_file_handle_v3)
+	    || fh3->data.data_len < offsetof(file_handle_v3_t, fsopaque)
+	    || fh3->data.data_len > NFS3_FHSIZE
 	    || fh3->data.data_len != nfs3_sizeof_handle(pfile_handle)) {
 		if (isInfo(COMPONENT_FILEHANDLE)) {
 			if (pfile_handle == NULL) {
@@ -429,14 +383,14 @@ int nfs3_Is_Fh_Invalid(nfs_fh3 *fh3)
 				LogInfo(COMPONENT_FILEHANDLE,
 					"INVALID HANDLE: data.data_len=%d is less than %d",
 					fh3->data.data_len,
-					(int)sizeof(file_handle_v3_t));
+					(int)offsetof(file_handle_v3_t,
+						      fsopaque));
 			} else if (fh3->data.data_len >
-				   sizeof(struct alloc_file_handle_v3)) {
+				   NFS3_FHSIZE) {
 				LogInfo(COMPONENT_FILEHANDLE,
 					"INVALID HANDLE: data.data_len=%d is greater than %d",
 					fh3->data.data_len,
-					(int)sizeof(struct
-						    alloc_file_handle_v3));
+					(int)NFS3_FHSIZE);
 			} else if (fh3->data.data_len !=
 				   nfs3_sizeof_handle(pfile_handle)) {
 				LogInfo(COMPONENT_FILEHANDLE,
@@ -629,7 +583,7 @@ nfsstat4 nfs4_sanity_check_FH(compound_data_t *data,
 	if (fh_status != NFS4_OK)
 		return fh_status;
 
-	assert(data->current_entry != NULL &&
+	assert(data->current_obj != NULL &&
 	       data->current_filetype != NO_FILE_TYPE);
 
 	/* If the filehandle is invalid */

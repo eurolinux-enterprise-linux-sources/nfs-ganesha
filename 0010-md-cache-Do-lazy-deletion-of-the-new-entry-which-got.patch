@@ -1,0 +1,33 @@
+From c377b160b3cc554ed1a25b3d9636dc92b7384a85 Mon Sep 17 00:00:00 2001
+From: Soumya Koduri <skoduri@redhat.com>
+Date: Wed, 4 Jan 2017 12:16:38 +0530
+Subject: [PATCH] md-cache: Do lazy deletion of the new entry which got raced
+
+There could be cases where in we race/fail to construct
+newly allocated entry. In such cases, do lazy deletion
+of that entry to avoid use after free of that memory.
+
+Change-Id: Ice2420f770456ba0799c59fe9c4d9ef8a12d4184
+Signed-off-by: Daniel Gryniewicz <dang@redhat.com>
+Signed-off-by: Soumya Koduri <skoduri@redhat.com>
+---
+ src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_helpers.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_helpers.c b/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_helpers.c
+index 4dfa976..fa07418 100644
+--- a/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_helpers.c
++++ b/src/FSAL/Stackable_FSALs/FSAL_MDCACHE/mdcache_helpers.c
+@@ -580,7 +580,8 @@ mdcache_new_entry(struct mdcache_fsal_export *export,
+ 			mdcache_key_delete(&nentry->fh_hk.key);
+ 
+ 		/* Release the new entry we acquired. */
+-		mdcache_lru_putback(nentry, LRU_FLAG_NONE);
++		mdcache_put(nentry);
++		mdcache_kill_entry(nentry);
+ 	}
+ 
+  out_release:
+-- 
+1.8.3.1
+

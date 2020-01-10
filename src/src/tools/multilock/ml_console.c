@@ -24,6 +24,7 @@
  */
 
 #include "multilock.h"
+#include "assert.h"
 
 /* command line syntax */
 
@@ -52,11 +53,12 @@ bool err_accounting;
 sigset_t full_signal_set;
 sigset_t original_signal_set;
 
-void open_socket()
+void open_socket(void)
 {
 	int rc;
 
 	rc = socket(AF_INET, SOCK_STREAM, 0);
+
 	if (rc == -1)
 		fatal("socket failed with ERRNO %d \"%s\"\n",
 		      errno, strerror(errno));
@@ -84,7 +86,7 @@ void open_socket()
 		      errno, strerror(errno));
 }
 
-void do_accept()
+void do_accept(void)
 {
 	struct client *client = malloc(sizeof(*client));
 	socklen_t len;
@@ -105,7 +107,7 @@ void do_accept()
 
 	FD_SET(client->c_socket, &sockets);
 
-	sprintf(client->c_name, "<UNKNOWN_%d>", client->c_socket);
+	array_sprintf(client->c_name, "<UNKNOWN_%d>", client->c_socket);
 
 	if (client->c_socket > maxfd)
 		maxfd = client->c_socket;
@@ -182,7 +184,7 @@ struct client *find_client_by_name(const char *name)
 
 int receive(bool watchin, long int timeout_secs)
 {
-	fd_set readfds, writefds, exceptfds;
+	fd_set readfds, exceptfds;
 	struct timespec timeout;
 	int rc, i;
 	int timeend = 0;
@@ -194,6 +196,7 @@ int receive(bool watchin, long int timeout_secs)
 		if (timeout_secs > 0) {
 			timeout.tv_nsec = 0;
 			timeout.tv_sec = timeend - time(NULL);
+
 			if (timeout.tv_sec == 0)
 				return -2;
 		} else if (timeout_secs == 0) {
@@ -201,13 +204,12 @@ int receive(bool watchin, long int timeout_secs)
 			timeout.tv_sec = 0;
 		}
 
-		memcpy(&readfds, &sockets, sizeof(sockets));
+		readfds = sockets;
 
 		if (watchin)
 			FD_SET(0, &readfds);
 
-		memcpy(&writefds, &sockets, sizeof(sockets));
-		memcpy(&exceptfds, &sockets, sizeof(sockets));
+		exceptfds = sockets;
 
 		if (watchin)
 			FD_SET(0, &exceptfds);
@@ -275,7 +277,7 @@ int receive(bool watchin, long int timeout_secs)
 	}
 }
 
-void error()
+void error(void)
 {
 	int len = strlen(errdetail);
 
@@ -313,13 +315,15 @@ struct response *process_client_response(struct client *client)
 	int len;
 	struct response *client_resp;
 	char *rest;
-	char line[MAXSTR * 2];
+	char line[MAXXFER];
 
 	client_resp = alloc_resp(client);
 
-	len = readln(client->c_input, line, MAXSTR * 2);
+	len = readln(client->c_input, line, sizeof(line));
+
 	if (len >= 0) {
-		sprintf(client_resp->r_original, "%s %s", client->c_name, line);
+		array_sprintf(client_resp->r_original, "%s %s",
+			      client->c_name, line);
 		fprintf(output, "%s\n", client_resp->r_original);
 
 		rest = parse_response(line, client_resp);
@@ -328,9 +332,8 @@ struct response *process_client_response(struct client *client)
 			return client_resp;
 
 		if (client_resp->r_cmd == CMD_HELLO) {
-			strncpy(client->c_name, client_resp->r_data,
-				client_resp->r_length);
-			client->c_name[client_resp->r_length] = '\0';
+			assert(client_resp->r_length < sizeof(client->c_name));
+			array_strcpy(client->c_name, client_resp->r_data);
 		}
 	} else {
 		fprintf(output, "%s -2 QUIT OK # socket closed\n",
@@ -344,7 +347,7 @@ struct response *process_client_response(struct client *client)
 	return client_resp;
 }
 
-static void master_command();
+static void master_command(void);
 
 struct response *receive_response(bool watchin, long int timeout_secs)
 {
@@ -352,6 +355,7 @@ struct response *receive_response(bool watchin, long int timeout_secs)
 	struct client *client;
 
 	fd = receive(watchin, timeout_secs);
+
 	if (fd == -2 && timeout_secs >= 0) {
 		/* Expected timeout */
 		return NULL;
@@ -364,9 +368,10 @@ struct response *receive_response(bool watchin, long int timeout_secs)
 			resp->r_tag = -1;
 			resp->r_cmd = CMD_QUIT;
 			resp->r_status = STATUS_CANCELED;
-			strcpy(resp->r_original, "-1 QUIT CANCELED");
+			array_strcpy(resp->r_original, "-1 QUIT CANCELED");
 			errno = 0;
-			strcpy(errdetail, "Receive interrupted - exiting...");
+			array_strcpy(errdetail,
+				     "Receive interrupted - exiting...");
 		} else {
 			/* some other error occurred */
 			fprintf_stderr("Receive failed ERRNO %d \"%s\"\n",
@@ -375,14 +380,14 @@ struct response *receive_response(bool watchin, long int timeout_secs)
 
 			resp->r_errno = errno;
 			resp->r_tag = -1;
-			strcpy(resp->r_data, "Receive failed");
+			array_strcpy(resp->r_data, "Receive failed");
 
-			sprintf(resp->r_original,
-				"-1 QUIT ERRNO %d \"%s\" \"Receive failed\"",
-				errno, strerror(errno));
+			array_sprintf(resp->r_original,
+				      "-1 QUIT ERRNO %d \"%s\" \"Receive failed\"",
+				      errno, strerror(errno));
 
-			strcpy(errdetail, "Receive failed");
-			strcpy(badtoken, "");
+			array_strcpy(errdetail, "Receive failed");
+			array_strcpy(badtoken, "");
 		}
 		return resp;
 	} else if (watchin && fd == 0) {
@@ -412,6 +417,7 @@ enum master_cmd {
 	MCMD_SIMPLE_DENIED,
 	MCMD_SIMPLE_DEADLOCK,
 	MCMD_CLIENTS,
+	MCMD_FORK,
 };
 
 struct token master_commands[] = {
@@ -428,10 +434,11 @@ struct token master_commands[] = {
 	{"DENIED", 6, MCMD_SIMPLE_DENIED},
 	{"DEADLOCK", 8, MCMD_SIMPLE_DEADLOCK},
 	{"CLIENTS", 7, MCMD_CLIENTS},
+	{"FORK", 4, MCMD_FORK},
 	{"", 0, MCMD_CLIENT_CMD}
 };
 
-static void handle_quit();
+static void handle_quit(void);
 
 /*
  * wait_for_expected_responses
@@ -448,6 +455,7 @@ void wait_for_expected_responses(const char *label, int count,
 	bool fatal = false;
 
 	fprintf(output, "Waiting for %d %s...\n", count, label);
+
 	while (expected_responses != NULL
 	       && (client_list != NULL || could_quit)) {
 		client_resp = receive_response(false, -1);
@@ -468,12 +476,13 @@ void wait_for_expected_responses(const char *label, int count,
 			free_response(client_resp, NULL);
 		} else if (client_resp->r_cmd != CMD_QUIT) {
 			errno = 0;
+
 			if (err_accounting)
 				fprintf(stderr, "%s\nResp:      %s\n", last,
 					client_resp->r_original);
 
 			free_response(client_resp, NULL);
-			sprintf(errdetail, "Unexpected response");
+			array_strcpy(errdetail, "Unexpected response");
 			error();
 
 			/* If not called from handle_quit() dump list of
@@ -503,7 +512,7 @@ void wait_for_expected_responses(const char *label, int count,
 		handle_quit();
 }
 
-void handle_quit()
+void handle_quit(void)
 {
 	struct response *expect_resp;
 	struct client *client;
@@ -516,7 +525,7 @@ void handle_quit()
 			if (client->c_socket == 0)
 				continue;
 
-			sprintf(out, "%ld QUIT\n", ++global_tag);
+			array_sprintf(out, "%ld QUIT\n", ++global_tag);
 			fputs(out, client->c_output);
 			fflush(client->c_output);
 
@@ -525,8 +534,9 @@ void handle_quit()
 			expect_resp->r_cmd = CMD_QUIT;
 			expect_resp->r_status = STATUS_OK;
 			expect_resp->r_tag = global_tag;
-			sprintf(expect_resp->r_original, "EXPECT %s * QUIT OK",
-				client->c_name);
+			array_sprintf(expect_resp->r_original,
+				      "EXPECT %s * QUIT OK",
+				      client->c_name);
 			add_response(expect_resp, &expected_responses);
 			count++;
 
@@ -535,8 +545,9 @@ void handle_quit()
 			expect_resp->r_cmd = CMD_QUIT;
 			expect_resp->r_status = STATUS_OK;
 			expect_resp->r_tag = -2;
-			sprintf(expect_resp->r_original, "EXPECT %s -2 QUIT OK",
-				client->c_name);
+			array_sprintf(expect_resp->r_original,
+				      "EXPECT %s -2 QUIT OK",
+				      client->c_name);
 			add_response(expect_resp, &expected_responses);
 			count++;
 		}
@@ -584,9 +595,9 @@ bool expect_one_response(struct response *expect_resp, const char *last)
 
 struct master_state {
 	char *rest;
-	char line[MAXSTR * 2];
-	char out[MAXSTR * 2];
-	char last[MAXSTR * 2];	/* last command sent */
+	char line[MAXXFER];
+	char out[MAXXFER];
+	char last[MAXXFER];	/* last command sent */
 	struct client *client;
 	int len;
 	int cmd;
@@ -604,9 +615,9 @@ void mcmd_client_cmd(struct master_state *ms)
 		return;
 
 	if (script)
-		sprintf(ms->last, "Line %4ld: %s", lno, ms->line);
+		array_sprintf(ms->last, "Line %4ld: %s", lno, ms->line);
 	else
-		strcpy(ms->last, ms->line);
+		array_strcpy(ms->last, ms->line);
 
 	ms->client_cmd = alloc_resp(ms->client);
 
@@ -649,8 +660,7 @@ void mcmd_sleep(struct master_state *ms)
 					ms->last,
 					client_resp->r_original);
 
-			sprintf(errdetail,
-				"Unexpected response");
+			array_strcpy(errdetail, "Unexpected response");
 
 			ms->rest = NULL;
 
@@ -667,8 +677,7 @@ void mcmd_open_brace(struct master_state *ms)
 {
 	if (ms->inbrace) {
 		errno = 0;
-		strcpy(errdetail,
-		       "Illegal nested brace");
+		array_strcpy(errdetail, "Illegal nested brace");
 		ms->rest = NULL;
 	}
 
@@ -680,8 +689,7 @@ void mcmd_close_brace(struct master_state *ms)
 {
 	if (!ms->inbrace) {
 		errno = 0;
-		strcpy(errdetail,
-		       "Unmatched close brace");
+		array_strcpy(errdetail, "Unmatched close brace");
 		ms->rest = NULL;
 	} else if (!syntax) {
 		ms->inbrace = false;
@@ -699,8 +707,8 @@ void mcmd_clients(struct master_state *ms)
 {
 	if (ms->inbrace) {
 		errno = 0;
-		strcpy(errdetail,
-		       "CLIENTS command not allowed inside brace");
+		array_strcpy(errdetail,
+			     "CLIENTS command not allowed inside brace");
 		ms->rest = NULL;
 		return;
 	}
@@ -722,11 +730,11 @@ void mcmd_clients(struct master_state *ms)
 		ms->expect_resp->r_tag = -1;
 		ms->expect_resp->r_status = STATUS_OK;
 
-		strcpy(ms->expect_resp->r_data, ms->client->c_name);
+		array_strcpy(ms->expect_resp->r_data, ms->client->c_name);
 
-		sprintf(ms->expect_resp->r_original,
-			"EXPECT %s * HELLO OK \"%s\"",
-			ms->client->c_name, ms->client->c_name);
+		array_sprintf(ms->expect_resp->r_original,
+			      "EXPECT %s * HELLO OK \"%s\"",
+			      ms->client->c_name, ms->client->c_name);
 
 		ms->count++;
 
@@ -740,8 +748,7 @@ void mcmd_clients(struct master_state *ms)
 
 	if (ms->count == 0) {
 		errno = 0;
-		strcpy(errdetail,
-		       "Expected at least one client");
+		array_strcpy(errdetail, "Expected at least one client");
 		ms->rest = NULL;
 		return;
 	}
@@ -758,6 +765,92 @@ void mcmd_clients(struct master_state *ms)
 	ms->count = 0;
 }
 
+void mcmd_fork(struct master_state *ms)
+{
+	if (ms->inbrace) {
+		errno = 0;
+		array_strcpy(errdetail,
+			     "FORK command not allowed inside brace");
+		ms->rest = NULL;
+		return;
+	}
+
+	/* Get the client to send FORK to */
+	ms->rest = get_client(ms->rest,
+			      &ms->client,
+			      syntax,
+			      REQUIRES_MORE);
+
+	if (ms->rest == NULL)
+		return;
+
+	/* Build an EXPECT client * FORK OK "client" */
+	ms->client_cmd = alloc_resp(ms->client);
+	ms->client_cmd->r_cmd = CMD_FORK;
+	ms->client_cmd->r_tag = -1;
+	ms->client_cmd->r_status = STATUS_OK;
+
+	ms->count++;
+
+	/* Get the client that will be created */
+	ms->rest = get_client(ms->rest,
+			      &ms->client,
+			      true,
+			      REQUIRES_NO_MORE);
+
+	if (ms->rest == NULL)
+		return;
+
+	/* Build an EXPECT client * HELLO OK "client" */
+	ms->expect_resp = alloc_resp(ms->client);
+	ms->expect_resp->r_cmd = CMD_HELLO;
+	ms->expect_resp->r_tag = -1;
+	ms->expect_resp->r_status = STATUS_OK;
+
+	/* Use the created client's name as the FORK data */
+	array_strcpy(ms->client_cmd->r_data,
+		     ms->expect_resp->r_client->c_name);
+
+	array_strcpy(ms->expect_resp->r_data,
+		     ms->expect_resp->r_client->c_name);
+
+	array_sprintf(ms->client_cmd->r_original,
+		      "EXPECT %s * FORK OK \"%s\"",
+		      ms->client->c_name, ms->client->c_name);
+
+	array_sprintf(ms->expect_resp->r_original,
+		      "EXPECT %s * HELLO OK \"%s\"",
+		      ms->client->c_name, ms->client->c_name);
+
+	ms->count++;
+
+	if (syntax) {
+		free_response(ms->client_cmd, NULL);
+		free_response(ms->expect_resp, NULL);
+	} else {
+		/* Send the command */
+		send_cmd(ms->client_cmd);
+
+		/* Now fixup to expect client name as FORK OK data */
+		array_strcpy(ms->client_cmd->r_data,
+			     ms->client_cmd->r_client->c_name);
+
+		/* Add responses to list of expected responses */
+		add_response(ms->client_cmd, &expected_responses);
+		add_response(ms->expect_resp, &expected_responses);
+	}
+
+	if (!syntax) {
+		wait_for_expected_responses("clients",
+					    ms->count,
+					    ms->last,
+					    true);
+		fprintf(output, "All clients responded OK\n");
+	}
+
+	ms->count = 0;
+}
+
 void mcmd_expect(struct master_state *ms)
 {
 	ms->rest = get_client(ms->rest, &ms->client, true, REQUIRES_MORE);
@@ -767,14 +860,15 @@ void mcmd_expect(struct master_state *ms)
 
 	ms->expect_resp = alloc_resp(ms->client);
 
-	if (script)
-		sprintf(ms->expect_resp->r_original,
-			"Line %4ld: EXPECT %s %s",
-			lno, ms->client->c_name, ms->rest);
-	else
-		sprintf(ms->expect_resp->r_original,
-			"EXPECT %s %s",
-			ms->client->c_name, ms->rest);
+	if (script) {
+		array_sprintf(ms->expect_resp->r_original,
+			      "Line %4ld: EXPECT %s %s",
+			      lno, ms->client->c_name, ms->rest);
+	} else {
+		array_sprintf(ms->expect_resp->r_original,
+			      "EXPECT %s %s",
+			      ms->client->c_name, ms->rest);
+	}
 
 	ms->rest = parse_response(ms->rest, ms->expect_resp);
 
@@ -789,7 +883,7 @@ void mcmd_expect(struct master_state *ms)
 
 void mcmd_simple(struct master_state *ms)
 {
-	strcpy(ms->last, ms->line);
+	array_strcpy(ms->last, ms->line);
 	ms->rest = get_client(ms->rest, &ms->client, syntax, REQUIRES_MORE);
 
 	if (ms->rest == NULL)
@@ -825,9 +919,9 @@ void mcmd_simple(struct master_state *ms)
 	case CMD_HELLO:
 	case CMD_QUIT:
 		if (ms->cmd != MCMD_SIMPLE_OK) {
-			sprintf(errdetail,
-				"Simple %s command expects OK",
-				commands[ms->client_cmd->r_cmd].cmd_name);
+			array_sprintf(errdetail,
+				      "Simple %s command expects OK",
+				      commands[ms->client_cmd->r_cmd].cmd_name);
 			errno = 0;
 			ms->rest = NULL;
 		}
@@ -835,15 +929,15 @@ void mcmd_simple(struct master_state *ms)
 
 	case CMD_READ:
 		if (ms->cmd != MCMD_SIMPLE_OK) {
-			sprintf(errdetail,
-				"Simple %s command expects OK",
-				commands[ms->client_cmd->r_cmd].cmd_name);
+			array_sprintf(errdetail,
+				      "Simple %s command expects OK",
+				      commands[ms->client_cmd->r_cmd].cmd_name);
 			errno = 0;
 			ms->rest = NULL;
 		} else if (ms->client_cmd->r_length == 0
 			   || ms->client_cmd->r_data[0] == '\0') {
-			strcpy(errdetail,
-			       "Simple READ must have compare data");
+			array_strcpy(errdetail,
+				     "Simple READ must have compare data");
 			errno = 0;
 			ms->rest = NULL;
 		}
@@ -851,9 +945,9 @@ void mcmd_simple(struct master_state *ms)
 
 	case CMD_LOCKW:
 		if (ms->cmd != MCMD_SIMPLE_DEADLOCK) {
-			sprintf(errdetail,
-				"%s command can not be a simple command",
-				commands[ms->client_cmd->r_cmd].cmd_name);
+			array_sprintf(errdetail,
+				      "%s command can not be a simple command",
+				      commands[ms->client_cmd->r_cmd].cmd_name);
 			errno = 0;
 			ms->rest = NULL;
 		}
@@ -863,10 +957,10 @@ void mcmd_simple(struct master_state *ms)
 	case CMD_HOP:
 		if (ms->cmd != MCMD_SIMPLE_DENIED
 		    && ms->cmd != MCMD_SIMPLE_GRANTED) {
-			sprintf(errdetail,
-				"Simple %s command requires GRANTED or DENIED status",
-				commands[ms->client_cmd->r_cmd].
-				cmd_name);
+			array_sprintf(errdetail,
+				      "Simple %s command requires GRANTED or DENIED status",
+				      commands[ms->client_cmd->r_cmd].
+				      cmd_name);
 			errno = 0;
 			ms->rest = NULL;
 		}
@@ -875,9 +969,9 @@ void mcmd_simple(struct master_state *ms)
 	case CMD_TEST:
 	case CMD_LIST:
 		if (ms->cmd != MCMD_SIMPLE_AVAILABLE) {
-			sprintf(errdetail,
-				"Simple %s command requires AVAILABLE status",
-				commands[ms->client_cmd->r_cmd].cmd_name);
+			array_sprintf(errdetail,
+				      "Simple %s command requires AVAILABLE status",
+				      commands[ms->client_cmd->r_cmd].cmd_name);
 			errno = 0;
 			ms->rest = NULL;
 		}
@@ -886,16 +980,21 @@ void mcmd_simple(struct master_state *ms)
 	case CMD_UNLOCK:
 	case CMD_UNHOP:
 		if (ms->cmd != MCMD_SIMPLE_GRANTED) {
-			sprintf(errdetail,
-				"Simple %s command requires GRANTED status",
-				commands[ms->client_cmd->r_cmd].cmd_name);
+			array_sprintf(errdetail,
+				      "Simple %s command requires GRANTED status",
+				      commands[ms->client_cmd->r_cmd].cmd_name);
 			errno = 0;
 			ms->rest = NULL;
 		}
 		break;
 
+	case CMD_FORK:
+		array_strcpy(errdetail,
+			     "FORK not compatible with a simple command");
+		break;
+
 	case NUM_COMMANDS:
-		strcpy(errdetail, "Invalid command");
+		array_strcpy(errdetail, "Invalid command");
 		errno = 0;
 		ms->rest = NULL;
 		break;
@@ -910,14 +1009,14 @@ void mcmd_simple(struct master_state *ms)
 
 	/* We can't know what file descriptor will be returned */
 	ms->client_cmd->r_fno = -1;
-	sprintf_resp(ms->out, "EXPECT", ms->client_cmd);
+	sprintf_resp(ms->out, sizeof(ms->out), "EXPECT", ms->client_cmd);
 	fprintf(output, "%s", ms->out);
 
 	if (expect_one_response(ms->client_cmd, ms->last))
 		ms->rest = NULL;
 }
 
-void master_command()
+void master_command(void)
 {
 	struct master_state ms = {
 		.inbrace = false,
@@ -926,11 +1025,12 @@ void master_command()
 	ms.last[0] = '\0';
 
 	while (1) {
-		ms.len = readln(input, ms.line, MAXSTR);
+		ms.len = readln(input, ms.line, sizeof(ms.line));
 		lno++;
 
 		if (ms.len < 0) {
-			ms.len = sprintf(ms.line, "QUIT");
+			array_sprintf(ms.line, "QUIT");
+			ms.len = strlen(ms.line);
 			if (!syntax)
 				fprintf(output, "QUIT\n");
 		}
@@ -990,6 +1090,10 @@ void master_command()
 
 			case MCMD_EXPECT:
 				mcmd_expect(&ms);
+				break;
+
+			case MCMD_FORK:
+				mcmd_fork(&ms);
 				break;
 
 			case MCMD_SIMPLE_OK:
@@ -1054,30 +1158,35 @@ int main(int argc, char **argv)
 	sigact.sa_handler = sighandler;
 
 	rc = sigaction(SIGINT, &sigact, NULL);
+
 	if (rc == -1)
 		fatal(
 		    "sigaction(SIGINT, &sigact, NULL) returned -1 errno %d \"%s\"\n",
 		    errno, strerror(errno));
 
 	rc = sigaction(SIGTERM, &sigact, NULL);
+
 	if (rc == -1)
 		fatal(
 		    "sigaction(SIGTERM, &sigact, NULL) returned -1 errno %d \"%s\"\n",
 		    errno, strerror(errno));
 
 	rc = sigaction(SIGUSR1, &sigact, NULL);
+
 	if (rc == -1)
 		fatal(
 		    "sigaction(SIGUSR1, &sigact, NULL) returned -1 errno %d \"%s\"\n",
 		    errno, strerror(errno));
 
 	rc = sigaction(SIGPIPE, &sigact, NULL);
+
 	if (rc == -1)
 		fatal(
 		    "sigaction(SIGPIPE, &sigact, NULL) returned -1 errno %d \"%s\"\n",
 		    errno, strerror(errno));
 
 	rc = sigfillset(&full_signal_set);
+
 	if (rc == -1)
 		fatal(
 		    "sigfillset(&full_signal_set) returned -1 errno %d \"%s\"\n",
@@ -1166,7 +1275,7 @@ int main(int argc, char **argv)
 
 		if (strict && resp != NULL) {
 			errno = 0;
-			sprintf(errdetail, "Unexpected response");
+			array_strcpy(errdetail, "Unexpected response");
 			free_response(resp, NULL);
 			error();
 			if (error_is_fatal)

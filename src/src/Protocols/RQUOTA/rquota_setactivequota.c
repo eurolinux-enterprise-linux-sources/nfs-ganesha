@@ -30,7 +30,6 @@
 #include "nfs23.h"
 #include "nfs4.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_exports.h"
 #include "mount.h"
 #include "rquota.h"
@@ -40,15 +39,11 @@
  * @brief The Rquota setactivequota function, for all versions.
  *
  * @param[in]  arg     Ignored
- * @param[in]  export  Ignored
- * @param[in]  worker  Ignored
  * @param[in]  req     Ignored
  * @param[out] res     Ignored
  */
 
-int rquota_setactivequota(nfs_arg_t *arg,
-			  nfs_worker_data_t *worker, struct svc_req *req,
-			  nfs_res_t *res)
+int rquota_setactivequota(nfs_arg_t *arg, struct svc_req *req, nfs_res_t *res)
 {
 	LogFullDebug(COMPONENT_NFSPROTO,
 		     "REQUEST PROCESSING: Calling rquota_setactivequota");
@@ -64,5 +59,5 @@ int rquota_setactivequota(nfs_arg_t *arg,
  */
 void rquota_setactivequota_Free(nfs_res_t *res)
 {
-	return;
+	/* Nothing to do */
 }

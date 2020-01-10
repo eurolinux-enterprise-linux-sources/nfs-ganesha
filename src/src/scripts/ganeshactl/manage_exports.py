@@ -6,7 +6,7 @@
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
+# the Free Software Foundation; either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
@@ -49,6 +49,10 @@ class ShowExports(QtCore.QObject):
     def addexport(self, conf_path, exp_expr):
         self.exportmgr.AddExport(conf_path, exp_expr)
         print "Add Export in %s" % conf_path
+
+    def updateexport(self, conf_path, exp_expr):
+        self.exportmgr.UpdateExport(conf_path, exp_expr)
+        print "Update Export in %s" % conf_path
 
     def removeexport(self, exp_id):
         self.exportmgr.RemoveExport(exp_id)
@@ -95,6 +99,8 @@ if __name__ == '__main__':
     exportmgr = ShowExports(sysbus)
     if sys.argv[1] == "add":
         exportmgr.addexport(sys.argv[2], sys.argv[3])
+    elif sys.argv[1] == "update":
+        exportmgr.updateexport(sys.argv[2], sys.argv[3])
     elif sys.argv[1] == "remove":
         exportmgr.removeexport(sys.argv[2])
     elif sys.argv[1] == "display":

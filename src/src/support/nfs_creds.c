@@ -60,7 +60,7 @@
 
 /* Export permissions for root op context */
 uint32_t root_op_export_options = EXPORT_OPTION_ROOT |
-				  EXPORT_OPTION_ACCESS_TYPE |
+				  EXPORT_OPTION_ACCESS_MASK |
 				  EXPORT_OPTION_AUTH_TYPES |
 				  EXPORT_OPTION_PROTOCOLS |
 				  EXPORT_OPTION_TRANSPORTS;
@@ -68,24 +68,29 @@ uint32_t root_op_export_options = EXPORT_OPTION_ROOT |
 uint32_t root_op_export_set = EXPORT_OPTION_SQUASH_TYPES |
 			      EXPORT_OPTION_ANON_UID_SET |
 			      EXPORT_OPTION_ANON_GID_SET |
-			      EXPORT_OPTION_ACCESS_TYPE |
+			      EXPORT_OPTION_ACCESS_MASK |
 			      EXPORT_OPTION_AUTH_TYPES |
 			      EXPORT_OPTION_PROTOCOLS |
 			      EXPORT_OPTION_TRANSPORTS;
 
 void squash_setattr(struct attrlist *attr)
 {
-	if (attr->mask & ATTR_OWNER) {
+	if (attr->valid_mask & ATTR_OWNER &&
+	    op_ctx->export_perms->anonymous_uid != 0) {
 		if (op_ctx->export_perms->options &
 		    EXPORT_OPTION_ALL_ANONYMOUS)
 			attr->owner = op_ctx->export_perms->anonymous_uid;
-		else if (!(op_ctx->export_perms->options & EXPORT_OPTION_ROOT)
+		else if (((op_ctx->export_perms->options &
+			   EXPORT_OPTION_ROOT_SQUASH) ||
+			  (op_ctx->export_perms->options &
+			   EXPORT_OPTION_ROOT_ID_SQUASH))
 			 && (attr->owner == 0)
 			 && ((op_ctx->cred_flags & UID_SQUASHED) != 0))
 			attr->owner = op_ctx->export_perms->anonymous_uid;
 	}
 
-	if (attr->mask & ATTR_GROUP) {
+	if (attr->valid_mask & ATTR_GROUP &&
+	    op_ctx->export_perms->anonymous_gid != 0) {
 		/* If all squashed, then always squash the owner_group.
 		 *
 		 * If root squashed, then squash owner_group if
@@ -95,7 +100,10 @@ void squash_setattr(struct attrlist *attr)
 		if (op_ctx->export_perms->options &
 		    EXPORT_OPTION_ALL_ANONYMOUS)
 			attr->group = op_ctx->export_perms->anonymous_gid;
-		else if (!(op_ctx->export_perms->options & EXPORT_OPTION_ROOT)
+		else if (((op_ctx->export_perms->options &
+			   EXPORT_OPTION_ROOT_SQUASH) ||
+			  (op_ctx->export_perms->options &
+			   EXPORT_OPTION_ROOT_ID_SQUASH))
 			 && (attr->group == 0)
 			 && ((op_ctx->cred_flags & (GID_SQUASHED |
 						     GARRAY_SQUASHED)) != 0))
@@ -114,6 +122,14 @@ void squash_setattr(struct attrlist *attr)
 bool nfs_compare_clientcred(nfs_client_cred_t *cred1,
 			    nfs_client_cred_t *cred2)
 {
+#ifdef _HAVE_GSSAPI
+	gss_name_t cred1_cred_name;
+	gss_name_t cred2_cred_name;
+	OM_uint32 maj_stat, min_stat;
+	int status;
+#endif
+
+
 	if (cred1 == NULL)
 		return false;
 	if (cred2 == NULL)
@@ -131,6 +147,35 @@ bool nfs_compare_clientcred(nfs_client_cred_t *cred1,
 		    cred2->auth_union.auth_unix.aup_gid)
 			return false;
 		break;
+
+#ifdef _HAVE_GSSAPI
+	case RPCSEC_GSS:
+		maj_stat = gss_inquire_context(&min_stat,
+			cred1->auth_union.auth_gss.gd->ctx,
+			&cred1_cred_name, NULL, NULL, NULL, NULL, NULL, NULL);
+
+		if (maj_stat != GSS_S_COMPLETE &&
+		    maj_stat != GSS_S_CONTEXT_EXPIRED)
+			return false;
+
+		 maj_stat = gss_inquire_context(&min_stat,
+			cred2->auth_union.auth_gss.gd->ctx,
+			&cred2_cred_name, NULL, NULL, NULL, NULL, NULL, NULL);
+
+		if (maj_stat != GSS_S_COMPLETE &&
+		    maj_stat != GSS_S_CONTEXT_EXPIRED)
+			return false;
+
+		maj_stat = gss_compare_name(&min_stat, cred1_cred_name,
+					    cred2_cred_name, &status);
+		if (maj_stat != GSS_S_COMPLETE)
+			return false;
+
+		if (status == 0)
+			return false;
+
+		break;
+#endif
 
 	default:
 		if (memcmp
@@ -179,14 +224,13 @@ int nfs_rpc_req2client_cred(struct svc_req *req, nfs_client_cred_t *pcred)
 
 		pcred->auth_union.auth_gss.svc = (unsigned int)(gd->sec.svc);
 		pcred->auth_union.auth_gss.qop = (unsigned int)(gd->sec.qop);
-		pcred->auth_union.auth_gss.gss_context_id = gd->ctx;
+		pcred->auth_union.auth_gss.gd = gd;
 		break;
 #endif
 
 	default:
 		/* Unsupported authentication flavour */
 		return -1;
-		break;
 	}
 
 	return 1;
@@ -319,8 +363,9 @@ nfsstat4 nfs_req_creds(struct svc_req *req)
 	if ((op_ctx->cred_flags & CREDS_ANON) != 0 ||
 	    ((op_ctx->export_perms->options &
 	      EXPORT_OPTION_ALL_ANONYMOUS) != 0) ||
-	    ((op_ctx->export_perms->options & EXPORT_OPTION_ROOT) == 0 &&
+	    ((op_ctx->export_perms->options & EXPORT_OPTION_ROOT_SQUASH) != 0 &&
 	      op_ctx->original_creds.caller_uid == 0)) {
+		/* Squash uid, gid, and discard groups */
 		op_ctx->creds->caller_uid =
 					op_ctx->export_perms->anonymous_uid;
 		op_ctx->creds->caller_gid =
@@ -333,15 +378,24 @@ nfsstat4 nfs_req_creds(struct svc_req *req)
 			    op_ctx->creds->caller_gid);
 		op_ctx->cred_flags |= UID_SQUASHED | GID_SQUASHED;
 		return NFS4_OK;
+	} else if ((op_ctx->export_perms->options &
+		    EXPORT_OPTION_ROOT_ID_SQUASH) != 0 &&
+		   op_ctx->original_creds.caller_uid == 0) {
+		/* Only squash root id, leave gid and groups alone for now */
+		op_ctx->creds->caller_uid =
+					op_ctx->export_perms->anonymous_uid;
+		op_ctx->cred_flags |= UID_SQUASHED;
+	} else {
+		/* Use original_creds uid */
+		op_ctx->creds->caller_uid = op_ctx->original_creds.caller_uid;
 	}
-
-	/* Now we will use the original_creds uid from original credential */
-	op_ctx->creds->caller_uid = op_ctx->original_creds.caller_uid;
 
 	/****************************************************************/
 	/* Now sqush group or use original_creds gid			*/
 	/****************************************************************/
-	if ((op_ctx->export_perms->options & EXPORT_OPTION_ROOT) == 0 &&
+	if (((op_ctx->export_perms->options & EXPORT_OPTION_ROOT_SQUASH) != 0 ||
+	     (op_ctx->export_perms->options &
+	      EXPORT_OPTION_ROOT_ID_SQUASH) != 0) &&
 	    op_ctx->original_creds.caller_gid == 0) {
 		/* Squash gid */
 		op_ctx->creds->caller_gid =
@@ -381,7 +435,7 @@ nfsstat4 nfs_req_creds(struct svc_req *req)
 	/****************************************************************/
 
 	/* If no root squashing in caller_garray, return now */
-	if ((op_ctx->export_perms->options & EXPORT_OPTION_ROOT) != 0 ||
+	if ((op_ctx->export_perms->options & EXPORT_OPTION_SQUASH_TYPES) == 0 ||
 	    op_ctx->creds->caller_glen == 0)
 		goto out;
 
@@ -393,12 +447,6 @@ nfsstat4 nfs_req_creds(struct svc_req *req)
 				(*garray_copy) =
 					gsh_malloc(op_ctx->creds->caller_glen *
 						   sizeof(gid_t));
-
-				if ((*garray_copy) == NULL) {
-					LogCrit(COMPONENT_DISPATCH,
-						"Attempt to sqaush caller_garray failed - no memory");
-					return NFS4ERR_ACCESS;
-				}
 
 				memcpy((*garray_copy),
 				       op_ctx->creds->caller_garray,
@@ -426,9 +474,12 @@ nfsstat4 nfs_req_creds(struct svc_req *req)
 out:
 
 	LogMidDebugAlt(COMPONENT_DISPATCH, COMPONENT_EXPORT,
-		    "%s creds mapped to uid=%u, gid=%u%s, glen=%d%s",
+		    "%s creds mapped to uid=%u%s, gid=%u%s, glen=%d%s",
 		    auth_label,
 		    op_ctx->creds->caller_uid,
+		    (op_ctx->cred_flags & UID_SQUASHED) != 0
+			? " (squashed)"
+			: "",
 		    op_ctx->creds->caller_gid,
 		    (op_ctx->cred_flags & GID_SQUASHED) != 0
 			? " (squashed)"
@@ -453,8 +504,8 @@ void init_credentials(void)
 {
 	memset(op_ctx->creds, 0, sizeof(*op_ctx->creds));
 	memset(&op_ctx->original_creds, 0, sizeof(op_ctx->original_creds));
-	op_ctx->creds->caller_uid = (uid_t) ANON_UID;
-	op_ctx->creds->caller_gid = (gid_t) ANON_GID;
+	op_ctx->creds->caller_uid = op_ctx->export_perms->anonymous_uid;
+	op_ctx->creds->caller_gid = op_ctx->export_perms->anonymous_gid;
 	op_ctx->caller_gdata = NULL;
 	op_ctx->caller_garray_copy = NULL;
 	op_ctx->managed_garray_copy = NULL;
@@ -502,11 +553,11 @@ nfsstat4 nfs4_export_check_access(struct svc_req *req)
 
 	/* Check if any access at all */
 	if ((op_ctx->export_perms->options &
-	     EXPORT_OPTION_ACCESS_TYPE) == 0) {
+	     EXPORT_OPTION_ACCESS_MASK) == 0) {
 		LogInfoAlt(COMPONENT_NFS_V4, COMPONENT_EXPORT,
 			"Access not allowed on Export_Id %d %s for client %s",
-			op_ctx->export->export_id,
-			op_ctx->export->fullpath,
+			op_ctx->ctx_export->export_id,
+			op_ctx->ctx_export->fullpath,
 			op_ctx->client
 				? op_ctx->client->hostaddr_str
 				: "unknown client");
@@ -517,8 +568,8 @@ nfsstat4 nfs4_export_check_access(struct svc_req *req)
 	if ((op_ctx->export_perms->options & EXPORT_OPTION_NFSV4) == 0) {
 		LogInfoAlt(COMPONENT_NFS_V4, COMPONENT_EXPORT,
 			"NFS4 not allowed on Export_Id %d %s for client %s",
-			op_ctx->export->export_id,
-			op_ctx->export->fullpath,
+			op_ctx->ctx_export->export_id,
+			op_ctx->ctx_export->fullpath,
 			op_ctx->client
 				? op_ctx->client->hostaddr_str
 				: "unknown client");
@@ -536,8 +587,8 @@ nfsstat4 nfs4_export_check_access(struct svc_req *req)
 		LogInfoAlt(COMPONENT_NFS_V4, COMPONENT_EXPORT,
 			"NFS4 over %s not allowed on Export_Id %d %s for client %s",
 			xprt_type_to_str(xprt_type),
-			op_ctx->export->export_id,
-			op_ctx->export->fullpath,
+			op_ctx->ctx_export->export_id,
+			op_ctx->ctx_export->fullpath,
 			op_ctx->client
 				? op_ctx->client->hostaddr_str
 				: "unknown client");
@@ -550,8 +601,8 @@ nfsstat4 nfs4_export_check_access(struct svc_req *req)
 	    && (port >= IPPORT_RESERVED)) {
 		LogInfoAlt(COMPONENT_NFS_V4, COMPONENT_EXPORT,
 			"Non-reserved Port %d is not allowed on Export_Id %d %s for client %s",
-			port, op_ctx->export->export_id,
-			op_ctx->export->fullpath,
+			port, op_ctx->ctx_export->export_id,
+			op_ctx->ctx_export->fullpath,
 			op_ctx->client
 				? op_ctx->client->hostaddr_str
 				: "unknown client");
@@ -562,8 +613,8 @@ nfsstat4 nfs4_export_check_access(struct svc_req *req)
 	if (export_check_security(req) == false) {
 		LogInfoAlt(COMPONENT_NFS_V4, COMPONENT_EXPORT,
 			"NFS4 auth not allowed on Export_Id %d %s for client %s",
-			op_ctx->export->export_id,
-			op_ctx->export->fullpath,
+			op_ctx->ctx_export->export_id,
+			op_ctx->ctx_export->fullpath,
 			op_ctx->client
 				? op_ctx->client->hostaddr_str
 				: "unknown client");
@@ -577,29 +628,29 @@ nfsstat4 nfs4_export_check_access(struct svc_req *req)
 /**
  * @brief Perform version independent ACCESS operation.
  *
- * This function wraps a call to cache_inode_access, determining the appropriate
+ * This function wraps a call to fsal_access, determining the appropriate
  * access_mask to use to check all the requested access bits. It requests the
  * allowed and denied access so that it can respond for each requested access
  * with a single access call.
  *
- * @param[in]  entry The cache inode entry to check access for
+ * @param[in]  obj Object handle to check access for
  * @param[in]  requested_access The ACCESS3 or ACCESS4 bits requested
  * @param[out] granted_access   The bits granted
  * @param[out] supported_access The bits supported for this inode
  *
- * @return cache inode status
- * @retval CACHE_INODE_SUCCESS all access was granted
- * @retval CACHE_INODE_FSAL_EACCESS one or more access bits were denied
- * @retval other values indicate a cache inode failure
+ * @return FSAL error
+ * @retval ERR_FSAL_NO_ERROR all access was granted
+ * @retval ERR_FSAL_ACCESS one or more access bits were denied
+ * @retval other values indicate a FSAL failure
  *
  */
 
-cache_inode_status_t nfs_access_op(cache_entry_t *entry,
+fsal_errors_t nfs_access_op(struct fsal_obj_handle *obj,
 				   uint32_t requested_access,
 				   uint32_t *granted_access,
 				   uint32_t *supported_access)
 {
-	cache_inode_status_t status;
+	fsal_status_t fsal_status;
 	fsal_accessflags_t access_mask;
 	fsal_accessflags_t access_allowed;
 	fsal_accessflags_t access_denied;
@@ -631,21 +682,21 @@ cache_inode_status_t nfs_access_op(cache_entry_t *entry,
 		access_mask |= FSAL_R_OK | FSAL_ACE_PERM_READ_DATA;
 
 	if (requested_access & ACCESS3_LOOKUP) {
-		if (entry->type == DIRECTORY)
+		if (obj->type == DIRECTORY)
 			access_mask |= FSAL_X_OK | FSAL_ACE_PERM_EXECUTE;
 		else
 			granted_mask &= ~ACCESS3_LOOKUP;
 	}
 
 	if (requested_access & ACCESS3_MODIFY) {
-		if (entry->type == DIRECTORY)
+		if (obj->type == DIRECTORY)
 			access_mask |= FSAL_W_OK | FSAL_ACE_PERM_DELETE_CHILD;
 		else
 			access_mask |= FSAL_W_OK | FSAL_ACE_PERM_WRITE_DATA;
 	}
 
 	if (requested_access & ACCESS3_EXTEND) {
-		if (entry->type == DIRECTORY)
+		if (obj->type == DIRECTORY)
 			access_mask |=
 			    FSAL_W_OK | FSAL_ACE_PERM_ADD_FILE |
 			    FSAL_ACE_PERM_ADD_SUBDIRECTORY;
@@ -654,14 +705,14 @@ cache_inode_status_t nfs_access_op(cache_entry_t *entry,
 	}
 
 	if (requested_access & ACCESS3_DELETE) {
-		if (entry->type == DIRECTORY)
+		if (obj->type == DIRECTORY)
 			access_mask |= FSAL_W_OK | FSAL_ACE_PERM_DELETE_CHILD;
 		else
 			granted_mask &= ~ACCESS3_DELETE;
 	}
 
 	if (requested_access & ACCESS3_EXECUTE) {
-		if (entry->type != DIRECTORY)
+		if (obj->type != DIRECTORY)
 			access_mask |= FSAL_X_OK | FSAL_ACE_PERM_EXECUTE;
 		else
 			granted_mask &= ~ACCESS3_EXECUTE;
@@ -678,11 +729,11 @@ cache_inode_status_t nfs_access_op(cache_entry_t *entry,
 		    FSAL_TEST_MASK(access_mask, FSAL_W_OK) ? 'w' : '-',
 		    FSAL_TEST_MASK(access_mask, FSAL_X_OK) ? 'x' : '-',
 		    FSAL_TEST_MASK(access_mask, FSAL_ACE_PERM_READ_DATA) ?
-			entry->type == DIRECTORY ?
+			obj->type == DIRECTORY ?
 			"list_dir" : "read_data" : "-",
 		    FSAL_TEST_MASK(access_mask,
 				   FSAL_ACE_PERM_WRITE_DATA) ?
-			entry->type == DIRECTORY ?
+			obj->type == DIRECTORY ?
 			"add_file" : "write_data" : "-",
 		    FSAL_TEST_MASK(access_mask, FSAL_ACE_PERM_EXECUTE) ?
 			"execute" : "-",
@@ -692,12 +743,11 @@ cache_inode_status_t nfs_access_op(cache_entry_t *entry,
 		    FSAL_TEST_MASK(access_mask, FSAL_ACE_PERM_DELETE_CHILD) ?
 			"delete_child" : "-");
 
-	status =
-	    cache_inode_access_sw(entry, access_mask, &access_allowed,
-				  &access_denied, true);
-
-	if (status == CACHE_INODE_SUCCESS ||
-	    status == CACHE_INODE_FSAL_EACCESS) {
+	fsal_status = obj->obj_ops.test_access(obj, access_mask,
+					       &access_allowed,
+					       &access_denied, false);
+	if (fsal_status.major == ERR_FSAL_NO_ERROR ||
+	    fsal_status.major == ERR_FSAL_ACCESS) {
 		/* Define granted access based on granted mode bits. */
 		if (access_allowed & FSAL_R_OK)
 			*granted_access |= ACCESS3_READ;
@@ -713,7 +763,7 @@ cache_inode_status_t nfs_access_op(cache_entry_t *entry,
 		if (access_allowed & FSAL_ACE_PERM_READ_DATA)
 			*granted_access |= ACCESS3_READ;
 
-		if (entry->type == DIRECTORY) {
+		if (obj->type == DIRECTORY) {
 			if (access_allowed & FSAL_ACE_PERM_DELETE_CHILD)
 				*granted_access |=
 				    ACCESS3_MODIFY | ACCESS3_DELETE;
@@ -773,5 +823,5 @@ cache_inode_status_t nfs_access_op(cache_entry_t *entry,
 					   ACCESS3_EXECUTE) ? "EXECUTE" : "-");
 	}
 
-	return status;
+	return fsal_status.major;
 }
